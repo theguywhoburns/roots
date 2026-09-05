@@ -12,7 +12,7 @@
 //! drains and matches.
 
 use crate::address::KEY_LEN;
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 use crate::session::PACKET_TYPE_PROTO;
 
 /// Protocol dispatch byte: no-op (yggdrasil-go `typeProtoDummy`).
@@ -72,9 +72,9 @@ impl crate::router::Router {
     /// Send one raw protocol frame (`payload` starts with the
     /// `PROTO_*` dispatch byte) to `dest`, opening the session first if
     /// needed — same buffering as traffic sends.
-    pub async fn proto_send<T: Transport>(
+    pub async fn proto_send(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -85,9 +85,9 @@ impl crate::router::Router {
 
     /// Ask `dest` for its nodeinfo; the `PROTO_NODEINFO_RES` reply arrives
     /// in [`Router::proto_inbox`](crate::router::Router::proto_inbox).
-    pub async fn request_nodeinfo<T: Transport>(
+    pub async fn request_nodeinfo(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), crate::error::Error> {
@@ -97,9 +97,9 @@ impl crate::router::Router {
 
     /// Ask `dest` for its debug self/peers/tree snapshot; the matching
     /// `DEBUG_*_RES` reply arrives in `proto_inbox`.
-    pub async fn request_debug<T: Transport>(
+    pub async fn request_debug(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         what: u8,
@@ -119,9 +119,9 @@ impl crate::router::Router {
     /// `typeSessionProto` session byte): answer requests from local state,
     /// deliver responses to `proto_inbox`, ignore dummies/unknowns — the
     /// same accept-and-ignore shape as Go `protoHandler.handleProto`.
-    pub(crate) async fn handle_proto_bytes<T: Transport>(
+    pub(crate) async fn handle_proto_bytes(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         payload: &[u8],
@@ -146,9 +146,9 @@ impl crate::router::Router {
         Ok(())
     }
 
-    async fn handle_debug_bytes<T: Transport>(
+    async fn handle_debug_bytes(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         payload: &[u8],

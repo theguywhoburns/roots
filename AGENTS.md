@@ -14,10 +14,27 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 - `src/lib.rs` — library root (`Client`, re-exports). `src/main.rs` — thin demo probe (dial + router status), not the product.
 - `src/address.rs` — key→IPv6 derivation. `src/handshake.rs` — link `meta` codec. `src/link.rs` — `Transport` trait + TCP dial/listen/handshake, backoff + `?maxbackoff=`/`?sni=` URI opts. `src/tls.rs` — `Tls` transport (rustls/ring, NoVerify like Go InsecureSkipVerify, rcgen self-signed listener). `src/ws.rs` — `Ws` transport (`ygg-ws` subprotocol, one binary message per flush, byte-stream reads). `src/frame.rs` — ironwood link framing + uvarint/path helpers.
 - `src/router.rs` — spanning-tree router (owns all protocol state). `src/bloom.rs`, `src/pathfind.rs`, `src/session.rs`, `src/traffic.rs`, `src/proto.rs` — `impl Router` protocol extensions + wire types.
-- `src/router.rs` API notes: `register()` is once per LINK, `serve()` drives slices of it; `resolve()` maps IPv6 addr→node key over DHT; `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `proto_send`/`request_nodeinfo`/`request_debug` frame `typeSessionProto` (replies land in `proto_inbox`); `set_nodeinfo` advertises JSON (≤16384 B); `has_path/has_session/path_details` + `dump()` (returns `String`, never prints) are diagnostics.
+- `src/router.rs` API notes: `register()` is once per LINK, `serve()` drives slices of it; all router methods take `&mut dyn Link` (`PeerConn<T>` per transport + type-erased `AnyConn`, so one router drives mixed links); `resolve()` maps IPv6 addr→node key over DHT; `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `proto_send`/`request_nodeinfo`/`request_debug` frame `typeSessionProto` (replies land in `proto_inbox`); `set_nodeinfo` advertises JSON (≤16384 B); `has_path/has_session/path_details` + `dump()` (returns `String`, never prints) are diagnostics.
 - `examples/` (dev-deps only, lib never sees them): `common/` (shared smoltcp `MeshPhy` bridge + `new_iface`/`new_tcp_socket`/`smol_now`, used by all TCP examples and `tests/tcp_loopback.rs` via `#[path]`), `http_fetch` (smoltcp TCP GET), `mesh_tcp` (bilateral TCP, both ends ours), `irc_watch` (smoltcp IRC: register/LIST/JOIN #ru, verified live — first user message caught 2026-09-06), `proto_probe` (nodeinfo/debug exchange with a Go node, verified live), `ping6`, `listen_ping`, `oracle_probe` (one payload + ticks), `tcp_proxy` (logging MITM proxy), `hs_answer` (cross-impl handshake helper).
 - `tests/`: `mesh_ping.rs` (`#[ignore]`, A↔B ICMPv6 via public peer), `reconnect.rs` (drop→redial delivery), `tcp_loopback.rs` (pure smoltcp driver check, no mesh).
 - Build artifacts in `/target` (gitignored). Do not commit.
+
+## Boundary: library vs demo client
+
+- **Library (`src/`, lib target)** talks wires and owns state: key/address
+  derivation, `meta` handshake, `Transport` impls (`Tcp`/`Tls`/`Ws`, later
+  `wss`/`quic`), frame codec, spanning-tree router, pathfinder/DHT,
+  sessions, nodeinfo/debug proto, reconnect/backoff, plus read-only query
+  snapshots (`parent`, `has_path`, `has_session`, `path_details`, `dump`).
+  The lib never prints, never opens TUN, never serves admin.
+- **Demo client (binaries: `src/main.rs`, `examples/`)** decides what to do
+  with it: dial by scheme, hold, dump, smoltcp bridges (`examples/common/`),
+  app demos (`http_fetch`, `mesh_tcp`, `irc_watch`, `proto_probe`), debug
+  tools (`ping6`, `listen_ping`, `oracle_probe`, `tcp_proxy`, `hs_answer`).
+  Future app-layer work lives here: yggdrasilctl-compatible admin adapter
+  (thin mapping over lib queries), TUN plumbing (TUN crate stays a
+  demo-dep, packets cross via `inbox`/outbox), `main.rs` growing from probe
+  into a small client.
 
 ## Reference material (executable truth, in order)
 

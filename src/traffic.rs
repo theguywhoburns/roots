@@ -7,7 +7,7 @@
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{append_path, append_uvarint, split_path};
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Traffic {
@@ -58,9 +58,9 @@ impl Traffic {
 impl crate::router::Router {
     /// Handle inbound traffic: forward one hop, deliver session payloads
     /// addressed to us, or report the path broken (Go `router.handleTraffic`).
-    pub(crate) async fn handle_inbound_traffic<T: Transport>(
+    pub(crate) async fn handle_inbound_traffic(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         tr: &Traffic,
     ) -> Result<(), Error> {

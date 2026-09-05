@@ -87,6 +87,82 @@ pub trait Transport {
     ) -> impl std::future::Future<Output = Result<Self::Stream, Error>> + Send;
 }
 
+/// Byte stream usable as a link wire: one trait so links of different
+/// transports (`Tcp`, `Tls`, `Ws`) erase to a single type.
+pub trait LinkStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> LinkStream for T {}
+
+/// Boxed frame read/write futures returned by [`Link`] (kept behind
+/// aliases so the trait stays under clippy's type-complexity limit).
+pub type LinkRead<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(FrameType, Vec<u8>), Error>> + Send + 'a>,
+>;
+pub type LinkWrite<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), Error>> + Send + 'a>>;
+
+/// One open link as the router sees it: framed reads/writes without
+/// naming the transport. `PeerConn<T>` implements this for every
+/// transport, and [`AnyConn`] type-erases the stream, so a single
+/// `Router` can drive mixed-transport links through `&mut dyn Link`
+/// (the precondition for the multi-peer connection map).
+pub trait Link: Send {
+    /// Link priority from the handshake (lowest wins among same-key links).
+    fn priority(&self) -> u8;
+    fn read_frame<'a>(&'a mut self) -> LinkRead<'a>;
+    fn write_frame<'a>(&'a mut self, ftype: FrameType, payload: &'a [u8]) -> LinkWrite<'a>;
+}
+
+impl<T: Transport> Link for PeerConn<T> {
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn read_frame<'a>(&'a mut self) -> LinkRead<'a> {
+        Box::pin(async move { PeerConn::read_frame(self).await })
+    }
+
+    fn write_frame<'a>(&'a mut self, ftype: FrameType, payload: &'a [u8]) -> LinkWrite<'a> {
+        Box::pin(async move { PeerConn::write_frame(self, ftype, payload).await })
+    }
+}
+
+/// Type-erased authenticated peer connection: same shape as
+/// [`PeerConn`], but the stream is boxed, so links of different
+/// transports share one concrete type.
+pub struct AnyConn {
+    pub remote_key: [u8; KEY_LEN],
+    pub priority: u8,
+    pub stream: Box<dyn LinkStream>,
+}
+
+impl AnyConn {
+    pub fn new<T: Transport>(conn: PeerConn<T>) -> Self
+    where
+        T::Stream: 'static,
+    {
+        Self {
+            remote_key: conn.remote_key,
+            priority: conn.priority,
+            stream: Box::new(conn.stream),
+        }
+    }
+}
+
+impl Link for AnyConn {
+    fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    fn read_frame<'a>(&'a mut self) -> LinkRead<'a> {
+        Box::pin(async move { read_frame_from(&mut self.stream).await })
+    }
+
+    fn write_frame<'a>(&'a mut self, ftype: FrameType, payload: &'a [u8]) -> LinkWrite<'a> {
+        Box::pin(async move { write_frame_to(&mut self.stream, ftype, payload).await })
+    }
+}
+
 /// Plain TCP transport.
 pub struct Tcp;
 
@@ -297,42 +373,59 @@ pub struct RunStats {
     pub payload_bytes: u64,
 }
 
+/// Read one framed body (type + payload) after the length prefix, over
+/// any byte stream. Shared by [`PeerConn`] and [`AnyConn`].
+pub async fn read_frame_from<S: AsyncRead + Unpin>(
+    stream: &mut S,
+) -> Result<(FrameType, Vec<u8>), Error> {
+    let mut prefix = Vec::with_capacity(10);
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await?;
+        prefix.push(b[0]);
+        if b[0] < 0x80 {
+            break;
+        }
+        if prefix.len() >= 10 {
+            return Err(Error::InvalidLength);
+        }
+    }
+    let (len, _) = frame::read_uvarint(&prefix).ok_or(Error::InvalidLength)?;
+    if len == 0 || len as usize > MAX_MESSAGE_SIZE {
+        return Err(Error::InvalidLength);
+    }
+    let mut body = vec![0u8; len as usize];
+    stream.read_exact(&mut body).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::InvalidLength
+        } else {
+            Error::Io(e)
+        }
+    })?;
+    let (ftype, payload) = frame::decode_body(&body)?;
+    Ok((ftype, payload.to_vec()))
+}
+
+/// Write one framed body over any byte stream.
+pub async fn write_frame_to<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    ftype: FrameType,
+    payload: &[u8],
+) -> Result<(), Error> {
+    let enc = frame::encode_frame(ftype, payload);
+    stream.write_all(&enc).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 impl<T: Transport> PeerConn<T> {
     /// Read one framed body (type + payload) after the length prefix.
     pub async fn read_frame(&mut self) -> Result<(FrameType, Vec<u8>), Error> {
-        let mut prefix = Vec::with_capacity(10);
-        loop {
-            let mut b = [0u8; 1];
-            self.stream.read_exact(&mut b).await?;
-            prefix.push(b[0]);
-            if b[0] < 0x80 {
-                break;
-            }
-            if prefix.len() >= 10 {
-                return Err(Error::InvalidLength);
-            }
-        }
-        let (len, _) = frame::read_uvarint(&prefix).ok_or(Error::InvalidLength)?;
-        if len == 0 || len as usize > MAX_MESSAGE_SIZE {
-            return Err(Error::InvalidLength);
-        }
-        let mut body = vec![0u8; len as usize];
-        self.stream.read_exact(&mut body).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                Error::InvalidLength
-            } else {
-                Error::Io(e)
-            }
-        })?;
-        let (ftype, payload) = frame::decode_body(&body)?;
-        Ok((ftype, payload.to_vec()))
+        read_frame_from(&mut self.stream).await
     }
 
     pub async fn write_frame(&mut self, ftype: FrameType, payload: &[u8]) -> Result<(), Error> {
-        let enc = frame::encode_frame(ftype, payload);
-        self.stream.write_all(&enc).await?;
-        self.stream.flush().await?;
-        Ok(())
+        write_frame_to(&mut self.stream, ftype, payload).await
     }
 
     /// Serve the link until `hold_for` elapses: reply keepalive to every

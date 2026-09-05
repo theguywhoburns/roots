@@ -6,7 +6,7 @@
 
 use crate::address::KEY_LEN;
 use crate::error::Error;
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 
 /// Bits in the filter.
 pub const BLOOM_M: usize = 8192;
@@ -315,9 +315,9 @@ impl crate::router::Router {
         b
     }
 
-    pub(crate) async fn bloom_maintenance<T: Transport>(
+    pub(crate) async fn bloom_maintenance(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
     ) -> Result<(), crate::error::Error> {
         self.bloom_fix();
@@ -359,9 +359,9 @@ impl crate::router::Router {
     }
 
     /// Forward a multicast packet along the tree (Go `_sendMulticast`).
-    pub(crate) async fn multicast<T: Transport>(
+    pub(crate) async fn multicast(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         from_key: [u8; KEY_LEN],
         to_key: [u8; KEY_LEN],

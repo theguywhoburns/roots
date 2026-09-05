@@ -17,7 +17,7 @@ use sha2::{Digest, Sha512};
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{append_uvarint, read_uvarint};
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 
 pub const SESSION_TYPE_INIT: u8 = 1;
 pub const SESSION_TYPE_ACK: u8 = 2;
@@ -216,9 +216,9 @@ impl crate::router::Router {
     }
 
     /// Send a session-layer payload inside network traffic to `dest`.
-    async fn net_send<T: Transport>(
+    async fn net_send(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -227,9 +227,9 @@ impl crate::router::Router {
     }
 
     /// Handle one session payload extracted from inbound traffic.
-    pub(crate) async fn handle_session_bytes<T: Transport>(
+    pub(crate) async fn handle_session_bytes(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         data: &[u8],
@@ -347,9 +347,9 @@ impl crate::router::Router {
     /// impossible. The buffered-init path stores the same kind byte, so a
     /// proto request queued before the session exists is still framed as
     /// proto on flush.
-    async fn session_send_inner<T: Transport>(
+    async fn session_send_inner(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,
@@ -374,9 +374,9 @@ impl crate::router::Router {
     }
 
     /// App-level send: encrypt now or buffer behind an init (Go `writeTo`).
-    pub(crate) async fn session_send<T: Transport>(
+    pub(crate) async fn session_send(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         msg: Vec<u8>,
@@ -388,9 +388,9 @@ impl crate::router::Router {
     /// Kind-generalized send: `PACKET_TYPE_TRAFFIC` for TUN payloads,
     /// `PACKET_TYPE_PROTO` for nodeinfo/debug frames (framing is the only
     /// difference; session setup and buffering are shared).
-    pub(crate) async fn session_send_kind<T: Transport>(
+    pub(crate) async fn session_send_kind(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,

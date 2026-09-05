@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{FrameType, append_path, append_uvarint, read_uvarint, split_path};
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 
 /// Learned source route to a node (Go `pathInfo`, timers as instants).
 #[derive(Debug, Clone)]
@@ -285,9 +285,9 @@ impl crate::router::Router {
     }
 
     /// Originate a lookup (Go `_sendLookup` + `_handleLookup` for self).
-    pub(crate) async fn send_lookup<T: Transport>(
+    pub(crate) async fn send_lookup(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -305,9 +305,9 @@ impl crate::router::Router {
 
     /// Handle a lookup from `from` (Go `_handleLookup`): multicast onwards,
     /// then answer directly on a transformed-key match.
-    pub(crate) async fn handle_lookup<T: Transport>(
+    pub(crate) async fn handle_lookup(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         lookup: &PathLookup,
@@ -350,9 +350,9 @@ impl crate::router::Router {
 
     /// Handle a notify: forward toward its path, or accept it when we are
     /// the destination (Go `_handleNotify`).
-    pub(crate) async fn handle_notify<T: Transport>(
+    pub(crate) async fn handle_notify(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         notify: &PathNotify,
     ) -> Result<(), Error> {
@@ -417,9 +417,9 @@ impl crate::router::Router {
     }
 
     /// Handle a broken-path report (Go `_handleBroken`).
-    pub(crate) async fn handle_broken<T: Transport>(
+    pub(crate) async fn handle_broken(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         broken: &PathBroken,
     ) -> Result<(), Error> {
@@ -447,9 +447,9 @@ impl crate::router::Router {
     /// Throttled lookup driver (Go `_rumorSendLookup`). Rumors rendezvous
     /// by transformed key, so a notify from the full key matches a lookup
     /// for a partial key.
-    pub(crate) async fn rumor_lookup<T: Transport>(
+    pub(crate) async fn rumor_lookup(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -478,9 +478,9 @@ impl crate::router::Router {
 
     /// Send a network-layer payload, attaching the learned path or
     /// buffering behind a lookup (Go `pathfinder._handleTraffic`).
-    pub(crate) async fn pathfinder_send<T: Transport>(
+    pub(crate) async fn pathfinder_send(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -510,9 +510,9 @@ impl crate::router::Router {
 
     /// Forward locally-originated traffic one hop (Go `router.handleTraffic`
     /// for the send side; the watermark update is inside `greedy_next`).
-    async fn route_traffic<T: Transport>(
+    async fn route_traffic(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         tr: &crate::traffic::Traffic,
     ) -> Result<(), Error> {

@@ -17,7 +17,7 @@ use crate::address::KEY_LEN;
 use crate::bloom::BloomFilter;
 use crate::error::Error;
 use crate::frame::{FrameType, append_uvarint, read_uvarint};
-use crate::link::{PeerConn, Transport};
+use crate::link::Link;
 use crate::pathfind::NotifyInfo;
 use crate::session::Session;
 
@@ -387,9 +387,9 @@ impl Router {
     /// replay of already-sent announces (Go `addPeer`). Call ONCE per link
     /// (not per serve slice): the peer answers every SigReq and replays
     /// are sent-map-gated, so repeats look like a reconnect storm.
-    pub async fn register<T: Transport>(
+    pub async fn register(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         // Reuse the link port for a known key (Go keeps one port per key
@@ -426,7 +426,7 @@ impl Router {
             responded: false,
             lag,
             sent_at: Some(Instant::now()),
-            prio: conn.priority,
+            prio: conn.priority(),
             order,
         };
         // One registration per link (callers register once, then serve in
@@ -465,9 +465,9 @@ impl Router {
         Ok(())
     }
 
-    async fn send_req<T: Transport>(
+    async fn send_req(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let req = self.new_req();
@@ -482,9 +482,9 @@ impl Router {
     }
 
     /// Answer an inbound SigReq (Go `_handleRequest`).
-    async fn handle_request<T: Transport>(
+    async fn handle_request(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
         req: SigReq,
     ) -> Result<(), Error> {
@@ -616,11 +616,7 @@ impl Router {
     }
 
     /// Deterministic parent selection (Go `_fix`). Returns announces to send.
-    async fn fix<T: Transport>(
-        &mut self,
-        conn: &mut PeerConn<T>,
-        peer_key: [u8; KEY_LEN],
-    ) -> Result<(), Error> {
+    async fn fix(&mut self, conn: &mut dyn Link, peer_key: [u8; KEY_LEN]) -> Result<(), Error> {
         let self_info = self.infos.get(&self.pubkey).copied();
         let mut best_root = self.pubkey;
         let mut best_parent = self.pubkey;
@@ -723,7 +719,7 @@ impl Router {
         self.self_refresh_at = Some(Instant::now() + ROUTER_REFRESH);
     }
 
-    async fn send_all_reqs<T: Transport>(&mut self, conn: &mut PeerConn<T>) -> Result<(), Error> {
+    async fn send_all_reqs(&mut self, conn: &mut dyn Link) -> Result<(), Error> {
         // Go `_sendReqs` clears req/res state and re-requests every peer.
         self.responses.clear();
         let keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
@@ -753,9 +749,9 @@ impl Router {
     }
 
     /// Send unsent ancestry announces to one peer (Go `_sendAnnounces`).
-    async fn send_announces<T: Transport>(
+    async fn send_announces(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let mut to_send: Vec<[u8; KEY_LEN]> = Vec::new();
@@ -782,9 +778,9 @@ impl Router {
         Ok(())
     }
 
-    fn handle_announce<T: Transport>(
+    fn handle_announce(
         &mut self,
-        _conn: &mut PeerConn<T>,
+        _conn: &mut dyn Link,
         from: [u8; KEY_LEN],
         ann: &Announce,
     ) -> Option<Announce> {
@@ -817,9 +813,9 @@ impl Router {
     /// Write one frame to the link when `target` is that link's peer.
     /// (Single-link serve keeps one `PeerConn`; this check is what grows
     /// into a connection map for multi-peer.)
-    pub(crate) async fn write_to_peer<T: Transport>(
+    pub(crate) async fn write_to_peer(
         &self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         target: [u8; KEY_LEN],
         ftype: FrameType,
@@ -838,9 +834,9 @@ impl Router {
     /// to the owning node). Returns the key (also usable directly for
     /// [`Router::session_send`] via the `serve` outbox). Times out with
     /// [`Error::Timeout`].
-    pub async fn resolve<T: Transport>(
+    pub async fn resolve(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         addr: &crate::address::Address,
         timeout: Duration,
@@ -889,9 +885,9 @@ impl Router {
     }
 
     /// One maintenance tick: expire, fix parent, send announces.
-    pub async fn maintain<T: Transport>(
+    pub async fn maintain(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         self.expire();
@@ -929,9 +925,9 @@ impl Router {
 
     /// Handle one inbound frame: router protocol plus a keepalive reply for
     /// every non-keepalive type (Go `peerMonitor` semantics).
-    pub(crate) async fn dispatch_frame<T: Transport>(
+    pub(crate) async fn dispatch_frame(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         ftype: FrameType,
         payload: &[u8],
@@ -1012,9 +1008,9 @@ impl Router {
     /// `(dest, payload)` pairs in `outgoing` are sent as session payloads
     /// (buffered behind lookup + handshake automatically). Payloads that
     /// fail mid-write are re-queued into `resend` for the next link.
-    pub async fn serve<T: Transport>(
+    pub async fn serve(
         &mut self,
-        conn: &mut PeerConn<T>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
@@ -1180,6 +1176,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_transport_links_share_one_router() {
+        // Slice 10a: one Router drives a TCP link and a WS link (the WS
+        // side type-erased through `AnyConn`) as `&mut dyn Link`. Tree
+        // converges and a session opens over the TCP leg.
+        use crate::link::{AnyConn, Link};
+
+        let c_sk = SigningKey::from_bytes(&[0x40; 32]);
+        let s1_sk = SigningKey::from_bytes(&[0x10; 32]);
+        let s2_sk = SigningKey::from_bytes(&[0x20; 32]);
+        let s1_pub = s1_sk.verifying_key().to_bytes();
+
+        let tcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = tcp_listener.local_addr().unwrap();
+        let srv1 = tokio::spawn(async move {
+            let (sock, _) = tcp_listener.accept().await.unwrap();
+            let mut sock = sock;
+            let opts = LinkOptions::default();
+            let (key, _) = crate::link::run_handshake(&mut sock, &s1_sk, &opts, true)
+                .await
+                .unwrap();
+            let mut conn = crate::link::PeerConn::<Tcp> {
+                remote_key: key,
+                priority: 0,
+                stream: sock,
+            };
+            let mut router = Router::new(s1_sk);
+            router.register(&mut conn, key).await.unwrap();
+            let _ = router
+                .serve(
+                    &mut conn,
+                    key,
+                    Some(Duration::from_secs(15)),
+                    &mut Vec::new(),
+                )
+                .await;
+        });
+        let ws_listener = crate::ws::ws_listen("ws://127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let srv2 = tokio::spawn(async move {
+            let mut conn = crate::ws::ws_accept(&ws_listener, &s2_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            let key = conn.remote_key;
+            let mut router = Router::new(s2_sk);
+            router.register(&mut conn, key).await.unwrap();
+            let _ = router
+                .serve(
+                    &mut conn,
+                    key,
+                    Some(Duration::from_secs(15)),
+                    &mut Vec::new(),
+                )
+                .await;
+        });
+
+        let tcp_uri = format!("tcp://{tcp_addr}");
+        let mut tcp_conn = crate::link::dial(&tcp_uri, &c_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let tcp_peer = tcp_conn.remote_key;
+        let ws_uri = format!("ws://{ws_addr}");
+        let ws_conn = crate::ws::ws_dial(&ws_uri, &c_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let ws_peer = ws_conn.remote_key;
+        let mut ws_conn = AnyConn::new(ws_conn);
+
+        let mut router = Router::new(c_sk);
+        router.register(&mut tcp_conn, tcp_peer).await.unwrap();
+        router.register(&mut ws_conn, ws_peer).await.unwrap();
+
+        // Drive both links: maintain each, drain frames from each.
+        let end = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < end {
+            router.maintain(&mut tcp_conn, tcp_peer).await.unwrap();
+            router.maintain(&mut ws_conn, ws_peer).await.unwrap();
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(100), tcp_conn.read_frame()).await
+            {
+                router.frames[ftype as usize] += 1;
+                router
+                    .dispatch_frame(&mut tcp_conn, tcp_peer, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(100), ws_conn.read_frame()).await
+            {
+                router.frames[ftype as usize] += 1;
+                router
+                    .dispatch_frame(&mut ws_conn, ws_peer, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if router.parent().is_some()
+                && router.root_path().is_some()
+                && router.known_nodes() >= 3
+            {
+                break;
+            }
+        }
+        assert!(router.parent().is_some(), "converged over mixed links");
+        assert!(router.known_nodes() >= 3, "learned both peers");
+
+        // Full stack over the TCP leg through the same dyn interface.
+        router
+            .session_send(&mut tcp_conn, tcp_peer, s1_pub, vec![0])
+            .await
+            .unwrap();
+        let end = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < end {
+            if router.has_session(&s1_pub) {
+                break;
+            }
+            router.maintain(&mut tcp_conn, tcp_peer).await.unwrap();
+            router.maintain(&mut ws_conn, ws_peer).await.unwrap();
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(100), tcp_conn.read_frame()).await
+            {
+                router
+                    .dispatch_frame(&mut tcp_conn, tcp_peer, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(100), ws_conn.read_frame()).await
+            {
+                router
+                    .dispatch_frame(&mut ws_conn, ws_peer, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(router.has_session(&s1_pub), "session over dyn TCP link");
+        srv1.abort();
+        srv2.abort();
+    }
+
+    #[tokio::test]
     async fn two_routers_converge_over_loopback() {
         // A dials B; both run routers for a beat. B should adopt A as parent
         // only if A is the lesser key... here just assert both learn each
@@ -1195,7 +1330,7 @@ mod tests {
             let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = PeerConn::<Tcp> {
+            let mut conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 stream: sock,
@@ -1258,7 +1393,7 @@ mod tests {
             let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = PeerConn::<Tcp> {
+            let mut conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 stream: sock,
@@ -1319,7 +1454,7 @@ mod tests {
             let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = PeerConn::<Tcp> {
+            let mut conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 stream: sock,
@@ -1386,7 +1521,7 @@ mod tests {
             let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = PeerConn::<Tcp> {
+            let mut conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 stream: sock,

@@ -18,8 +18,9 @@
 - [ ] Slice 10+ — `wss`/`quic`, TUN, admin, multi-peer conn map, Go-style lazy keepalive (we reply eagerly — harmless chatter)
 
 ## Remaining work (as of 2026-09-06)
-- Code cleanup: DONE 2026-09-06 — `MeshPhy` + `smol_now` + iface/socket helpers factored into `examples/common/` (used by `http_fetch`/`mesh_tcp`/`irc_watch` + `tests/tcp_loopback.rs` via `#[path]`); `Router::dump()` returns `String` instead of printing (lib has zero `eprintln!` paths; `ROOTS_DBG_DUMP` gating lives in `src/main.rs` only); `prio`/`order` reported in `dump()` so no `allow(dead_code)`; `src/main.rs` TCP/TLS branches deduped via generic `run()`; removed leftover `DBGLU`/`DBG learned path` stderr taps.
-- Slice 10+: `wss`/`quic` transports, TUN, admin socket, multi-peer conn map, Go-style lazy keepalive (we reply eagerly — harmless chatter).
+- Code cleanup: DONE 2026-09-06 — `MeshPhy` + `smol_now` + iface/socket helpers factored into `examples/common/`; `Router::dump()` returns `String` (lib prints nothing); `prio`/`order` in `dump()`; `src/main.rs` TCP/TLS/WS branches deduped via generic `run()`; stale debug taps removed; lib/demo-client boundary recorded in `AGENTS.md`.
+- **Library:** multi-peer conn map (DONE 10a 2026-09-06: `dyn Link` trait + `AnyConn` type erasure + `read_frame_from`/`write_frame_to` free fns; all router methods take `&mut dyn Link`, behavior-identical, 55 tests green incl. mixed TCP+WS loopback; 10b next: shared-state multi-link serve), `wss`/`quic` transports, Go-style lazy keepalive (we reply eagerly — harmless chatter), `getPaths`/`getSessions` query snapshots.
+- **Demo client:** yggdrasilctl-compatible admin adapter (thin mapping over lib queries, no protocol in the lib), TUN plumbing (TUN crate stays a demo-dep), `main.rs` from probe into a small client.
 
 ## Notes for a fresh session
 - Go ref cloned at /tmp/opencode/ygg-ref/yggdrasil-go (depth 1, HEAD 422836e). Trust it over docs.

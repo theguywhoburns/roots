@@ -22,7 +22,9 @@ pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
 pub use error::Error;
 pub use frame::FrameType;
 pub use handshake::Meta;
-pub use link::{LinkOptions, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri};
+pub use link::{
+    AnyConn, Link, LinkOptions, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri,
+};
 pub use router::Router;
 pub use tls::Tls;
 pub use ws::Ws;
