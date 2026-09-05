@@ -16,6 +16,7 @@ pub mod router;
 pub mod session;
 pub mod tls;
 pub mod traffic;
+pub mod ws;
 
 pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
 pub use error::Error;
@@ -24,6 +25,7 @@ pub use handshake::Meta;
 pub use link::{LinkOptions, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri};
 pub use router::Router;
 pub use tls::Tls;
+pub use ws::Ws;
 
 use ed25519_dalek::SigningKey;
 
@@ -63,6 +65,11 @@ impl Client {
         crate::tls::tls_dial(uri, &self.key, &self.opts).await
     }
 
+    /// Connect to a `ws://` peer URI and complete the handshake.
+    pub async fn connect_ws(&self, uri: &str) -> Result<PeerConn<crate::ws::Ws>, Error> {
+        crate::ws::ws_dial(uri, &self.key, &self.opts).await
+    }
+
     /// Bind a `tcp://` listener for inbound peers.
     pub async fn listen(&self, uri: &str) -> Result<tokio::net::TcpListener, Error> {
         link::listen(uri).await
@@ -97,6 +104,12 @@ impl Client {
             Scheme::Tls => {
                 drive(&mut router, max_backoff, outgoing, max_serves, || {
                     crate::tls::tls_dial(uri, &self.key, &self.opts)
+                })
+                .await
+            }
+            Scheme::Ws => {
+                drive(&mut router, max_backoff, outgoing, max_serves, || {
+                    crate::ws::ws_dial(uri, &self.key, &self.opts)
                 })
                 .await
             }

@@ -21,6 +21,8 @@ pub enum Error {
     PasswordTooLong,
     #[error("bad peer URI: {0}")]
     BadUri(String),
+    #[error("websocket subprotocol mismatch, expected ygg-ws")]
+    BadSubprotocol,
     #[error("handshake timed out")]
     Timeout,
     #[error("io: {0}")]

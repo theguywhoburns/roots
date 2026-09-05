@@ -25,7 +25,22 @@ async fn main() {
         hex::encode(client.key.verifying_key().to_bytes())
     );
     println!("local addr {}", client.address());
-    let mut conn = client.connect(&peer).await.expect("dial peer");
+    // Scheme-aware dial so one probe covers every transport.
+    if peer.starts_with("ws://") {
+        let conn = client.connect_ws(&peer).await.expect("dial ws peer");
+        run_probe(client, conn).await;
+        return;
+    }
+    if peer.starts_with("tls://") {
+        let conn = client.connect_tls(&peer).await.expect("dial tls peer");
+        run_probe(client, conn).await;
+        return;
+    }
+    let conn = client.connect(&peer).await.expect("dial peer");
+    run_probe(client, conn).await;
+}
+
+async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerConn<T>) {
     let peer_key = conn.remote_key;
     println!("peer key {}", hex::encode(peer_key));
     let mut router = Router::new(client.key);

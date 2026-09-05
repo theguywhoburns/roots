@@ -24,6 +24,8 @@ sha2 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = "0.26"
 rcgen = "0.13"
+tokio-tungstenite = "0.29"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 smoltcp = "0.14.0"

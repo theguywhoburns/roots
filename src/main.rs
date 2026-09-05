@@ -75,6 +75,16 @@ async fn main() {
         }
         return;
     }
+    if uri.starts_with("ws://") {
+        match client.connect_ws(&uri).await {
+            Ok(conn) => run(client, conn, hold).await,
+            Err(e) => {
+                eprintln!("connect failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     match client.connect(&uri).await {
         Ok(conn) => run(client, conn, hold).await,
         Err(e) => {
