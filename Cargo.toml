@@ -1,0 +1,30 @@
+[package]
+name = "roots"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "roots"
+path = "src/lib.rs"
+
+[[bin]]
+name = "roots"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+blake2 = "0.10"
+thiserror = "2"
+hex = "0.4"
+rand = "0.8"
+curve25519-dalek = "4"
+crypto_box = "0.9"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = "0.26"
+rcgen = "0.13"
+
+[dev-dependencies]
+smoltcp = "0.14.0"
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }
