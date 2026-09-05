@@ -27,8 +27,28 @@ fn report(router: &Router) {
         router.frames
     );
     if std::env::var("ROOTS_DBG_DUMP").is_ok() {
-        router.dump();
+        print!("{}", router.dump());
     }
+}
+
+async fn run<T: roots::Transport>(
+    client: Client,
+    mut conn: roots::PeerConn<T>,
+    hold: Option<std::time::Duration>,
+) {
+    show("remote", &conn.remote_key);
+    let peer_key = conn.remote_key;
+    let mut router = Router::new(client.key);
+    let mut no_out = Vec::new();
+    if let Err(e) = router.register(&mut conn, peer_key).await {
+        eprintln!("register failed: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = router.serve(&mut conn, peer_key, hold, &mut no_out).await {
+        eprintln!("link dropped: {e}");
+        std::process::exit(1);
+    }
+    report(&router);
 }
 
 #[tokio::main]
@@ -46,46 +66,20 @@ async fn main() {
     let client = Client::new(key);
     println!("local  addr {}", client.address());
     if uri.starts_with("tls://") {
-        let mut conn = match client.connect_tls(&uri).await {
-            Ok(c) => c,
+        match client.connect_tls(&uri).await {
+            Ok(conn) => run(client, conn, hold).await,
             Err(e) => {
                 eprintln!("connect failed: {e}");
                 std::process::exit(1);
             }
-        };
-        let peer_key = conn.remote_key;
-        show("remote", &peer_key);
-        let mut router = Router::new(client.key);
-        let mut no_out = Vec::new();
-        if let Err(e) = router.register(&mut conn, peer_key).await {
-            eprintln!("register failed: {e}");
-            std::process::exit(1);
         }
-        if let Err(e) = router.serve(&mut conn, peer_key, hold, &mut no_out).await {
-            eprintln!("link dropped: {e}");
-            std::process::exit(1);
-        }
-        report(&router);
         return;
     }
-    let mut conn = match client.connect(&uri).await {
-        Ok(c) => c,
+    match client.connect(&uri).await {
+        Ok(conn) => run(client, conn, hold).await,
         Err(e) => {
             eprintln!("connect failed: {e}");
             std::process::exit(1);
         }
-    };
-    let peer_key = conn.remote_key;
-    show("remote", &peer_key);
-    let mut router = Router::new(client.key);
-    let mut no_out = Vec::new();
-    if let Err(e) = router.register(&mut conn, peer_key).await {
-        eprintln!("register failed: {e}");
-        std::process::exit(1);
     }
-    if let Err(e) = router.serve(&mut conn, peer_key, hold, &mut no_out).await {
-        eprintln!("link dropped: {e}");
-        std::process::exit(1);
-    }
-    report(&router);
 }

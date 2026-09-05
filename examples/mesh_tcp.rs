@@ -4,78 +4,16 @@
 //!
 //! Run: `cargo run -q --example mesh_tcp -- tcp://bode.theender.net:42069`
 
-use std::collections::VecDeque;
+mod common;
+
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use roots::{Client, Router};
-
-struct MeshPhy {
-    rx: VecDeque<Vec<u8>>,
-    tx: VecDeque<Vec<u8>>,
-}
-
-struct MeshRx {
-    pkt: Vec<u8>,
-}
-
-struct MeshTx<'a> {
-    out: &'a mut VecDeque<Vec<u8>>,
-}
-
-impl Device for MeshPhy {
-    type RxToken<'a> = MeshRx;
-    type TxToken<'a> = MeshTx<'a>;
-
-    fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx.pop_front().map(|pkt| {
-            let tx = MeshTx { out: &mut self.tx };
-            (MeshRx { pkt }, tx)
-        })
-    }
-
-    fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(MeshTx { out: &mut self.tx })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1280;
-        caps
-    }
-}
-
-impl RxToken for MeshRx {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(&self.pkt)
-    }
-}
-
-impl TxToken for MeshTx<'_> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let mut buf = vec![0u8; len];
-        let r = f(&mut buf);
-        self.out.push_back(buf);
-        r
-    }
-}
-
-fn smol_now(start: Instant) -> SmolInstant {
-    SmolInstant::from_millis(start.elapsed().as_millis() as i64)
-}
 
 async fn drive(
     router: &mut Router,
@@ -138,56 +76,24 @@ async fn main() {
 
     // Stacks: A client -> B server port 80.
     let start = Instant::now();
-    let mut a_phy = MeshPhy {
-        rx: VecDeque::new(),
-        tx: VecDeque::new(),
-    };
-    let mut b_phy = MeshPhy {
-        rx: VecDeque::new(),
-        tx: VecDeque::new(),
-    };
-    let mut a_if = Interface::new(
-        Config::new(HardwareAddress::Ip),
-        &mut a_phy,
-        smol_now(start),
-    );
-    a_if.update_ip_addrs(|a| {
-        a.push(IpCidr::new(IpAddress::Ipv6(a_ip), 128)).unwrap();
-    });
-    a_if.routes_mut()
-        .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED)
-        .unwrap();
-    let mut b_if = Interface::new(
-        Config::new(HardwareAddress::Ip),
-        &mut b_phy,
-        smol_now(start),
-    );
-    b_if.update_ip_addrs(|a| {
-        a.push(IpCidr::new(IpAddress::Ipv6(b_ip), 128)).unwrap();
-    });
-    b_if.routes_mut()
-        .add_default_ipv6_route(std::net::Ipv6Addr::UNSPECIFIED)
-        .unwrap();
+    let mut a_phy = common::MeshPhy::new();
+    let mut b_phy = common::MeshPhy::new();
+    let mut a_if = common::new_iface(&mut a_phy, a_ip, start);
+    let mut b_if = common::new_iface(&mut b_phy, b_ip, start);
 
     let mut a_socks = SocketSet::new(vec![]);
-    let mut cs = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; 32768]),
-        tcp::SocketBuffer::new(vec![0; 32768]),
-    );
-    cs.connect(
-        a_if.context(),
-        IpEndpoint::new(IpAddress::Ipv6(b_ip), 80),
-        40000u16,
-    )
-    .unwrap();
-    let c_h = a_socks.add(cs);
+    let c_h = common::new_tcp_socket(&mut a_socks);
+    a_socks
+        .get_mut::<tcp::Socket>(c_h)
+        .connect(
+            a_if.context(),
+            IpEndpoint::new(IpAddress::Ipv6(b_ip), 80),
+            40000u16,
+        )
+        .unwrap();
     let mut b_socks = SocketSet::new(vec![]);
-    let mut ss = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0; 32768]),
-        tcp::SocketBuffer::new(vec![0; 32768]),
-    );
-    ss.listen(80).unwrap();
-    let s_h = b_socks.add(ss);
+    let s_h = common::new_tcp_socket(&mut b_socks);
+    b_socks.get_mut::<tcp::Socket>(s_h).listen(80).unwrap();
 
     let mut a_out: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut b_out: Vec<([u8; 32], Vec<u8>)> = Vec::new();
@@ -209,8 +115,8 @@ async fn main() {
         for (_, p) in rb.inbox.drain(..) {
             b_phy.rx.push_back(p);
         }
-        a_if.poll(smol_now(start), &mut a_phy, &mut a_socks);
-        b_if.poll(smol_now(start), &mut b_phy, &mut b_socks);
+        a_if.poll(common::smol_now(start), &mut a_phy, &mut a_socks);
+        b_if.poll(common::smol_now(start), &mut b_phy, &mut b_socks);
         while let Some(p) = a_phy.tx.pop_front() {
             a_out.push((b_pub, p));
         }

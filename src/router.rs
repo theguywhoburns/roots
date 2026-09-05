@@ -195,7 +195,6 @@ pub(crate) struct PeerState {
     pub(crate) sent_at: Option<Instant>,
     /// Link priority from the handshake (lowest wins among same-key links;
     /// single link per key for now — used when the conn map lands).
-    #[allow(dead_code)]
     pub(crate) prio: u8,
     /// Connection order (oldest wins final tiebreaks).
     pub(crate) order: u64,
@@ -236,6 +235,11 @@ pub struct Router {
     pub(crate) resend: Vec<([u8; KEY_LEN], Vec<u8>)>,
     /// Delivered session payloads: `(from_key, bytes)`.
     pub inbox: Vec<([u8; KEY_LEN], Vec<u8>)>,
+    /// Our advertised nodeinfo (raw JSON; see `src/proto.rs`).
+    pub(crate) nodeinfo: Vec<u8>,
+    /// Delivered session-protocol responses: `(from_key, proto_bytes)`
+    /// where `proto_bytes` starts with the `PROTO_*` dispatch byte.
+    pub proto_inbox: Vec<([u8; KEY_LEN], Vec<u8>)>,
     /// Frames received per type (for diagnostics).
     pub frames: [u64; 10],
     pub announces_sent: u64,
@@ -274,6 +278,8 @@ impl Router {
             peer_order: 0,
             resend: Vec::new(),
             inbox: Vec::new(),
+            nodeinfo: crate::proto::NODEINFO_DEFAULT.to_vec(),
+            proto_inbox: Vec::new(),
             frames: [0; 10],
             announces_sent: 0,
             announces_recv: 0,
@@ -308,32 +314,47 @@ impl Router {
         self.infos.len()
     }
 
-    /// Debug dump of tree + path state (gated behind `ROOTS_DBG_DUMP`).
-    pub fn dump(&self) {
+    /// Debug snapshot of tree + path + link state. Returns text instead of
+    /// printing: the lib never writes to stderr; binaries decide (gated
+    /// behind `ROOTS_DBG_DUMP` in `src/main.rs`).
+    pub fn dump(&self) -> String {
+        let mut out = String::new();
+        let mut peers: Vec<_> = self.peers.keys().collect();
+        peers.sort();
+        for k in peers {
+            let p = &self.peers[k];
+            out.push_str(&format!(
+                "PEER key={} prio={} order={}\n",
+                hex::encode(k),
+                p.prio,
+                p.order
+            ));
+        }
         let mut keys: Vec<_> = self.infos.keys().collect();
         keys.sort();
         for k in keys {
             let i = &self.infos[k];
-            eprintln!(
-                "INFO key={} parent={} seq={} port={}",
+            out.push_str(&format!(
+                "INFO key={} parent={} seq={} port={}\n",
                 hex::encode(k),
                 hex::encode(i.parent),
                 i.res.req.seq,
                 i.res.port
-            );
+            ));
         }
         let mut paths: Vec<_> = self.paths.keys().collect();
         paths.sort();
         for k in paths {
             let e = &self.paths[k];
-            eprintln!(
-                "PATH key={} path={:?} seq={}",
+            out.push_str(&format!(
+                "PATH key={} path={:?} seq={}\n",
                 hex::encode(k),
                 e.path,
                 e.seq
-            );
+            ));
         }
-        eprintln!("SELF coords={:?}", self.root_path());
+        out.push_str(&format!("SELF coords={:?}\n", self.root_path()));
+        out
     }
 
     /// True when we hold a live source route to `key` (for diagnostics).
@@ -1376,14 +1397,6 @@ mod tests {
             let _ = router
                 .serve(&mut conn, key, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
-            if std::env::var("ROOTS_DBG_LU").is_ok() {
-                eprintln!(
-                    "DBGLU B FINAL parent={:?} infos={} ann_sent={}",
-                    router.parent().map(hex::encode),
-                    router.known_nodes(),
-                    router.announces_sent
-                );
-            }
             router
         });
         let uri = format!("tcp://{addr}");

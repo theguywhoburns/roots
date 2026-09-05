@@ -11,6 +11,7 @@ pub mod frame;
 pub mod handshake;
 pub mod link;
 pub mod pathfind;
+pub mod proto;
 pub mod router;
 pub mod session;
 pub mod tls;

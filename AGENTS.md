@@ -13,9 +13,9 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 
 - `src/lib.rs` — library root (`Client`, re-exports). `src/main.rs` — thin demo probe (dial + router status), not the product.
 - `src/address.rs` — key→IPv6 derivation. `src/handshake.rs` — link `meta` codec. `src/link.rs` — `Transport` trait + TCP dial/listen/handshake, backoff + `?maxbackoff=`/`?sni=` URI opts. `src/tls.rs` — `Tls` transport (rustls/ring, NoVerify like Go InsecureSkipVerify, rcgen self-signed listener). `src/frame.rs` — ironwood link framing + uvarint/path helpers.
-- `src/router.rs` — spanning-tree router (owns all protocol state). `src/bloom.rs`, `src/pathfind.rs`, `src/session.rs`, `src/traffic.rs` — `impl Router` protocol extensions + wire types.
-- `src/router.rs` API notes: `register()` is once per LINK, `serve()` drives slices of it; `resolve()` maps IPv6 addr→node key over DHT; `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `has_path/has_session/path_details` + `dump()` are diagnostics.
-- `examples/` (dev-deps only, lib never sees them): `http_fetch` (smoltcp TCP GET), `mesh_tcp` (bilateral TCP, both ends ours), `irc_watch` (smoltcp IRC: register/LIST/JOIN #en, verified live), `ping6`, `listen_ping`, `oracle_probe` (one payload + ticks), `tcp_proxy` (logging MITM proxy), `hs_answer` (cross-impl handshake helper).
+- `src/router.rs` — spanning-tree router (owns all protocol state). `src/bloom.rs`, `src/pathfind.rs`, `src/session.rs`, `src/traffic.rs`, `src/proto.rs` — `impl Router` protocol extensions + wire types.
+- `src/router.rs` API notes: `register()` is once per LINK, `serve()` drives slices of it; `resolve()` maps IPv6 addr→node key over DHT; `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `proto_send`/`request_nodeinfo`/`request_debug` frame `typeSessionProto` (replies land in `proto_inbox`); `set_nodeinfo` advertises JSON (≤16384 B); `has_path/has_session/path_details` + `dump()` (returns `String`, never prints) are diagnostics.
+- `examples/` (dev-deps only, lib never sees them): `common/` (shared smoltcp `MeshPhy` bridge + `new_iface`/`new_tcp_socket`/`smol_now`, used by all TCP examples and `tests/tcp_loopback.rs` via `#[path]`), `http_fetch` (smoltcp TCP GET), `mesh_tcp` (bilateral TCP, both ends ours), `irc_watch` (smoltcp IRC: register/LIST/JOIN #ru, verified live — first user message caught 2026-09-06), `proto_probe` (nodeinfo/debug exchange with a Go node, verified live), `ping6`, `listen_ping`, `oracle_probe` (one payload + ticks), `tcp_proxy` (logging MITM proxy), `hs_answer` (cross-impl handshake helper).
 - `tests/`: `mesh_ping.rs` (`#[ignore]`, A↔B ICMPv6 via public peer), `reconnect.rs` (drop→redial delivery), `tcp_loopback.rs` (pure smoltcp driver check, no mesh).
 - Build artifacts in `/target` (gitignored). Do not commit.
 
@@ -31,13 +31,14 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 
 - `register()` once per link, `serve()` per slice. Registering per slice re-sends SigReq + replays announces every 250ms (~800 dupes/run) and the peer answers each one — looks exactly like a protocol storm in frame counters.
 - `SigRes.psig` and announce `sig` cover node + parent + req + **port** — signing the bare req bytes verifies against nothing (caught by `announce_chain_verifies`).
-- Session payloads need the `typeSessionTraffic` (1) leading byte (`Core.WriteTo` adds it, `Core.ReadFrom` dispatches on it) — Go silently drops anything else, including valid IPv6 starting with 0x60. Wrap in `session_send`, strip on inbox delivery (live-fetch outage, guarded by `packet_type_constants_match_go`).
+- Session payloads need the `typeSessionTraffic` (1) leading byte (`Core.WriteTo` adds it, `Core.ReadFrom` dispatches on it) — Go silently drops anything else, including valid IPv6 starting with 0x60. Wrap in `session_send`, strip on inbox delivery (live-fetch outage, guarded by `packet_type_constants_match_go`). Same framing for `typeSessionProto` (2): `proto_send` wraps, `handle_proto_bytes` dispatches.
+- Pre-session send buffer is a SINGLE slot, last write wins — Go `_bufferAndInit` does `buf.data = msg` unconditionally. Queueing 4 proto requests before the session opens delivers only the last; stagger behind `has_session` (caught live by `proto_probe`: only GETTREE arrived).
 - Bloom hashes must be bit-identical Murmur3-x64-128 `sum256` (`bloom.rs`), not any standard murmur3 crate default — verified by `bloom_vector_matches_go`.
 - DHT rumors rendezvous by TRANSFORMED key (`xkey`), not dest key — a notify from the full key must match a lookup for a partial key. Keying rumors by dest silently drops all resolutions.
 - `serve()` answers keepalive to every non-keepalive frame (Go `peerMonitor` semantics); the link drops in ~3s without it. (Known deviation: Go uses a 1s timer cancelled by sends; we reply immediately — harmless chatter.)
 - Single link per `Router::serve` today; multi-peer needs a connection map (`write_to_peer` is the seam). `prio`/`order` tiebreaks are wired for it.
 - Live-test peers: `tcp://bode.theender.net:42069` (reliable); `yggdrasil.su:62486` throttled us after heavy dialing. Stagger dials; `dial_retry` in the mesh test.
-- Env-gated debug taps exist (`ROOTS_DBG_DUMP` in main, `dump()` on Router); lib has no other `eprintln!` paths.
+- Env-gated debug tap: `ROOTS_DBG_DUMP` in `src/main.rs` prints `Router::dump()` (a `String`; the lib never writes to stderr — fatal `connect/register/link` errors in binaries are the only `eprintln!` paths).
 
 ## Commands
 

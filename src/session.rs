@@ -25,8 +25,8 @@ pub const SESSION_TYPE_TRAFFIC: u8 = 3;
 /// yggdrasil-go `typeSessionTraffic`: leading byte of TUN payloads inside a
 /// session message (`Core.WriteTo` adds it, `Core.ReadFrom` dispatches on it).
 pub const PACKET_TYPE_TRAFFIC: u8 = 1;
-/// yggdrasil-go `typeSessionProto`: protocol payloads (nodeinfo/debug).
-/// Inbound protocol frames are currently dropped (no handler yet).
+/// yggdrasil-go `typeSessionProto`: protocol payloads (nodeinfo/debug,
+/// handled in `src/proto.rs`).
 pub const PACKET_TYPE_PROTO: u8 = 2;
 /// Fixed init/ack message length (Go `sessionInitSize`).
 pub const SESSION_INIT_SIZE: usize = 193;
@@ -196,7 +196,9 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 /// Pending outbound session: buffered initiator keys + one queued payload
-/// (Go `sessionBuffer`, timers as instants).
+/// (Go `sessionBuffer`, timers as instants). The payload carries its
+/// session packet-type byte (`1` traffic / `2` proto) so the flush path
+/// re-frames it exactly as a live send would.
 #[derive(Clone)]
 pub(crate) struct SessionBuf {
     pub init: SessionInit,
@@ -204,7 +206,7 @@ pub(crate) struct SessionBuf {
     pub send_priv: [u8; 32],
     pub next_pub: [u8; 32],
     pub next_priv: [u8; 32],
-    pub data: Option<Vec<u8>>,
+    pub data: Option<(u8, Vec<u8>)>,
     pub deadline: std::time::Instant,
 }
 
@@ -263,8 +265,8 @@ impl crate::router::Router {
                         let enc = ack.encrypt_msg(SESSION_TYPE_ACK, &sk, &from);
                         self.net_send(conn, conn_peer, from, enc).await?;
                     }
-                    if let Some(payload) = buffered.and_then(|b| b.data) {
-                        self.session_send_inner(conn, conn_peer, from, payload)
+                    if let Some((kind, payload)) = buffered.and_then(|b| b.data) {
+                        self.session_send_inner(conn, conn_peer, from, kind, payload)
                             .await?;
                     }
                     return Ok(());
@@ -296,11 +298,20 @@ impl crate::router::Router {
                                 e.deadline = now + crate::pathfind::PATH_TIMEOUT;
                             }
                             // yggdrasil-go dispatches on the leading session
-                            // packet-type byte (`Core.ReadFrom`): 1 = TUN
-                            // traffic (delivered), 2 = protocol (not yet
-                            // implemented here), anything else dropped.
-                            if payload.first() == Some(&PACKET_TYPE_TRAFFIC) {
-                                self.inbox.push((from, payload[1..].to_vec()));
+                            // packet-type byte (`Core.ReadFrom` in
+                            // yggdrasil-go/src/core/core.go): 1 = TUN
+                            // traffic (delivered to the app), 2 = protocol
+                            // (nodeinfo/debug, handled in `src/proto.rs`),
+                            // anything else dropped.
+                            match payload.first() {
+                                Some(&PACKET_TYPE_TRAFFIC) => {
+                                    self.inbox.push((from, payload[1..].to_vec()));
+                                }
+                                Some(&PACKET_TYPE_PROTO) => {
+                                    self.handle_proto_bytes(conn, conn_peer, from, &payload[1..])
+                                        .await?;
+                                }
+                                _ => {}
                             }
                         }
                         None => {
@@ -330,18 +341,22 @@ impl crate::router::Router {
     }
 
     /// Encrypt via the existing session (caller guarantees presence).
-    /// Wraps the raw payload with the `typeSessionTraffic` byte first, so
-    /// callers (fresh sends, buffer flushes, resends) all pass raw bytes
-    /// and double-wrapping is impossible.
+    /// Wraps the raw payload with the session packet-type byte first (`1`
+    /// for TUN traffic, `2` for protocol), so callers (fresh sends, buffer
+    /// flushes, resends) all pass raw bytes and double-wrapping is
+    /// impossible. The buffered-init path stores the same kind byte, so a
+    /// proto request queued before the session exists is still framed as
+    /// proto on flush.
     async fn session_send_inner<T: Transport>(
         &mut self,
         conn: &mut PeerConn<T>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
+        kind: u8,
         msg: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
         let mut wrapped = Vec::with_capacity(msg.len() + 1);
-        wrapped.push(PACKET_TYPE_TRAFFIC);
+        wrapped.push(kind);
         wrapped.extend_from_slice(&msg);
         let enc = self.sessions.get_mut(&dest).map(|(s, active)| {
             *active = std::time::Instant::now();
@@ -366,8 +381,25 @@ impl crate::router::Router {
         dest: [u8; KEY_LEN],
         msg: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
+        self.session_send_kind(conn, conn_peer, dest, PACKET_TYPE_TRAFFIC, msg)
+            .await
+    }
+
+    /// Kind-generalized send: `PACKET_TYPE_TRAFFIC` for TUN payloads,
+    /// `PACKET_TYPE_PROTO` for nodeinfo/debug frames (framing is the only
+    /// difference; session setup and buffering are shared).
+    pub(crate) async fn session_send_kind<T: Transport>(
+        &mut self,
+        conn: &mut PeerConn<T>,
+        conn_peer: [u8; KEY_LEN],
+        dest: [u8; KEY_LEN],
+        kind: u8,
+        msg: Vec<u8>,
+    ) -> Result<(), crate::error::Error> {
         if self.sessions.contains_key(&dest) {
-            return self.session_send_inner(conn, conn_peer, dest, msg).await;
+            return self
+                .session_send_inner(conn, conn_peer, dest, kind, msg)
+                .await;
         }
         let now = std::time::Instant::now();
         let sk = self.key.clone();
@@ -390,7 +422,7 @@ impl crate::router::Router {
                     deadline: now + SESSION_TIMEOUT,
                 }
             });
-            buf.data = Some(msg);
+            buf.data = Some((kind, msg));
             buf.deadline = now + SESSION_TIMEOUT;
             buf.init.clone().encrypt_msg(SESSION_TYPE_INIT, &sk, &dest)
         };

@@ -5,81 +5,17 @@
 //!
 //! smoltcp is a dev-dependency only — the `roots` lib never sees it.
 
-use std::collections::VecDeque;
+mod common;
+
 use std::net::Ipv6Addr;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use smoltcp::iface::{Config, Interface, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint};
+use smoltcp::wire::{IpAddress, IpEndpoint};
 
 use roots::{Client, Router};
-
-/// smoltcp device bridged to one Yggdrasil session: ingress = inbound
-/// session payloads, egress = packets to send to the peer key.
-struct MeshPhy {
-    rx: VecDeque<Vec<u8>>,
-    tx: VecDeque<Vec<u8>>,
-}
-
-struct MeshRx {
-    pkt: Vec<u8>,
-}
-
-struct MeshTx<'a> {
-    out: &'a mut VecDeque<Vec<u8>>,
-}
-
-impl Device for MeshPhy {
-    type RxToken<'a> = MeshRx;
-    type TxToken<'a> = MeshTx<'a>;
-
-    fn receive(&mut self, _ts: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        self.rx.pop_front().map(|pkt| {
-            let tx = MeshTx { out: &mut self.tx };
-            (MeshRx { pkt }, tx)
-        })
-    }
-
-    fn transmit(&mut self, _ts: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(MeshTx { out: &mut self.tx })
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1280;
-        caps
-    }
-}
-
-impl RxToken for MeshRx {
-    fn consume<R, F>(self, f: F) -> R
-    where
-        F: FnOnce(&[u8]) -> R,
-    {
-        f(&self.pkt)
-    }
-}
-
-impl TxToken for MeshTx<'_> {
-    fn consume<R, F>(self, len: usize, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        let mut buf = vec![0u8; len];
-        let r = f(&mut buf);
-        self.out.push_back(buf);
-        r
-    }
-}
-
-fn smol_now(start: Instant) -> SmolInstant {
-    SmolInstant::from_millis(start.elapsed().as_millis() as i64)
-}
 
 #[tokio::main]
 async fn main() {
@@ -131,43 +67,18 @@ async fn main() {
         .await
         .expect("resolve target");
     println!("target key {}", hex::encode(key));
-    if let Some((path, seq)) = router.path_details(&key) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        eprintln!(
-            "DBG learned path={path:?} notify_seq={seq} now={now} age={}",
-            now.saturating_sub(seq)
-        );
-    }
 
     // smoltcp stack with our address, default route into the mesh device.
     let start = Instant::now();
-    let mut phy = MeshPhy {
-        rx: VecDeque::new(),
-        tx: VecDeque::new(),
-    };
-    let config = Config::new(HardwareAddress::Ip);
-    let mut iface = Interface::new(config, &mut phy, smol_now(start));
-    iface.update_ip_addrs(|addrs| {
-        addrs
-            .push(IpCidr::new(IpAddress::Ipv6(our_ip), 128))
-            .unwrap();
-    });
-    iface
-        .routes_mut()
-        .add_default_ipv6_route(Ipv6Addr::UNSPECIFIED)
-        .unwrap();
+    let mut phy = common::MeshPhy::new();
+    let mut iface = common::new_iface(&mut phy, our_ip, start);
     let mut sockets = SocketSet::new(vec![]);
-    let tcp_rx = tcp::SocketBuffer::new(vec![0; 65535]);
-    let tcp_tx = tcp::SocketBuffer::new(vec![0; 65535]);
-    let mut socket = tcp::Socket::new(tcp_rx, tcp_tx);
+    let handle = common::new_tcp_socket(&mut sockets);
     let remote = IpEndpoint::new(IpAddress::Ipv6(target), 80);
-    socket
+    sockets
+        .get_mut::<tcp::Socket>(handle)
         .connect(iface.context(), remote, 40000)
         .expect("tcp connect");
-    let handle = sockets.add(socket);
     let mut outbox: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let mut body: Vec<u8> = Vec::new();
     let mut get_sent = false;
@@ -192,7 +103,7 @@ async fn main() {
             phy.rx.push_back(pkt);
         }
         // Poll TCP.
-        iface.poll(smol_now(start), &mut phy, &mut sockets);
+        iface.poll(common::smol_now(start), &mut phy, &mut sockets);
         // Stack egress -> mesh outbox.
         while let Some(pkt) = phy.tx.pop_front() {
             outbox.push((key, pkt));
