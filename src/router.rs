@@ -17,7 +17,7 @@ use crate::address::KEY_LEN;
 use crate::bloom::BloomFilter;
 use crate::error::Error;
 use crate::frame::{FrameType, append_uvarint, read_uvarint};
-use crate::link::Link;
+use crate::link::{Link, LinkSet};
 use crate::pathfind::NotifyInfo;
 use crate::session::Session;
 
@@ -467,7 +467,7 @@ impl Router {
 
     async fn send_req(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let req = self.new_req();
@@ -478,13 +478,13 @@ impl Router {
         }
         let mut out = Vec::new();
         req.encode(&mut out);
-        conn.write_frame(FrameType::SigReq, &out).await
+        links.write(peer_key, FrameType::SigReq, &out).await
     }
 
     /// Answer an inbound SigReq (Go `_handleRequest`).
     async fn handle_request(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
         req: SigReq,
     ) -> Result<(), Error> {
@@ -492,7 +492,7 @@ impl Router {
         let res = SigRes::seal(req, port, &peer_key, &self.key, &self.pubkey);
         let mut out = Vec::new();
         res.encode(&mut out);
-        conn.write_frame(FrameType::SigRes, &out).await
+        links.write(peer_key, FrameType::SigRes, &out).await
     }
 
     /// Handle an inbound SigRes, checking it answers our open request and
@@ -616,7 +616,7 @@ impl Router {
     }
 
     /// Deterministic parent selection (Go `_fix`). Returns announces to send.
-    async fn fix(&mut self, conn: &mut dyn Link, peer_key: [u8; KEY_LEN]) -> Result<(), Error> {
+    async fn fix(&mut self, links: &mut LinkSet<'_>, peer_key: [u8; KEY_LEN]) -> Result<(), Error> {
         let self_info = self.infos.get(&self.pubkey).copied();
         let mut best_root = self.pubkey;
         let mut best_parent = self.pubkey;
@@ -674,13 +674,13 @@ impl Router {
                 self.refresh = false;
                 self.do_root1 = false;
                 self.do_root2 = false;
-                self.send_all_reqs(conn).await?;
+                self.send_all_reqs(links).await?;
             } else if self.do_root2 {
                 self.become_root();
                 self.refresh = false;
                 self.do_root1 = false;
                 self.do_root2 = false;
-                self.send_all_reqs(conn).await?;
+                self.send_all_reqs(links).await?;
             } else if !self.do_root1 {
                 self.do_root1 = true;
             }
@@ -719,12 +719,12 @@ impl Router {
         self.self_refresh_at = Some(Instant::now() + ROUTER_REFRESH);
     }
 
-    async fn send_all_reqs(&mut self, conn: &mut dyn Link) -> Result<(), Error> {
+    async fn send_all_reqs(&mut self, links: &mut LinkSet<'_>) -> Result<(), Error> {
         // Go `_sendReqs` clears req/res state and re-requests every peer.
         self.responses.clear();
         let keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
         for k in keys {
-            self.send_req(conn, k).await?;
+            self.send_req(links, k).await?;
         }
         Ok(())
     }
@@ -751,7 +751,7 @@ impl Router {
     /// Send unsent ancestry announces to one peer (Go `_sendAnnounces`).
     async fn send_announces(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let mut to_send: Vec<[u8; KEY_LEN]> = Vec::new();
@@ -771,7 +771,7 @@ impl Router {
                 let ann = info.announce(k);
                 let mut buf = Vec::new();
                 ann.encode(&mut buf);
-                conn.write_frame(FrameType::Announce, &buf).await?;
+                links.write(peer_key, FrameType::Announce, &buf).await?;
                 self.announces_sent += 1;
             }
         }
@@ -780,7 +780,7 @@ impl Router {
 
     fn handle_announce(
         &mut self,
-        _conn: &mut dyn Link,
+        _links: &mut LinkSet<'_>,
         from: [u8; KEY_LEN],
         ann: &Announce,
     ) -> Option<Announce> {
@@ -810,24 +810,6 @@ impl Router {
         }
     }
 
-    /// Write one frame to the link when `target` is that link's peer.
-    /// (Single-link serve keeps one `PeerConn`; this check is what grows
-    /// into a connection map for multi-peer.)
-    pub(crate) async fn write_to_peer(
-        &self,
-        conn: &mut dyn Link,
-        conn_peer: [u8; KEY_LEN],
-        target: [u8; KEY_LEN],
-        ftype: FrameType,
-        payload: &[u8],
-    ) -> Result<(), Error> {
-        if target == conn_peer {
-            conn.write_frame(ftype, payload).await
-        } else {
-            Ok(())
-        }
-    }
-
     /// Resolve an IPv6 address to its full node key: look up the partial
     /// key until a signed path-notify names a key with this address.
     /// Handles both node addresses (`02…`) and routed subnets (`03…`, resolved
@@ -836,7 +818,7 @@ impl Router {
     /// [`Error::Timeout`].
     pub async fn resolve(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         addr: &crate::address::Address,
         timeout: Duration,
@@ -847,19 +829,19 @@ impl Router {
         while tokio::time::Instant::now() < end {
             // Via the rumor path (creates the pending entry that lets us
             // accept the arriving notify), like Go's `SendLookup`.
-            self.rumor_lookup(conn, conn_peer, partial).await?;
+            self.rumor_lookup(links, conn_peer, partial).await?;
             // Keep the tree alive while resolving (same tick as serve).
             let now = tokio::time::Instant::now();
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
-                self.maintain(conn, conn_peer).await?;
+                self.maintain(links, conn_peer).await?;
             }
             let remaining = end.saturating_duration_since(tokio::time::Instant::now());
             let wait = remaining.min(Duration::from_secs(2));
             match tokio::time::timeout(wait, conn.read_frame()).await {
                 Ok(Ok((ftype, payload))) => {
                     self.frames[ftype as usize] += 1;
-                    self.dispatch_frame(conn, conn_peer, ftype, &payload)
+                    self.dispatch_frame(links, conn_peer, ftype, &payload)
                         .await?;
                 }
                 Ok(Err(e)) => return Err(e),
@@ -887,13 +869,13 @@ impl Router {
     /// One maintenance tick: expire, fix parent, send announces.
     pub async fn maintain(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         self.expire();
-        self.fix(conn, peer_key).await?;
-        self.send_announces(conn, peer_key).await?;
-        self.bloom_maintenance(conn, peer_key).await?;
+        self.fix(links, peer_key).await?;
+        self.send_announces(links, peer_key).await?;
+        self.bloom_maintenance(links, peer_key).await?;
         self.expire_ephemeral();
         // Re-drive lookups for still-pending rumors (a lookup sent before
         // blooms converged is dropped, not queued — Go relies on the app
@@ -908,7 +890,7 @@ impl Router {
             .map(|(_, r)| r.dest)
             .collect();
         for dest in pending {
-            self.rumor_lookup(conn, peer_key, dest).await?;
+            self.rumor_lookup(links, peer_key, dest).await?;
         }
         Ok(())
     }
@@ -927,7 +909,7 @@ impl Router {
     /// every non-keepalive type (Go `peerMonitor` semantics).
     pub(crate) async fn dispatch_frame(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         ftype: FrameType,
         payload: &[u8],
@@ -938,9 +920,9 @@ impl Router {
                 if let Ok((req, n)) = SigReq::decode(payload)
                     && n == payload.len()
                 {
-                    self.handle_request(conn, conn_peer, req).await?;
+                    self.handle_request(links, conn_peer, req).await?;
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::SigRes => {
                 if let Ok((res, n)) = SigRes::decode(payload)
@@ -949,52 +931,52 @@ impl Router {
                 {
                     self.handle_response(conn_peer, res);
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::Announce => {
                 if let Ok(ann) = Announce::decode_exact(payload)
                     && ann.check()
                 {
-                    let reply = self.handle_announce(conn, conn_peer, &ann);
+                    let reply = self.handle_announce(links, conn_peer, &ann);
                     if let Some(better) = reply {
                         let mut buf = Vec::new();
                         better.encode(&mut buf);
-                        conn.write_frame(FrameType::Announce, &buf).await?;
+                        links.write(conn_peer, FrameType::Announce, &buf).await?;
                         self.announces_sent += 1;
                     }
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::BloomFilter => {
                 let _ = self.bloom_handle(conn_peer, payload);
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::PathLookup => {
                 if let Ok(lookup) = crate::pathfind::PathLookup::decode_exact(payload) {
-                    self.handle_lookup(conn, conn_peer, conn_peer, &lookup)
+                    self.handle_lookup(links, conn_peer, conn_peer, &lookup)
                         .await?;
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::PathNotify => {
                 if let Ok(notify) = crate::pathfind::PathNotify::decode_exact(payload)
                     && notify.check()
                 {
-                    self.handle_notify(conn, conn_peer, &notify).await?;
+                    self.handle_notify(links, conn_peer, &notify).await?;
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::PathBroken => {
                 if let Ok(broken) = crate::pathfind::PathBroken::decode_exact(payload) {
-                    self.handle_broken(conn, conn_peer, &broken).await?;
+                    self.handle_broken(links, conn_peer, &broken).await?;
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
             FrameType::Traffic => {
                 if let Ok(tr) = crate::traffic::Traffic::decode(payload) {
-                    self.handle_inbound_traffic(conn, conn_peer, &tr).await?;
+                    self.handle_inbound_traffic(links, conn_peer, &tr).await?;
                 }
-                conn.write_frame(FrameType::KeepAlive, &[]).await?;
+                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
             }
         }
         Ok(())
@@ -1010,7 +992,7 @@ impl Router {
     /// fail mid-write are re-queued into `resend` for the next link.
     pub async fn serve(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
@@ -1019,7 +1001,7 @@ impl Router {
         outgoing.splice(..0, std::mem::take(&mut self.resend));
         let end = hold_for.map(|h| tokio::time::Instant::now() + h);
         let mut last_maintain = tokio::time::Instant::now();
-        self.maintain(conn, peer_key).await?;
+        self.maintain(links, peer_key).await?;
         loop {
             let now = tokio::time::Instant::now();
             if let Some(end) = end
@@ -1028,11 +1010,11 @@ impl Router {
                 break;
             }
             for (dest, msg) in std::mem::take(outgoing) {
-                self.session_send(conn, peer_key, dest, msg).await?;
+                self.session_send(links, peer_key, dest, msg).await?;
             }
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
-                self.maintain(conn, peer_key).await?;
+                self.maintain(links, peer_key).await?;
             }
             let timeout = end
                 .map(|e| e.saturating_duration_since(now))
@@ -1041,7 +1023,7 @@ impl Router {
             match tokio::time::timeout(timeout, conn.read_frame()).await {
                 Ok(Ok((ftype, payload))) => {
                     self.frames[ftype as usize] += 1;
-                    self.dispatch_frame(conn, peer_key, ftype, &payload).await?;
+                    self.dispatch_frame(links, peer_key, ftype, &payload).await?;
                 }
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {}

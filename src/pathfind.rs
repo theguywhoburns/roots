@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{FrameType, append_path, append_uvarint, read_uvarint, split_path};
-use crate::link::Link;
+use crate::link::{Link, LinkSet};
 
 /// Learned source route to a node (Go `pathInfo`, timers as instants).
 #[derive(Debug, Clone)]
@@ -287,7 +287,7 @@ impl crate::router::Router {
     /// Originate a lookup (Go `_sendLookup` + `_handleLookup` for self).
     pub(crate) async fn send_lookup(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -299,7 +299,7 @@ impl crate::router::Router {
             dest,
             from: self.root_path().unwrap_or_default(),
         };
-        self.handle_lookup(conn, conn_peer, self.pubkey, &lookup)
+        self.handle_lookup(links, conn_peer, self.pubkey, &lookup)
             .await
     }
 
@@ -307,7 +307,7 @@ impl crate::router::Router {
     /// then answer directly on a transformed-key match.
     pub(crate) async fn handle_lookup(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         lookup: &PathLookup,
@@ -315,7 +315,7 @@ impl crate::router::Router {
         let mut buf = Vec::new();
         lookup.encode(&mut buf);
         self.multicast(
-            conn,
+            links,
             conn_peer,
             from,
             lookup.dest,
@@ -345,14 +345,14 @@ impl crate::router::Router {
             dest: lookup.source,
             info,
         };
-        self.handle_notify(conn, conn_peer, &notify).await
+        self.handle_notify(links, conn_peer, &notify).await
     }
 
     /// Handle a notify: forward toward its path, or accept it when we are
     /// the destination (Go `_handleNotify`).
     pub(crate) async fn handle_notify(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         notify: &PathNotify,
     ) -> Result<(), Error> {
@@ -360,9 +360,7 @@ impl crate::router::Router {
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
-            return self
-                .write_to_peer(conn, conn_peer, next, FrameType::PathNotify, &buf)
-                .await;
+            return links.write(next, FrameType::PathNotify, &buf).await;
         }
         if notify.dest != self.pubkey {
             return Ok(());
@@ -411,7 +409,7 @@ impl crate::router::Router {
             .and_then(|r| r.pending.take())
         {
             let dest = notify.source;
-            self.pathfinder_send(conn, conn_peer, dest, data).await?;
+            self.pathfinder_send(links, conn_peer, dest, data).await?;
         }
         Ok(())
     }
@@ -419,7 +417,7 @@ impl crate::router::Router {
     /// Handle a broken-path report (Go `_handleBroken`).
     pub(crate) async fn handle_broken(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         broken: &PathBroken,
     ) -> Result<(), Error> {
@@ -427,9 +425,7 @@ impl crate::router::Router {
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
-            return self
-                .write_to_peer(conn, conn_peer, next, FrameType::PathBroken, &buf)
-                .await;
+            return links.write(next, FrameType::PathBroken, &buf).await;
         }
         if broken.source != self.pubkey {
             return Ok(());
@@ -439,7 +435,7 @@ impl crate::router::Router {
                 e.broken = true;
             }
             let dest = broken.dest;
-            self.rumor_lookup(conn, conn_peer, dest).await?;
+            self.rumor_lookup(links, conn_peer, dest).await?;
         }
         Ok(())
     }
@@ -449,7 +445,7 @@ impl crate::router::Router {
     /// for a partial key.
     pub(crate) async fn rumor_lookup(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -473,14 +469,14 @@ impl crate::router::Router {
         e.send_at = Some(now);
         e.deadline = now + PATH_TIMEOUT;
         // Boxed: the lookup/notify/send graph is mutually recursive.
-        Box::pin(self.send_lookup(conn, conn_peer, dest)).await
+        Box::pin(self.send_lookup(links, conn_peer, dest)).await
     }
 
     /// Send a network-layer payload, attaching the learned path or
     /// buffering behind a lookup (Go `pathfinder._handleTraffic`).
     pub(crate) async fn pathfinder_send(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -499,9 +495,9 @@ impl crate::router::Router {
                 watermark: u64::MAX,
                 payload,
             };
-            return self.route_traffic(conn, conn_peer, &tr).await;
+            return self.route_traffic(links, conn_peer, &tr).await;
         }
-        self.rumor_lookup(conn, conn_peer, dest).await?;
+        self.rumor_lookup(links, conn_peer, dest).await?;
         if let Some(r) = self.rumors.get_mut(&crate::bloom::xkey(&dest)) {
             r.pending = Some(payload);
         }
@@ -512,16 +508,14 @@ impl crate::router::Router {
     /// for the send side; the watermark update is inside `greedy_next`).
     async fn route_traffic(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         tr: &crate::traffic::Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
-            return self
-                .write_to_peer(conn, conn_peer, next, FrameType::Traffic, &buf)
-                .await;
+            return links.write(next, FrameType::Traffic, &buf).await;
         }
         Ok(())
     }

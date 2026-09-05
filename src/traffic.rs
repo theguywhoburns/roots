@@ -7,7 +7,7 @@
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{append_path, append_uvarint, split_path};
-use crate::link::Link;
+use crate::link::{Link, LinkSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Traffic {
@@ -60,26 +60,20 @@ impl crate::router::Router {
     /// addressed to us, or report the path broken (Go `router.handleTraffic`).
     pub(crate) async fn handle_inbound_traffic(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         tr: &Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
-            return self
-                .write_to_peer(
-                    conn,
-                    conn_peer,
-                    next,
-                    crate::frame::FrameType::Traffic,
-                    &buf,
-                )
+            return links
+                .write(next, crate::frame::FrameType::Traffic, &buf)
                 .await;
         }
         if tr.dest == self.pubkey {
             return self
-                .handle_session_bytes(conn, conn_peer, tr.source, &tr.payload)
+                .handle_session_bytes(links, conn_peer, tr.source, &tr.payload)
                 .await;
         }
         let broken = crate::pathfind::PathBroken {
@@ -88,7 +82,7 @@ impl crate::router::Router {
             source: tr.source,
             dest: tr.dest,
         };
-        self.handle_broken(conn, conn_peer, &broken).await
+        self.handle_broken(links, conn_peer, &broken).await
     }
 }
 

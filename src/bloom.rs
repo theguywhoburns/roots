@@ -6,7 +6,7 @@
 
 use crate::address::KEY_LEN;
 use crate::error::Error;
-use crate::link::Link;
+use crate::link::{Link, LinkSet};
 
 /// Bits in the filter.
 pub const BLOOM_M: usize = 8192;
@@ -317,7 +317,7 @@ impl crate::router::Router {
 
     pub(crate) async fn bloom_maintenance(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
     ) -> Result<(), crate::error::Error> {
         self.bloom_fix();
@@ -333,14 +333,7 @@ impl crate::router::Router {
                 self.bloom_send.insert(pk, b.clone());
                 self.bloom_dirty.insert(pk, false);
                 let bytes = b.encode();
-                self.write_to_peer(
-                    conn,
-                    conn_peer,
-                    pk,
-                    crate::frame::FrameType::BloomFilter,
-                    &bytes,
-                )
-                .await?;
+                links.write(pk, crate::frame::FrameType::BloomFilter, &bytes).await?;
             }
         }
         Ok(())
@@ -361,7 +354,7 @@ impl crate::router::Router {
     /// Forward a multicast packet along the tree (Go `_sendMulticast`).
     pub(crate) async fn multicast(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         from_key: [u8; KEY_LEN],
         to_key: [u8; KEY_LEN],
@@ -384,8 +377,7 @@ impl crate::router::Router {
             if !interested {
                 continue;
             }
-            self.write_to_peer(conn, conn_peer, k, ftype, payload)
-                .await?;
+            links.write(k, ftype, payload).await?;
         }
         Ok(())
     }

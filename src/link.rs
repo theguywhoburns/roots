@@ -163,6 +163,64 @@ impl Link for AnyConn {
     }
 }
 
+/// The multi-peer connection map (Slice 10b): one entry per link keyed
+/// by the peer's node key. All router I/O goes through the set, so mixed
+/// transports share one code path; a target with no entry is silently
+/// skipped (a next hop we hold no link for). Single-link callers
+/// (`serve`, `resolve`) wrap their one link and delegate.
+#[derive(Default)]
+pub struct LinkSet<'a> {
+    entries: Vec<([u8; KEY_LEN], &'a mut dyn Link)>,
+}
+
+impl<'a> LinkSet<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Wrap a single link (single-peer callers).
+    pub fn single(peer: [u8; KEY_LEN], link: &'a mut dyn Link) -> Self {
+        Self {
+            entries: vec![(peer, link)],
+        }
+    }
+
+    pub fn add(&mut self, peer: [u8; KEY_LEN], link: &'a mut dyn Link) {
+        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == peer) {
+            slot.1 = link;
+        } else {
+            self.entries.push((peer, link));
+        }
+    }
+
+    /// Peer keys currently in the set (for per-link maintain loops).
+    pub fn peers(&self) -> Vec<[u8; KEY_LEN]> {
+        self.entries.iter().map(|(k, _)| *k).collect()
+    }
+
+    /// Reborrowing access to one link's framed I/O.
+    pub fn get(&mut self, peer: &[u8; KEY_LEN]) -> Option<&mut dyn Link> {
+        self.entries
+            .iter_mut()
+            .find(|(k, _)| k == peer)
+            .map(|(_, l)| &mut **l)
+    }
+
+    /// Write one frame to the link for `target` (no entry = drop).
+    pub async fn write(
+        &mut self,
+        target: [u8; KEY_LEN],
+        ftype: FrameType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        if let Some(link) = self.get(&target) {
+            link.write_frame(ftype, payload).await
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Plain TCP transport.
 pub struct Tcp;
 

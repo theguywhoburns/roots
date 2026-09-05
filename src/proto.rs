@@ -12,7 +12,7 @@
 //! drains and matches.
 
 use crate::address::KEY_LEN;
-use crate::link::Link;
+use crate::link::{Link, LinkSet};
 use crate::session::PACKET_TYPE_PROTO;
 
 /// Protocol dispatch byte: no-op (yggdrasil-go `typeProtoDummy`).
@@ -74,12 +74,12 @@ impl crate::router::Router {
     /// needed — same buffering as traffic sends.
     pub async fn proto_send(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
-        self.session_send_kind(conn, conn_peer, dest, PACKET_TYPE_PROTO, payload)
+        self.session_send_kind(links, conn_peer, dest, PACKET_TYPE_PROTO, payload)
             .await
     }
 
@@ -87,11 +87,11 @@ impl crate::router::Router {
     /// in [`Router::proto_inbox`](crate::router::Router::proto_inbox).
     pub async fn request_nodeinfo(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), crate::error::Error> {
-        self.proto_send(conn, conn_peer, dest, vec![PROTO_NODEINFO_REQ])
+        self.proto_send(links, conn_peer, dest, vec![PROTO_NODEINFO_REQ])
             .await
     }
 
@@ -99,7 +99,7 @@ impl crate::router::Router {
     /// `DEBUG_*_RES` reply arrives in `proto_inbox`.
     pub async fn request_debug(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         what: u8,
@@ -111,7 +111,7 @@ impl crate::router::Router {
             ),
             "request_debug takes a *_REQ subtype"
         );
-        self.proto_send(conn, conn_peer, dest, vec![PROTO_DEBUG, what])
+        self.proto_send(links, conn_peer, dest, vec![PROTO_DEBUG, what])
             .await
     }
 
@@ -121,7 +121,7 @@ impl crate::router::Router {
     /// same accept-and-ignore shape as Go `protoHandler.handleProto`.
     pub(crate) async fn handle_proto_bytes(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         payload: &[u8],
@@ -135,12 +135,12 @@ impl crate::router::Router {
                 let mut out = Vec::with_capacity(self.nodeinfo.len() + 1);
                 out.push(PROTO_NODEINFO_RES);
                 out.extend_from_slice(&self.nodeinfo);
-                self.proto_send(conn, conn_peer, from, out).await?;
+                self.proto_send(links, conn_peer, from, out).await?;
             }
             PROTO_NODEINFO_RES => {
                 self.proto_inbox.push((from, payload.to_vec()));
             }
-            PROTO_DEBUG => self.handle_debug_bytes(conn, conn_peer, from, rest).await?,
+            PROTO_DEBUG => self.handle_debug_bytes(links, conn_peer, from, rest).await?,
             _ => {}
         }
         Ok(())
@@ -148,7 +148,7 @@ impl crate::router::Router {
 
     async fn handle_debug_bytes(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         payload: &[u8],
@@ -170,7 +170,7 @@ impl crate::router::Router {
                 out.push(PROTO_DEBUG);
                 out.push(DEBUG_GETSELF_RES);
                 out.extend_from_slice(body.as_bytes());
-                self.proto_send(conn, conn_peer, from, out).await?;
+                self.proto_send(links, conn_peer, from, out).await?;
             }
             DEBUG_GETPEERS_REQ => {
                 // Go `_handleGetPeersRequest`: concatenated link-peer keys,
@@ -178,7 +178,7 @@ impl crate::router::Router {
                 let mut keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
                 keys.sort();
                 let out = concat_keys(PROTO_DEBUG, DEBUG_GETPEERS_RES, &keys);
-                self.proto_send(conn, conn_peer, from, out).await?;
+                self.proto_send(links, conn_peer, from, out).await?;
             }
             DEBUG_GETTREE_REQ => {
                 // Go `_handleGetTreeRequest`: concatenated known-tree keys,
@@ -186,7 +186,7 @@ impl crate::router::Router {
                 let mut keys: Vec<[u8; KEY_LEN]> = self.infos.keys().copied().collect();
                 keys.sort();
                 let out = concat_keys(PROTO_DEBUG, DEBUG_GETTREE_RES, &keys);
-                self.proto_send(conn, conn_peer, from, out).await?;
+                self.proto_send(links, conn_peer, from, out).await?;
             }
             DEBUG_GETSELF_RES | DEBUG_GETPEERS_RES | DEBUG_GETTREE_RES => {
                 let _ = rest;
