@@ -19,7 +19,7 @@
 
 ## Remaining work (as of 2026-09-06)
 - Code cleanup: DONE 2026-09-06 — `MeshPhy` + `smol_now` + iface/socket helpers factored into `examples/common/`; `Router::dump()` returns `String` (lib prints nothing); `prio`/`order` in `dump()`; `src/main.rs` TCP/TLS/WS branches deduped via generic `run()`; stale debug taps removed; lib/demo-client boundary recorded in `AGENTS.md`.
-- **Library:** multi-peer conn map (DONE 10a 2026-09-06: `dyn Link` trait + `AnyConn` type erasure + `read_frame_from`/`write_frame_to` free fns; DONE 10b 2026-09-06: `LinkSet` map + `serve_links` shared-state multi-link serve, `serve`/`resolve`/`register` keep single-link signatures as thin wrappers; 55 tests green incl. mixed TCP+WS loopback through one set; timing rule: read slices only when multiplexing, single link blocks whole budget), `wss`/`quic` transports, Go-style lazy keepalive (we reply eagerly — harmless chatter), `getPaths`/`getSessions` query snapshots.
+- **Library:** multi-peer conn map (DONE 10a/10b 2026-09-06), god-object split (DONE 2026-09-06: tree protocol `SigReq`/`SigRes`/`Announce` + parent selection out of `router.rs` into `src/tree.rs`; `router.rs` 1578→942 lines, orchestration only; 55 tests green), `wss`/`quic` transports, Go-style lazy keepalive (we reply eagerly — harmless chatter), `getPaths`/`getSessions` query snapshots.
 - **Demo client:** yggdrasilctl-compatible admin adapter (thin mapping over lib queries, no protocol in the lib), TUN plumbing (TUN crate stays a demo-dep), `main.rs` from probe into a small client.
 
 ## Notes for a fresh session

@@ -16,6 +16,7 @@ pub mod router;
 pub mod session;
 pub mod tls;
 pub mod traffic;
+pub mod tree;
 pub mod ws;
 
 pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
