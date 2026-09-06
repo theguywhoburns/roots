@@ -818,11 +818,13 @@ impl Router {
     /// [`Error::Timeout`].
     pub async fn resolve(
         &mut self,
-        links: &mut LinkSet<'_>,
+        conn: &mut dyn Link,
         conn_peer: [u8; KEY_LEN],
         addr: &crate::address::Address,
         timeout: Duration,
     ) -> Result<[u8; KEY_LEN], Error> {
+        let mut links = LinkSet::single(conn_peer, conn);
+        let links = &mut links;
         let partial = crate::address::lookup_key_for_addr(addr);
         let end = tokio::time::Instant::now() + timeout;
         let mut last_maintain = tokio::time::Instant::now();
@@ -838,7 +840,11 @@ impl Router {
             }
             let remaining = end.saturating_duration_since(tokio::time::Instant::now());
             let wait = remaining.min(Duration::from_secs(2));
-            match tokio::time::timeout(wait, conn.read_frame()).await {
+            let frame = match links.get(&conn_peer) {
+                Some(link) => tokio::time::timeout(wait, link.read_frame()).await,
+                None => continue,
+            };
+            match frame {
                 Ok(Ok((ftype, payload))) => {
                     self.frames[ftype as usize] += 1;
                     self.dispatch_frame(links, conn_peer, ftype, &payload)
@@ -875,7 +881,7 @@ impl Router {
         self.expire();
         self.fix(links, peer_key).await?;
         self.send_announces(links, peer_key).await?;
-        self.bloom_maintenance(links, peer_key).await?;
+        self.bloom_maintenance(links).await?;
         self.expire_ephemeral();
         // Re-drive lookups for still-pending rumors (a lookup sent before
         // blooms converged is dropped, not queued — Go relies on the app
@@ -992,8 +998,22 @@ impl Router {
     /// fail mid-write are re-queued into `resend` for the next link.
     pub async fn serve(
         &mut self,
-        links: &mut LinkSet<'_>,
+        conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
+        hold_for: Option<Duration>,
+        outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
+    ) -> Result<(), Error> {
+        self.serve_links(&mut LinkSet::single(peer_key, conn), hold_for, outgoing)
+            .await
+    }
+
+    /// Serve every link in the set through one router: per-link maintain,
+    /// shared session outbox, frames dispatched with their arrival peer.
+    /// Single-link `serve` is this with a one-entry set; multi-peer apps
+    /// register each link once, then slice this.
+    pub async fn serve_links(
+        &mut self,
+        links: &mut LinkSet<'_>,
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
     ) -> Result<(), Error> {
@@ -1001,7 +1021,9 @@ impl Router {
         outgoing.splice(..0, std::mem::take(&mut self.resend));
         let end = hold_for.map(|h| tokio::time::Instant::now() + h);
         let mut last_maintain = tokio::time::Instant::now();
-        self.maintain(links, peer_key).await?;
+        for peer in links.peers() {
+            self.maintain(links, peer).await?;
+        }
         loop {
             let now = tokio::time::Instant::now();
             if let Some(end) = end
@@ -1010,23 +1032,42 @@ impl Router {
                 break;
             }
             for (dest, msg) in std::mem::take(outgoing) {
-                self.session_send(links, peer_key, dest, msg).await?;
+                // Outbox sends are link-agnostic (pathfinder routes); the
+                // first peer key only scopes per-link state refreshes.
+                let peer = links.peers().into_iter().next().unwrap_or(self.pubkey);
+                self.session_send(links, peer, dest, msg).await?;
             }
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
-                self.maintain(links, peer_key).await?;
+                for peer in links.peers() {
+                    self.maintain(links, peer).await?;
+                }
             }
             let timeout = end
                 .map(|e| e.saturating_duration_since(now))
                 .unwrap_or(MAINTENANCE_INTERVAL)
                 .min(MAINTENANCE_INTERVAL);
-            match tokio::time::timeout(timeout, conn.read_frame()).await {
-                Ok(Ok((ftype, payload))) => {
-                    self.frames[ftype as usize] += 1;
-                    self.dispatch_frame(links, peer_key, ftype, &payload).await?;
+            // Drain every link. A single link blocks for the whole budget
+            // (exact old `serve` timing); several links take short slices
+            // each so one quiet link never starves the rest.
+            let slice = if links.peers().len() > 1 {
+                timeout.min(Duration::from_millis(100))
+            } else {
+                timeout
+            };
+            for peer in links.peers() {
+                let frame = match links.get(&peer) {
+                    Some(link) => tokio::time::timeout(slice, link.read_frame()).await,
+                    None => continue,
+                };
+                match frame {
+                    Ok(Ok((ftype, payload))) => {
+                        self.frames[ftype as usize] += 1;
+                        self.dispatch_frame(links, peer, ftype, &payload).await?;
+                    }
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {}
                 }
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {}
             }
         }
         Ok(())
@@ -1162,7 +1203,7 @@ mod tests {
         // Slice 10a: one Router drives a TCP link and a WS link (the WS
         // side type-erased through `AnyConn`) as `&mut dyn Link`. Tree
         // converges and a session opens over the TCP leg.
-        use crate::link::{AnyConn, Link};
+        use crate::link::AnyConn;
 
         let c_sk = SigningKey::from_bytes(&[0x40; 32]);
         let s1_sk = SigningKey::from_bytes(&[0x10; 32]);
@@ -1229,42 +1270,20 @@ mod tests {
         router.register(&mut tcp_conn, tcp_peer).await.unwrap();
         router.register(&mut ws_conn, ws_peer).await.unwrap();
 
-        // Drive both links: maintain each, drain frames from each.
-        let end = tokio::time::Instant::now() + Duration::from_secs(10);
-        while tokio::time::Instant::now() < end {
-            router.maintain(&mut tcp_conn, tcp_peer).await.unwrap();
-            router.maintain(&mut ws_conn, ws_peer).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(100), tcp_conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut tcp_conn, tcp_peer, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(100), ws_conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut ws_conn, ws_peer, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
-            if router.parent().is_some()
-                && router.root_path().is_some()
-                && router.known_nodes() >= 3
-            {
-                break;
-            }
-        }
+        // One router serves both links through a single set (the 10b
+        // shape); TCP stays concrete, WS arrives type-erased.
+        let mut links = LinkSet::single(tcp_peer, &mut tcp_conn);
+        links.add(ws_peer, &mut ws_conn);
+        router
+            .serve_links(&mut links, Some(Duration::from_secs(8)), &mut Vec::new())
+            .await
+            .unwrap();
         assert!(router.parent().is_some(), "converged over mixed links");
         assert!(router.known_nodes() >= 3, "learned both peers");
 
-        // Full stack over the TCP leg through the same dyn interface.
+        // Full stack over the TCP leg through the same set interface.
         router
-            .session_send(&mut tcp_conn, tcp_peer, s1_pub, vec![0])
+            .session_send(&mut links, tcp_peer, s1_pub, vec![0])
             .await
             .unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -1272,23 +1291,20 @@ mod tests {
             if router.has_session(&s1_pub) {
                 break;
             }
-            router.maintain(&mut tcp_conn, tcp_peer).await.unwrap();
-            router.maintain(&mut ws_conn, ws_peer).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(100), tcp_conn.read_frame()).await
-            {
-                router
-                    .dispatch_frame(&mut tcp_conn, tcp_peer, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(100), ws_conn.read_frame()).await
-            {
-                router
-                    .dispatch_frame(&mut ws_conn, ws_peer, ftype, &payload)
-                    .await
-                    .unwrap();
+            router.maintain(&mut links, tcp_peer).await.unwrap();
+            router.maintain(&mut links, ws_peer).await.unwrap();
+            for peer in [tcp_peer, ws_peer] {
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    links.get(&peer).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router
+                        .dispatch_frame(&mut links, peer, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
             }
         }
         assert!(router.has_session(&s1_pub), "session over dyn TCP link");
@@ -1457,20 +1473,26 @@ mod tests {
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
         // Converge first (mirrors serve slices): maintain + dispatch.
-        let end = tokio::time::Instant::now() + Duration::from_secs(4);
-        while tokio::time::Instant::now() < end {
-            router.maintain(&mut conn, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut conn, peer_key, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
-            if router.parent().is_some() && router.root_path().is_some() {
-                break;
+        {
+            let mut links = LinkSet::single(peer_key, &mut conn);
+            let end = tokio::time::Instant::now() + Duration::from_secs(4);
+            while tokio::time::Instant::now() < end {
+                router.maintain(&mut links, peer_key).await.unwrap();
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    links.get(&peer_key).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router.frames[ftype as usize] += 1;
+                    router
+                        .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
+                if router.parent().is_some() && router.root_path().is_some() {
+                    break;
+                }
             }
         }
         assert!(router.parent().is_some(), "A converged");
@@ -1523,20 +1545,26 @@ mod tests {
         let peer_key = conn.remote_key;
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
-        let end = tokio::time::Instant::now() + Duration::from_secs(4);
-        while tokio::time::Instant::now() < end {
-            router.maintain(&mut conn, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut conn, peer_key, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
-            if router.parent().is_some() && router.root_path().is_some() {
-                break;
+        {
+            let mut links = LinkSet::single(peer_key, &mut conn);
+            let end = tokio::time::Instant::now() + Duration::from_secs(4);
+            while tokio::time::Instant::now() < end {
+                router.maintain(&mut links, peer_key).await.unwrap();
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    links.get(&peer_key).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router.frames[ftype as usize] += 1;
+                    router
+                        .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
+                if router.parent().is_some() && router.root_path().is_some() {
+                    break;
+                }
             }
         }
         assert!(router.parent().is_some(), "A converged");

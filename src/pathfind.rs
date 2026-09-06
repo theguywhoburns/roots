@@ -12,7 +12,7 @@ use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{FrameType, append_path, append_uvarint, read_uvarint, split_path};
-use crate::link::{Link, LinkSet};
+use crate::link::LinkSet;
 
 /// Learned source route to a node (Go `pathInfo`, timers as instants).
 #[derive(Debug, Clone)]
@@ -314,15 +314,8 @@ impl crate::router::Router {
     ) -> Result<(), Error> {
         let mut buf = Vec::new();
         lookup.encode(&mut buf);
-        self.multicast(
-            links,
-            conn_peer,
-            from,
-            lookup.dest,
-            FrameType::PathLookup,
-            &buf,
-        )
-        .await?;
+        self.multicast(links, from, lookup.dest, FrameType::PathLookup, &buf)
+            .await?;
         if crate::bloom::xkey(&lookup.dest) != crate::bloom::xkey(&self.pubkey) {
             return Ok(());
         }
@@ -495,7 +488,7 @@ impl crate::router::Router {
                 watermark: u64::MAX,
                 payload,
             };
-            return self.route_traffic(links, conn_peer, &tr).await;
+            return self.route_traffic(links, &tr).await;
         }
         self.rumor_lookup(links, conn_peer, dest).await?;
         if let Some(r) = self.rumors.get_mut(&crate::bloom::xkey(&dest)) {
@@ -509,7 +502,6 @@ impl crate::router::Router {
     async fn route_traffic(
         &mut self,
         links: &mut LinkSet<'_>,
-        conn_peer: [u8; KEY_LEN],
         tr: &crate::traffic::Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();

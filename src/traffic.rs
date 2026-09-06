@@ -7,7 +7,7 @@
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{append_path, append_uvarint, split_path};
-use crate::link::{Link, LinkSet};
+use crate::link::LinkSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Traffic {

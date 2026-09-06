@@ -17,7 +17,7 @@ use sha2::{Digest, Sha512};
 use crate::address::KEY_LEN;
 use crate::error::Error;
 use crate::frame::{append_uvarint, read_uvarint};
-use crate::link::{Link, LinkSet};
+use crate::link::LinkSet;
 
 pub const SESSION_TYPE_INIT: u8 = 1;
 pub const SESSION_TYPE_ACK: u8 = 2;

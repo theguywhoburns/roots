@@ -71,7 +71,11 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
     // handshake, like Go's single-slot sessionBuffer — which is also
     // why the rest wait for the session: last write wins the buffer).
     router
-        .request_nodeinfo(&mut conn, peer_key, peer_key)
+        .request_nodeinfo(
+            &mut roots::LinkSet::single(peer_key, &mut conn),
+            peer_key,
+            peer_key,
+        )
         .await
         .expect("nodeinfo req");
     let mut outbox: Vec<([u8; 32], Vec<u8>)> = Vec::new();
@@ -90,7 +94,12 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
     assert!(router.has_session(&peer_key), "session never opened");
     for what in [DEBUG_GETSELF_REQ, DEBUG_GETPEERS_REQ, DEBUG_GETTREE_REQ] {
         router
-            .request_debug(&mut conn, peer_key, peer_key, what)
+            .request_debug(
+                &mut roots::LinkSet::single(peer_key, &mut conn),
+                peer_key,
+                peer_key,
+                what,
+            )
             .await
             .expect("debug req");
     }

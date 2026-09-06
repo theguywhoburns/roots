@@ -23,7 +23,7 @@ pub use error::Error;
 pub use frame::FrameType;
 pub use handshake::Meta;
 pub use link::{
-    AnyConn, Link, LinkOptions, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri,
+    AnyConn, Link, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri,
 };
 pub use router::Router;
 pub use tls::Tls;

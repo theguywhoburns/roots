@@ -200,10 +200,12 @@ impl<'a> LinkSet<'a> {
 
     /// Reborrowing access to one link's framed I/O.
     pub fn get(&mut self, peer: &[u8; KEY_LEN]) -> Option<&mut dyn Link> {
-        self.entries
-            .iter_mut()
-            .find(|(k, _)| k == peer)
-            .map(|(_, l)| &mut **l)
+        for (k, l) in self.entries.iter_mut() {
+            if k == peer {
+                return Some(&mut **l);
+            }
+        }
+        None
     }
 
     /// Write one frame to the link for `target` (no entry = drop).

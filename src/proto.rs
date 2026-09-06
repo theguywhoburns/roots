@@ -12,7 +12,7 @@
 //! drains and matches.
 
 use crate::address::KEY_LEN;
-use crate::link::{Link, LinkSet};
+use crate::link::LinkSet;
 use crate::session::PACKET_TYPE_PROTO;
 
 /// Protocol dispatch byte: no-op (yggdrasil-go `typeProtoDummy`).
@@ -140,7 +140,10 @@ impl crate::router::Router {
             PROTO_NODEINFO_RES => {
                 self.proto_inbox.push((from, payload.to_vec()));
             }
-            PROTO_DEBUG => self.handle_debug_bytes(links, conn_peer, from, rest).await?,
+            PROTO_DEBUG => {
+                self.handle_debug_bytes(links, conn_peer, from, rest)
+                    .await?
+            }
             _ => {}
         }
         Ok(())
@@ -274,16 +277,7 @@ mod tests {
         router.register(&mut conn, peer_key).await.unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
-            router.maintain(&mut conn, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut conn, peer_key, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
+            drive(&mut router, &mut conn, peer_key).await;
             if router.parent().is_some() && router.root_path().is_some() {
                 break;
             }
@@ -292,7 +286,12 @@ mod tests {
         // Open the session with a throwaway traffic byte so proto
         // requests below send immediately instead of buffering.
         router
-            .session_send(&mut conn, peer_key, b_pub, vec![0])
+            .session_send(
+                &mut LinkSet::single(peer_key, &mut conn),
+                peer_key,
+                b_pub,
+                vec![0],
+            )
             .await
             .unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -300,19 +299,43 @@ mod tests {
             if router.has_session(&b_pub) {
                 break;
             }
-            router.maintain(&mut conn, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(&mut conn, peer_key, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
+            drive(&mut router, &mut conn, peer_key).await;
         }
         assert!(router.has_session(&b_pub), "A has session for B");
         (router, conn, peer_key, b_pub, server)
+    }
+
+    /// One maintain + drain slice over A's single link (wrapped per call
+    /// so the caller's `conn` stays usable between slices).
+    async fn drive(
+        router: &mut Router,
+        conn: &mut crate::link::PeerConn<Tcp>,
+        peer_key: [u8; KEY_LEN],
+    ) {
+        router
+            .maintain(&mut LinkSet::single(peer_key, conn), peer_key)
+            .await
+            .unwrap();
+        if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+            Duration::from_millis(300),
+            LinkSet::single(peer_key, conn)
+                .get(&peer_key)
+                .unwrap()
+                .read_frame(),
+        )
+        .await
+        {
+            router.frames[ftype as usize] += 1;
+            router
+                .dispatch_frame(
+                    &mut LinkSet::single(peer_key, conn),
+                    peer_key,
+                    ftype,
+                    &payload,
+                )
+                .await
+                .unwrap();
+        }
     }
 
     /// Pump A's link until `pred` holds over `proto_inbox`, or time out.
@@ -327,16 +350,7 @@ mod tests {
             if pred(&router.proto_inbox) {
                 return;
             }
-            router.maintain(conn, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), conn.read_frame()).await
-            {
-                router.frames[ftype as usize] += 1;
-                router
-                    .dispatch_frame(conn, peer_key, ftype, &payload)
-                    .await
-                    .unwrap();
-            }
+            drive(router, conn, peer_key).await;
         }
         panic!("proto reply never arrived: {:?}", router.proto_inbox);
     }
@@ -345,7 +359,7 @@ mod tests {
     async fn nodeinfo_round_trip() {
         let (mut router, mut conn, peer_key, b_pub, server) = live_pair(0x11, 0x22).await;
         router
-            .request_nodeinfo(&mut conn, peer_key, b_pub)
+            .request_nodeinfo(&mut LinkSet::single(peer_key, &mut conn), peer_key, b_pub)
             .await
             .unwrap();
         pump_proto(&mut router, &mut conn, peer_key, |inbox| {
@@ -368,7 +382,12 @@ mod tests {
         let (mut router, mut conn, peer_key, b_pub, server) = live_pair(0x33, 0x44).await;
         for what in [DEBUG_GETSELF_REQ, DEBUG_GETPEERS_REQ, DEBUG_GETTREE_REQ] {
             router
-                .request_debug(&mut conn, peer_key, b_pub, what)
+                .request_debug(
+                    &mut LinkSet::single(peer_key, &mut conn),
+                    peer_key,
+                    b_pub,
+                    what,
+                )
                 .await
                 .unwrap();
         }
