@@ -21,10 +21,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use roots::{Client, Router};
 
 /// One admin handler: description + arg names (for `list`) + responder.
+/// Live links as the admin layer sees them: node key + dial URI.
+type LiveLinks = [([u8; 32], String)];
+
 struct Handler {
     desc: &'static str,
     args: Vec<&'static str>,
-    run: fn(&Router, &[u8; 32], &Value) -> Result<Value, String>,
+    run: fn(&Router, &[u8; 32], &LiveLinks, &Value) -> Result<Value, String>,
 }
 
 fn handlers() -> Vec<(&'static str, Handler)> {
@@ -34,7 +37,7 @@ fn handlers() -> Vec<(&'static str, Handler)> {
             Handler {
                 desc: "Show local node info",
                 args: vec![],
-                run: |r, key, _| {
+                run: |r, key, _links, _| {
                     let mut snet = [0u8; 16];
                     snet[..8].copy_from_slice(&roots::subnet_for_key(key).0);
                     let subnet = std::net::Ipv6Addr::from(snet);
@@ -54,20 +57,28 @@ fn handlers() -> Vec<(&'static str, Handler)> {
             Handler {
                 desc: "Show directly connected peers",
                 args: vec![],
-                run: |r, _, _| {
-                    let peers: Vec<Value> = r
+                run: |r, _, live, _| {
+                    // List LIVE links (our owned conns), not stale router
+                    // peer entries: a removed peer must disappear, like Go.
+                    let known: std::collections::HashMap<[u8; 32], (u64, u8, u128)> = r
                         .link_peers()
                         .iter()
-                        .map(|(key, port, prio, up, lag_ms)| {
+                        .map(|(k, port, prio, _, lag)| (*k, (*port, *prio, *lag)))
+                        .collect();
+                    let peers: Vec<Value> = live
+                        .iter()
+                        .map(|(key, uri)| {
+                            let (port, prio, lag_ms) = known.get(key).copied().unwrap_or((0, 0, 0));
                             // Go's peer cost is millisecond-scale like our
                             // lag estimate (unknown links price at u32::MAX).
-                            let ms = (*lag_ms).min(u64::MAX as u128) as u64;
+                            let ms = lag_ms.min(u64::MAX as u128) as u64;
                             json!({
+                                "remote": uri,
                                 "key": hex::encode(key),
                                 "address": roots::addr_for_key(key).to_string(),
                                 "port": port,
                                 "priority": prio,
-                                "up": up,
+                                "up": true,
                                 "inbound": false,
                                 "cost": ms,
                                 "latency": ms.saturating_mul(1_000_000),
@@ -83,7 +94,7 @@ fn handlers() -> Vec<(&'static str, Handler)> {
             Handler {
                 desc: "Show spanning-tree entries",
                 args: vec![],
-                run: |r, _, _| {
+                run: |r, _, _links, _| {
                     let tree: Vec<Value> = r
                         .tree_entries()
                         .iter()
@@ -105,7 +116,7 @@ fn handlers() -> Vec<(&'static str, Handler)> {
             Handler {
                 desc: "Show learned source routes",
                 args: vec![],
-                run: |r, _, _| {
+                run: |r, _, _links, _| {
                     let paths: Vec<Value> = r
                         .get_paths()
                         .iter()
@@ -127,7 +138,7 @@ fn handlers() -> Vec<(&'static str, Handler)> {
             Handler {
                 desc: "Show open E2E sessions",
                 args: vec![],
-                run: |r, _, _| {
+                run: |r, _, _links, _| {
                     let sessions: Vec<Value> = r
                         .get_sessions()
                         .iter()
@@ -297,18 +308,90 @@ async fn main() {
         .unwrap_or_else(|| "127.0.0.1:19019".to_string());
     let mut rng = rand::thread_rng();
     let client = Client::new(SigningKey::generate(&mut rng));
+    let dial_key = client.key.clone();
+    let dial_opts = client.opts.clone();
     let our_key = client.key.verifying_key().to_bytes();
     println!("local  addr {}", client.address());
-    let mut conn = client.connect(&peer).await.expect("dial public peer");
-    let peer_key = conn.remote_key;
+
+    /// One owned link: the type-erased connection plus the URI it was
+    /// dialed with (for addPeer/removePeer bookkeeping).
+    struct OwnedLink {
+        key: [u8; 32],
+        uri: String,
+        conn: roots::AnyConn,
+    }
+
+    async fn dial_owned(
+        dial_key: &SigningKey,
+        dial_opts: &roots::LinkOptions,
+        router: &mut Router,
+        uri: &str,
+    ) -> Result<OwnedLink, String> {
+        // Scheme dispatch mirrors Client::connect_*; failures surface as
+        // Go-style "unable to parse peering URI" / dial errors.
+        async fn handshake<T: roots::Transport>(
+            mut conn: roots::PeerConn<T>,
+            router: &mut Router,
+        ) -> Result<roots::AnyConn, String>
+        where
+            T::Stream: 'static,
+        {
+            let peer = conn.remote_key;
+            router
+                .register(&mut conn, peer)
+                .await
+                .map_err(|e| format!("register failed: {e}"))?;
+            Ok(roots::AnyConn::new(conn))
+        }
+        let tmp = Client::with_options(dial_key.clone(), dial_opts.clone());
+        let bad = |e: roots::Error| {
+            let msg = e.to_string();
+            if msg.starts_with("bad peer URI") {
+                format!("unable to parse peering URI: {msg}")
+            } else {
+                msg
+            }
+        };
+        let (key, conn) = if uri.starts_with("tls://") {
+            let c = tmp.connect_tls(uri).await.map_err(bad)?;
+            (c.remote_key, handshake(c, router).await?)
+        } else if uri.starts_with("ws://") {
+            let c = tmp.connect_ws(uri).await.map_err(bad)?;
+            (c.remote_key, handshake(c, router).await?)
+        } else if uri.starts_with("wss://") {
+            let c = tmp.connect_wss(uri).await.map_err(bad)?;
+            (c.remote_key, handshake(c, router).await?)
+        } else if uri.starts_with("quic://") {
+            let c = tmp.connect_quic(uri).await.map_err(bad)?;
+            (c.remote_key, handshake(c, router).await?)
+        } else {
+            let c = tmp.connect(uri).await.map_err(bad)?;
+            (c.remote_key, handshake(c, router).await?)
+        };
+        Ok(OwnedLink {
+            key,
+            uri: uri.to_string(),
+            conn,
+        })
+    }
+
     let mut router = Router::new(client.key);
-    router
-        .register(&mut conn, peer_key)
+    let first = dial_owned(&dial_key, &dial_opts, &mut router, &peer)
         .await
-        .expect("register");
+        .expect("dial public peer");
+    // Owned links: the set below borrows them, so topology changes
+    // (addPeer/removePeer) rebuild the set afterwards. Fresh clocks on
+    // rebuild only cost one quiet second, well under peer timeouts.
+    let mut owned = vec![first];
+    // (key, uri) mirror for admin arms: `owned` is mutably borrowed by
+    // the link set during serve, so reads go here instead.
+    let mut uris = vec![(owned[0].key, peer.clone())];
     let mut no_out = Vec::new();
     // One set for the whole run (see main loop below).
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::new();
+    for o in owned.iter_mut() {
+        links.add(o.key, &mut o.conn);
+    }
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {
         router
@@ -325,58 +408,141 @@ async fn main() {
     let mut outbox: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let table = handlers();
     let mut pending: Vec<PendingRemote> = Vec::new();
+    // A topology request (addPeer/removePeer) can't mutate `owned` while
+    // the set borrows it, so it is staged here and applied below, after
+    // the set is dropped. The set is rebuilt only on change.
+    enum Topo {
+        Add {
+            sock: tokio::net::TcpStream,
+            echo: Value,
+            uri: String,
+        },
+        Remove {
+            sock: tokio::net::TcpStream,
+            echo: Value,
+            uri: String,
+        },
+    }
     loop {
-        tokio::select! {
-            r = router.serve(&mut links, Some(Duration::from_millis(250)), &mut outbox) => {
-                if let Err(e) = r {
-                    eprintln!("link dropped: {e}");
-                    std::process::exit(1);
+        let mut links = roots::LinkSet::new();
+        for o in owned.iter_mut() {
+            links.add(o.key, &mut o.conn);
+        }
+        // Deferred init: only topology requests break the serve loop,
+        // always carrying their staged change.
+        let topo: Topo;
+        loop {
+            tokio::select! {
+                r = router.serve(&mut links, Some(Duration::from_millis(250)), &mut outbox) => {
+                    if let Err(e) = r {
+                        eprintln!("link dropped: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                a = listener.accept() => {
+                    match a {
+                        Ok((mut sock, _)) => {
+                            match read_request(&mut sock).await {
+                                Ok((name, args, echo)) => {
+                                    if name.is_empty() {
+                                        write_admin_response(sock, &echo, "error", "no request specified", Value::Null).await;
+                                    } else if name == "list" {
+                                        let mut list: Vec<Value> = table.iter().map(|(cmd, h)| {
+                                            json!({"command": cmd, "description": h.desc, "fields": h.args})
+                                        }).collect();
+                                        for (cmd, desc) in REMOTE_COMMANDS {
+                                            list.push(json!({"command": cmd, "description": desc, "fields": ["key"]}));
+                                        }
+                                        for (cmd, desc) in
+                                            [("addpeer", "Add a peer URI"), ("removepeer", "Remove a peer URI")]
+                                        {
+                                            list.push(json!({"command": cmd, "description": desc, "fields": ["uri"]}));
+                                        }
+                                        write_admin_response(sock, &echo, "success", "", json!({ "list": list })).await;
+                                    } else if let Some((_, h)) = table.iter().find(|(cmd, _)| *cmd == name) {
+                                        match (h.run)(&router, &our_key, &uris, &args) {
+                                            Ok(v) => write_admin_response(sock, &echo, "success", "", v).await,
+                                            Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
+                                        }
+                                    } else if let Some(kind) = remote_kind(&name) {
+                                        match parse_key_arg(&args) {
+                                            Ok(key) => pending.push(PendingRemote {
+                                                sock,
+                                                echo,
+                                                key,
+                                                kind,
+                                                sent: false,
+                                                deadline: Instant::now() + REMOTE_TIMEOUT,
+                                            }),
+                                            Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
+                                        }
+                                    } else if name == "addpeer" || name == "removepeer" {
+                                        let uri = args.get("uri").and_then(Value::as_str).unwrap_or("").to_string();
+                                        if uri.is_empty() {
+                                            write_admin_response(sock, &echo, "error", "unable to parse peering URI: empty", Value::Null).await;
+                                        } else if name == "addpeer" {
+                                            topo = Topo::Add { sock, echo, uri };
+                                            break;
+                                        } else {
+                                            topo = Topo::Remove { sock, echo, uri };
+                                            break;
+                                        }
+                                    } else {
+                                        write_admin_response(sock, &echo, "error", &format!("unknown action '{name}', try 'list' for help"), Value::Null).await;
+                                    }
+                                }
+                                Err(e) => eprintln!("admin read: {e}"),
+                            }
+                        }
+                        Err(e) => eprintln!("admin accept: {e}"),
+                    }
                 }
             }
-            a = listener.accept() => {
-                match a {
-                    Ok((mut sock, _)) => {
-                        match read_request(&mut sock).await {
-                            Ok((name, args, echo)) => {
-                                if name.is_empty() {
-                                    write_admin_response(sock, &echo, "error", "no request specified", Value::Null).await;
-                                } else if name == "list" {
-                                    let mut list: Vec<Value> = table.iter().map(|(cmd, h)| {
-                                        json!({"command": cmd, "description": h.desc, "fields": h.args})
-                                    }).collect();
-                                    for (cmd, desc) in REMOTE_COMMANDS {
-                                        list.push(json!({"command": cmd, "description": desc, "fields": ["key"]}));
-                                    }
-                                    write_admin_response(sock, &echo, "success", "", json!({ "list": list })).await;
-                                } else if let Some((_, h)) = table.iter().find(|(cmd, _)| *cmd == name) {
-                                    match (h.run)(&router, &our_key, &args) {
-                                        Ok(v) => write_admin_response(sock, &echo, "success", "", v).await,
-                                        Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
-                                    }
-                                } else if let Some(kind) = remote_kind(&name) {
-                                    match parse_key_arg(&args) {
-                                        Ok(key) => pending.push(PendingRemote {
-                                            sock,
-                                            echo,
-                                            key,
-                                            kind,
-                                            sent: false,
-                                            deadline: Instant::now() + REMOTE_TIMEOUT,
-                                        }),
-                                        Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
-                                    }
-                                } else {
-                                    write_admin_response(sock, &echo, "error", &format!("unknown action '{name}', try 'list' for help"), Value::Null).await;
-                                }
-                            }
-                            Err(e) => eprintln!("admin read: {e}"),
+            // Scope request sends to a live link, if any remain.
+            if let Some(scope) = links.peers().into_iter().next() {
+                service_pending(&mut router, &mut links, scope, &mut pending).await;
+            }
+        }
+        // Set dropped: safe to mutate the owned links.
+        match topo {
+            Topo::Add { sock, echo, uri } => {
+                if owned.iter().any(|o| o.uri == uri) {
+                    write_admin_response(
+                        sock,
+                        &echo,
+                        "error",
+                        "peer is already configured",
+                        Value::Null,
+                    )
+                    .await;
+                } else {
+                    match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
+                        Ok(link) => {
+                            uris.push((link.key, uri));
+                            owned.push(link);
+                            write_admin_response(sock, &echo, "success", "", json!({})).await;
                         }
+                        Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
                     }
-                    Err(e) => eprintln!("admin accept: {e}"),
+                }
+            }
+            Topo::Remove { sock, echo, uri } => {
+                if owned.iter().any(|o| o.uri == uri) {
+                    owned.retain(|o| o.uri != uri);
+                    uris.retain(|(_, u)| *u != uri);
+                    write_admin_response(sock, &echo, "success", "", json!({})).await;
+                } else {
+                    write_admin_response(
+                        sock,
+                        &echo,
+                        "error",
+                        "peer is not configured",
+                        Value::Null,
+                    )
+                    .await;
                 }
             }
         }
-        service_pending(&mut router, &mut links, peer_key, &mut pending).await;
     }
 }
 
