@@ -108,7 +108,7 @@ fn server_config() -> Arc<rustls::ServerConfig> {
 }
 
 /// SNI host: `?sni=` override, else the authority host (brackets stripped).
-fn sni_host(peer: &PeerUri) -> Result<String, Error> {
+pub(crate) fn sni_host(peer: &PeerUri) -> Result<String, Error> {
     if let Some(sni) = &peer.sni {
         return Ok(sni.clone());
     }
@@ -125,7 +125,7 @@ fn sni_host(peer: &PeerUri) -> Result<String, Error> {
         .to_string())
 }
 
-async fn tls_connect(
+pub(crate) async fn tls_connect(
     host_port: &str,
     sni: &str,
     timeout: Duration,
@@ -193,7 +193,13 @@ pub async fn tls_listen(
     let listener = tokio::net::TcpListener::bind(&peer.host_port)
         .await
         .map_err(Error::Io)?;
-    Ok((listener, tokio_rustls::TlsAcceptor::from(server_config())))
+    Ok((listener, server_acceptor()))
+}
+
+/// Self-signed TLS acceptor (Go mints its own node cert the same way;
+/// identity comes from the `meta` handshake, not the certificate).
+pub(crate) fn server_acceptor() -> tokio_rustls::TlsAcceptor {
+    tokio_rustls::TlsAcceptor::from(server_config())
 }
 
 /// Accept one inbound TLS peer and complete the handshake as responder.

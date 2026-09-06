@@ -186,10 +186,25 @@ async fn ws_connect(host_port: &str, timeout: Duration) -> Result<WsStream<TcpSt
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(Error::Io)?;
+    ws_client_handshake(tcp, host_port, "ws", timeout).await
+}
+
+/// WS client handshake over an established byte stream (plain TCP for
+/// `ws://`, TLS for `wss://`): HTTP upgrade offering `ygg-ws`, failing
+/// when the server agrees to anything else.
+async fn ws_client_handshake<S>(
+    stream: S,
+    host_port: &str,
+    scheme: &str,
+    timeout: Duration,
+) -> Result<WsStream<S>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Go dials the authority root with the ygg-ws subprotocol offered.
     // A pre-built `Request` is sent as-is, so fill in the full client
     // handshake headers (key included) ourselves.
-    let url = format!("ws://{host_port}/");
+    let url = format!("{scheme}://{host_port}/");
     let request = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(&url)
         .header("Host", host_port)
@@ -203,7 +218,7 @@ async fn ws_connect(host_port: &str, timeout: Duration) -> Result<WsStream<TcpSt
         .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
         .body(())
         .map_err(|_| Error::BadUri(url.clone()))?;
-    let (ws, response) = tokio::time::timeout(timeout, client_async(request, tcp))
+    let (ws, response) = tokio::time::timeout(timeout, client_async(request, stream))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
@@ -258,13 +273,33 @@ pub async fn ws_listen(uri: &str) -> Result<tokio::net::TcpListener, Error> {
 
 /// Accept one inbound WS peer: HTTP upgrade (requires the `ygg-ws`
 /// subprotocol like the Go server) + `meta` handshake as responder.
-#[allow(clippy::result_large_err)] // tungstenite's `Callback` trait fixes the 136 B `ErrorResponse`; it becomes the HTTP 500 body inside tungstenite
 pub async fn ws_accept(
     listener: &tokio::net::TcpListener,
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Ws>, Error> {
     let (sock, _) = listener.accept().await.map_err(Error::Io)?;
+    let mut stream = ws_server_handshake(sock).await?;
+    let (remote_key, priority) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        crate::link::run_handshake(&mut stream, local, opts, true),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
+    Ok(PeerConn {
+        remote_key,
+        priority,
+        stream,
+    })
+}
+
+/// WS server handshake over an established byte stream (plain TCP for
+/// `ws://`, TLS for `wss://`).
+#[allow(clippy::result_large_err)] // tungstenite's `Callback` trait fixes the 136 B `ErrorResponse`; it becomes the HTTP 500 body inside tungstenite
+async fn ws_server_handshake<S>(sock: S) -> Result<WsStream<S>, Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let ws = accept_hdr_async(sock, |req: &Request, mut res: Response| {
         let offered = req
             .headers()
@@ -293,7 +328,94 @@ pub async fn ws_accept(
     })
     .await
     .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    let mut stream = WsStream::new(ws);
+    Ok(WsStream::new(ws))
+}
+
+/// WebSocket-over-TLS transport (`wss://`). Same `ygg-ws` framing as
+/// [`Ws`], layered on the [`crate::tls`] unauthenticated TLS (Go has no
+/// wss *listener* — "use WS behind a reverse proxy" — but dials wss with
+/// `InsecureSkipVerify`, so stock Go can dial us here).
+pub struct Wss;
+
+impl Transport for Wss {
+    type Stream = WsStream<tokio_rustls::TlsStream<TcpStream>>;
+
+    async fn dial(addr: &str, timeout: Duration) -> Result<Self::Stream, Error> {
+        wss_connect(addr, addr, timeout).await
+    }
+}
+
+async fn wss_connect(
+    host_port: &str,
+    sni: &str,
+    timeout: Duration,
+) -> Result<WsStream<tokio_rustls::TlsStream<TcpStream>>, Error> {
+    let tls: tokio_rustls::TlsStream<TcpStream> = crate::tls::tls_connect(host_port, sni, timeout)
+        .await?
+        .into();
+    ws_client_handshake(tls, host_port, "wss", timeout).await
+}
+
+/// Dial a `wss://` peer: TCP + TLS + WS handshake (`ygg-ws`) + `meta`.
+pub async fn wss_dial(
+    uri: &str,
+    local: &SigningKey,
+    opts: &LinkOptions,
+) -> Result<PeerConn<Wss>, Error> {
+    let (scheme, peer) = parse_link_uri(uri)?;
+    if scheme != Scheme::Wss {
+        return Err(Error::BadUri(uri.to_string()));
+    }
+    let merged = merge_opts(&peer, opts);
+    let sni = crate::tls::sni_host(&peer)?;
+    let mut stream = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        wss_connect(&peer.host_port, &sni, DIAL_TIMEOUT),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
+    let (remote_key, priority) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        crate::link::run_handshake(&mut stream, local, &merged, false),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
+    Ok(PeerConn {
+        remote_key,
+        priority,
+        stream,
+    })
+}
+
+/// Bind a `wss://host:port` listener (TCP + TLS acceptor + WS upgrade).
+pub async fn wss_listen(
+    uri: &str,
+) -> Result<(tokio::net::TcpListener, tokio_rustls::TlsAcceptor), Error> {
+    let (scheme, peer) = parse_link_uri(uri)?;
+    if scheme != Scheme::Wss {
+        return Err(Error::BadUri(uri.to_string()));
+    }
+    let listener = tokio::net::TcpListener::bind(&peer.host_port)
+        .await
+        .map_err(Error::Io)?;
+    Ok((listener, crate::tls::server_acceptor()))
+}
+
+/// Accept one inbound WSS peer: TLS + WS upgrade + `meta` as responder.
+pub async fn wss_accept(
+    listener: &tokio::net::TcpListener,
+    acceptor: &tokio_rustls::TlsAcceptor,
+    local: &SigningKey,
+    opts: &LinkOptions,
+) -> Result<PeerConn<Wss>, Error> {
+    let (sock, _) = listener.accept().await.map_err(Error::Io)?;
+    let tls: tokio_rustls::TlsStream<TcpStream> =
+        tokio::time::timeout(crate::link::TLS_HANDSHAKE_TIMEOUT, acceptor.accept(sock))
+            .await
+            .map_err(|_| Error::Timeout)?
+            .map_err(|e| Error::Io(std::io::Error::other(e)))?
+            .into();
+    let mut stream = ws_server_handshake(tls).await?;
     let (remote_key, priority) = tokio::time::timeout(
         HANDSHAKE_TIMEOUT,
         crate::link::run_handshake(&mut stream, local, opts, true),
@@ -353,12 +475,55 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn wss_loopback_handshake() {
+        let a = SigningKey::from_bytes(&[0x65; 32]);
+        let b = SigningKey::from_bytes(&[0x66; 32]);
+        let (listener, acceptor) = wss_listen("wss://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expect_b = b.verifying_key().to_bytes();
+        let server = tokio::spawn(async move {
+            wss_accept(&listener, &acceptor, &b, &LinkOptions::default())
+                .await
+                .unwrap()
+        });
+        let uri = format!("wss://{addr}");
+        let conn = wss_dial(&uri, &a, &LinkOptions::default()).await.unwrap();
+        assert_eq!(conn.remote_key, expect_b);
+        let srv = server.await.unwrap();
+        assert_eq!(srv.remote_key, a.verifying_key().to_bytes());
+    }
+
+    #[tokio::test]
+    async fn wss_loopback_frames() {
+        let a = SigningKey::from_bytes(&[0x67; 32]);
+        let b = SigningKey::from_bytes(&[0x68; 32]);
+        let (listener, acceptor) = wss_listen("wss://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut c = wss_accept(&listener, &acceptor, &b, &LinkOptions::default())
+                .await
+                .unwrap();
+            let (t, p) = c.read_frame().await.unwrap();
+            assert_eq!((t, p), (FrameType::SigReq, vec![1, 2]));
+            c.write_frame(FrameType::KeepAlive, &[]).await.unwrap();
+        });
+        let uri = format!("wss://{addr}");
+        let mut conn = wss_dial(&uri, &a, &LinkOptions::default()).await.unwrap();
+        conn.write_frame(FrameType::SigReq, &[1, 2]).await.unwrap();
+        let (t, p) = conn.read_frame().await.unwrap();
+        assert_eq!((t, p), (FrameType::KeepAlive, vec![]));
+        server.await.unwrap();
+    }
+
     #[test]
     fn ws_uri_schemes() {
         let (s, p) = parse_link_uri("ws://h:99?password=x&priority=3").unwrap();
         assert_eq!(s, Scheme::Ws);
         assert_eq!(p.password, b"x");
         assert_eq!(p.priority, 3);
+        let (s, _) = parse_link_uri("wss://h:99").unwrap();
+        assert_eq!(s, Scheme::Wss);
         assert!(parse_link_uri("quic://h:1").is_err());
     }
 }

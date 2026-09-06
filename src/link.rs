@@ -2,8 +2,8 @@
 //! [`Transport`] for the stream type and reuse [`run_handshake`].
 //!
 //! URI forms (mirroring Go peer URIs):
-//! `tcp://host:port[?...]`, `tls://host:port[?...]` and
-//! `ws://host:port[?...]`, where `?...` is
+//! `tcp://host:port[?...]`, `tls://host:port[?...]`,
+//! `ws://host:port[?...]` and `wss://host:port[?...]`, where `?...` is
 //! `password=..&priority=..&key=<hex pubkey>&sni=<override>`.
 
 use std::time::Duration;
@@ -274,9 +274,10 @@ pub enum Scheme {
     Tcp,
     Tls,
     Ws,
+    Wss,
 }
 
-/// Parse a `tcp://`, `tls://` or `ws://` peer URI.
+/// Parse a `tcp://`, `tls://`, `ws://` or `wss://` peer URI.
 pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     let (scheme, rest) = if let Some(r) = uri.strip_prefix("tcp://") {
         (Scheme::Tcp, r)
@@ -284,6 +285,8 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
         (Scheme::Tls, r)
     } else if let Some(r) = uri.strip_prefix("ws://") {
         (Scheme::Ws, r)
+    } else if let Some(r) = uri.strip_prefix("wss://") {
+        (Scheme::Wss, r)
     } else {
         return Err(Error::BadUri(uri.to_string()));
     };
