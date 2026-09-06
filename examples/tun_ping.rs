@@ -16,9 +16,8 @@
 //! the serve outbox.
 //!
 //! NOTE: only packets addressed to the peer ride the session (kernel
-//! link-local chatter stays local). Besides being correct, this keeps a
-//! single session initiator: crossed simultaneous session opens from
-//! both ends currently stall (known limitation, see AGENTS.md).
+//! link-local chatter stays local — besides being correct, this avoids
+//! exact-crossed simultaneous session opens for routine noise).
 
 mod common;
 

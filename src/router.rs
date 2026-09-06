@@ -71,6 +71,8 @@ pub struct Router {
     /// App payloads that failed mid-write on a dead link, retried on the
     /// next link (at-least-once across reconnects; duplicates possible).
     pub(crate) resend: Vec<([u8; KEY_LEN], Vec<u8>)>,
+    /// Last session-init sequence number issued (see `next_init_seq`).
+    pub(crate) init_seq: std::sync::atomic::AtomicU64,
     /// Delivered session payloads: `(from_key, bytes)`.
     pub inbox: Vec<([u8; KEY_LEN], Vec<u8>)>,
     /// Our advertised nodeinfo (raw JSON; see `src/proto.rs`).
@@ -115,6 +117,7 @@ impl Router {
             session_bufs: HashMap::new(),
             peer_order: 0,
             resend: Vec::new(),
+            init_seq: std::sync::atomic::AtomicU64::new(0),
             inbox: Vec::new(),
             nodeinfo: crate::proto::NODEINFO_DEFAULT.to_vec(),
             proto_inbox: Vec::new(),
@@ -126,6 +129,23 @@ impl Router {
 
     pub fn pubkey(&self) -> [u8; KEY_LEN] {
         self.pubkey
+    }
+
+    /// Next session-init sequence number: strictly increasing per router.
+    /// (Go stamps `unix_now()` seconds, so crossed inits/acks inside one
+    /// second collide and are dropped as stale — deadlocking fast crossed
+    /// opens. Peers only ever require `seq` greater than the last seen,
+    /// so a local monotonic counter is wire-compatible and strictly more
+    /// robust. `Cell` because init/ack building happens while session
+    /// state is already borrowed.)
+    pub(crate) fn next_init_seq(&self) -> u64 {
+        let n = (crate::session::unix_now() + 1).max(
+            self.init_seq
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(1),
+        );
+        self.init_seq.store(n, std::sync::atomic::Ordering::Relaxed);
+        n
     }
 
     pub fn parent(&self) -> Option<[u8; KEY_LEN]> {
@@ -1032,5 +1052,197 @@ mod tests {
         let found = found.expect("resolve B subnet addr");
         assert_eq!(found, b_pub);
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn crossed_session_open_delivers_both_ways() {
+        // Both ends send first at the same time (no session either way).
+        //
+        // The simultaneous FIRST flight is inherently racy (each side's
+        // ack advances key expectations ahead of the other's flushed
+        // payload, deterministically dropping both — same in Go, where
+        // the ack is likewise sent before the buffered payload flushes).
+        // What must hold: the sessions converge anyway, so the SECOND
+        // flight delivers both ways with no permanent desync.
+        let a_sk = SigningKey::from_bytes(&[0xC3; 32]);
+        let b_sk = SigningKey::from_bytes(&[0xC4; 32]);
+        let a_pub = a_sk.verifying_key().to_bytes();
+        let b_pub = b_sk.verifying_key().to_bytes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = sock;
+            let opts = LinkOptions::default();
+            let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
+                .await
+                .unwrap();
+            let mut conn = crate::link::PeerConn::<Tcp> {
+                remote_key: key,
+                priority: 0,
+                stream: sock,
+            };
+            let mut router = Router::new(b_sk);
+            router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
+            // Converge, then send FIRST (simultaneously with A below).
+            let end = tokio::time::Instant::now() + Duration::from_secs(4);
+            while tokio::time::Instant::now() < end {
+                router.maintain(&mut links, key).await.unwrap();
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    links.get(&key).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router
+                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
+                if router.parent().is_some() && router.root_path().is_some() {
+                    break;
+                }
+            }
+            router
+                .session_send(&mut links, key, a_pub, b"from-B".to_vec())
+                .await
+                .unwrap();
+            // First flight may drop (see test doc); pump past it, then
+            // assert the second flight lands.
+            let end = tokio::time::Instant::now() + Duration::from_secs(8);
+            while tokio::time::Instant::now() < end {
+                router.maintain(&mut links, key).await.unwrap();
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    links.get(&key).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router
+                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
+            }
+            router
+                .session_send(&mut links, key, a_pub, b"from-B2".to_vec())
+                .await
+                .unwrap();
+            let end = tokio::time::Instant::now() + Duration::from_secs(8);
+            while tokio::time::Instant::now() < end {
+                if router
+                    .inbox
+                    .iter()
+                    .any(|(k, m)| *k == a_pub && m == b"from-A2")
+                {
+                    break;
+                }
+                router.maintain(&mut links, key).await.unwrap();
+                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                    Duration::from_millis(300),
+                    links.get(&key).unwrap().read_frame(),
+                )
+                .await
+                {
+                    router
+                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .await
+                        .unwrap();
+                }
+            }
+            router
+        });
+        let uri = format!("tcp://{addr}");
+        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let peer_key = conn.remote_key;
+        let mut router = Router::new(a_sk);
+        router.register(&mut conn, peer_key).await.unwrap();
+        let mut links = LinkSet::single(peer_key, &mut conn);
+        let end = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < end {
+            router.maintain(&mut links, peer_key).await.unwrap();
+            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                Duration::from_millis(300),
+                links.get(&peer_key).unwrap().read_frame(),
+            )
+            .await
+            {
+                router
+                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if router.parent().is_some() && router.root_path().is_some() {
+                break;
+            }
+        }
+        assert!(router.parent().is_some(), "A converged");
+        // Simultaneous first send (B already sent above); it may drop
+        // (see test doc) — the second flight is the real assertion.
+        router
+            .session_send(&mut links, peer_key, b_pub, b"from-A".to_vec())
+            .await
+            .unwrap();
+        let end = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < end {
+            router.maintain(&mut links, peer_key).await.unwrap();
+            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                Duration::from_millis(300),
+                links.get(&peer_key).unwrap().read_frame(),
+            )
+            .await
+            {
+                router
+                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+        }
+        router
+            .session_send(&mut links, peer_key, b_pub, b"from-A2".to_vec())
+            .await
+            .unwrap();
+        let end = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < end {
+            if router
+                .inbox
+                .iter()
+                .any(|(k, m)| *k == b_pub && m == b"from-B2")
+            {
+                break;
+            }
+            router.maintain(&mut links, peer_key).await.unwrap();
+            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                Duration::from_millis(300),
+                links.get(&peer_key).unwrap().read_frame(),
+            )
+            .await
+            {
+                router
+                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            router
+                .inbox
+                .iter()
+                .any(|(k, m)| *k == b_pub && m == b"from-B2"),
+            "A got B's second payload, inbox={:?}",
+            router.inbox
+        );
+        let b_router = server.await.unwrap();
+        assert!(
+            b_router
+                .inbox
+                .iter()
+                .any(|(k, m)| *k == a_pub && m == b"from-A2"),
+            "B got A's second payload, inbox={:?}",
+            b_router.inbox
+        );
     }
 }

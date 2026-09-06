@@ -257,9 +257,10 @@ impl crate::router::Router {
                         s.adopt_buffered(buf.send_pub, buf.send_priv, buf.next_pub, buf.next_priv);
                     }
                     self.sessions.insert(from, (s, now));
+                    let ack_seq = self.next_init_seq();
                     let ack_init = self.sessions.get_mut(&from).and_then(|(s, active)| {
                         *active = now;
-                        s.handle_init(&init)
+                        s.handle_init(&init, ack_seq)
                     });
                     if let Some(ack) = ack_init {
                         let enc = ack.encrypt_msg(SESSION_TYPE_ACK, &sk, &from);
@@ -278,9 +279,10 @@ impl crate::router::Router {
                     }
                     return Ok(());
                 }
+                let ack_seq = self.next_init_seq();
                 let ack_init = self.sessions.get_mut(&from).and_then(|(s, active)| {
                     *active = now;
-                    s.handle_init(&init)
+                    s.handle_init(&init, ack_seq)
                 });
                 if let Some(ack) = ack_init {
                     let enc = ack.encrypt_msg(SESSION_TYPE_ACK, &sk, &from);
@@ -288,6 +290,9 @@ impl crate::router::Router {
                 }
             }
             SESSION_TYPE_TRAFFIC => {
+                // Fresh seq up front: the decrypt-fail arm needs one while
+                // the session is borrowed (counter skips are harmless).
+                let reinit_seq = self.next_init_seq();
                 if let Some((s, active)) = self.sessions.get_mut(&from) {
                     match s.decrypt(data) {
                         Some(payload) => {
@@ -315,7 +320,7 @@ impl crate::router::Router {
                             }
                         }
                         None => {
-                            let init = s.make_init();
+                            let init = s.make_init(reinit_seq);
                             let enc = init.encrypt_msg(SESSION_TYPE_INIT, &sk, &from);
                             self.net_send(links, conn_peer, from, enc).await?;
                         }
@@ -329,7 +334,7 @@ impl crate::router::Router {
                         current: cp,
                         next: np,
                         key_seq: 0,
-                        seq: unix_now(),
+                        seq: self.next_init_seq(),
                     };
                     let enc = init.encrypt_msg(SESSION_TYPE_INIT, &sk, &from);
                     self.net_send(links, conn_peer, from, enc).await?;
@@ -403,6 +408,7 @@ impl crate::router::Router {
         }
         let now = std::time::Instant::now();
         let sk = self.key.clone();
+        let init_seq = self.next_init_seq();
         let enc = {
             let buf = self.session_bufs.entry(dest).or_insert_with(|| {
                 let (cp, cs) = fresh_box();
@@ -412,7 +418,7 @@ impl crate::router::Router {
                         current: cp,
                         next: np,
                         key_seq: 0,
-                        seq: unix_now(),
+                        seq: init_seq,
                     },
                     send_pub: cp,
                     send_priv: cs,
@@ -516,13 +522,14 @@ impl Session {
         self.fix_shared(0, 0);
     }
 
-    /// Handle inbound init; returns the ack-init to send back when accepted.
-    pub fn handle_init(&mut self, init: &SessionInit) -> Option<SessionInit> {
+    /// Handle inbound init; returns the ack-init to send back when accepted
+    /// (built with the caller-supplied sequence number).
+    pub fn handle_init(&mut self, init: &SessionInit, ack_seq: u64) -> Option<SessionInit> {
         if init.seq <= self.seq {
             return None;
         }
         self.apply_update(init);
-        Some(self.make_init())
+        Some(self.make_init(ack_seq))
     }
 
     /// Handle inbound ack; no reply needed.
@@ -542,17 +549,23 @@ impl Session {
         std::mem::swap(&mut self.recv_priv, &mut self.send_priv);
         std::mem::swap(&mut self.send_pub, &mut self.next_pub);
         std::mem::swap(&mut self.send_priv, &mut self.next_priv);
+        // Fresh next keys every update, like Go `_handleUpdate`
+        // (forward secrecy — recycled keys would still agree in
+        // loopback, but diverge from a real Go peer's hygiene).
+        let (np, ns) = fresh_box();
+        self.next_pub = np;
+        self.next_priv = ns;
         self.local_key_seq += 1;
         let send_nonce = self.send_nonce;
         self.fix_shared(0, send_nonce);
     }
 
-    pub fn make_init(&self) -> SessionInit {
+    pub fn make_init(&self, seq: u64) -> SessionInit {
         SessionInit {
             current: self.send_pub,
             next: self.next_pub,
             key_seq: self.local_key_seq,
-            seq: unix_now(),
+            seq,
         }
     }
 
@@ -743,7 +756,7 @@ mod tests {
         assert_eq!(dec, init);
         // B adopts session, replies ack; A adopts buffered keys then the ack.
         let mut sb = Session::for_init(pa, &dec);
-        let ack_init = sb.handle_init(&dec).unwrap();
+        let ack_init = sb.handle_init(&dec, 101).unwrap();
         let enc_ack = ack_init.encrypt_msg(SESSION_TYPE_ACK, &b, &pa);
         let a_box_priv = ed_to_curve_priv(&[0xA1; 32]);
         let dec_ack = SessionInit::decrypt_msg(&a_box_priv, &pb, &enc_ack).unwrap();
