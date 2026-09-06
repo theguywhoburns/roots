@@ -44,7 +44,8 @@ async fn run<T: roots::Transport>(
         eprintln!("register failed: {e}");
         std::process::exit(1);
     }
-    if let Err(e) = router.serve(&mut conn, peer_key, hold, &mut no_out).await {
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    if let Err(e) = router.serve(&mut links, hold, &mut no_out).await {
         eprintln!("link dropped: {e}");
         std::process::exit(1);
     }
@@ -87,6 +88,16 @@ async fn main() {
     }
     if uri.starts_with("wss://") {
         match client.connect_wss(&uri).await {
+            Ok(conn) => run(client, conn, hold).await,
+            Err(e) => {
+                eprintln!("connect failed: {e}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if uri.starts_with("quic://") {
+        match client.connect_quic(&uri).await {
             Ok(conn) => run(client, conn, hold).await,
             Err(e) => {
                 eprintln!("connect failed: {e}");

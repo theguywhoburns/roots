@@ -12,6 +12,7 @@ pub mod handshake;
 pub mod link;
 pub mod pathfind;
 pub mod proto;
+pub mod quic;
 pub mod router;
 pub mod session;
 pub mod tls;
@@ -26,6 +27,7 @@ pub use handshake::Meta;
 pub use link::{
     AnyConn, Link, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri,
 };
+pub use quic::Quic;
 pub use router::Router;
 pub use tls::Tls;
 pub use ws::{Ws, Wss};
@@ -78,6 +80,11 @@ impl Client {
         crate::ws::wss_dial(uri, &self.key, &self.opts).await
     }
 
+    /// Connect to a `quic://` peer URI and complete the handshake.
+    pub async fn connect_quic(&self, uri: &str) -> Result<PeerConn<crate::quic::Quic>, Error> {
+        crate::quic::quic_dial(uri, &self.key, &self.opts).await
+    }
+
     /// Bind a `tcp://` listener for inbound peers.
     pub async fn listen(&self, uri: &str) -> Result<tokio::net::TcpListener, Error> {
         link::listen(uri).await
@@ -127,6 +134,12 @@ impl Client {
                 })
                 .await
             }
+            Scheme::Quic => {
+                drive(&mut router, max_backoff, outgoing, max_serves, || {
+                    crate::quic::quic_dial(uri, &self.key, &self.opts)
+                })
+                .await
+            }
         }
     }
 }
@@ -146,12 +159,16 @@ where
 {
     let mut failures: u32 = 0;
     let mut served: u64 = 0;
+    // One set per link (it must not outlive the connection it wraps;
+    // within a link it persists across all serve slices so lazy
+    // keepalives keep firing).
     loop {
         if let Ok(mut conn) = dial().await {
             failures = 0; // handshake completed inside dial
             let peer = conn.remote_key;
             if router.register(&mut conn, peer).await.is_ok() {
-                let _ = router.serve(&mut conn, peer, None, outgoing).await;
+                let mut links = LinkSet::single(peer, &mut conn);
+                let _ = router.serve(&mut links, None, outgoing).await;
                 served += 1;
                 if max_serves.is_some_and(|m| served >= m) {
                     return Ok(());

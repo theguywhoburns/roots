@@ -171,6 +171,7 @@ impl Link for AnyConn {
 #[derive(Default)]
 pub struct LinkSet<'a> {
     entries: Vec<([u8; KEY_LEN], &'a mut dyn Link)>,
+    last_write: std::collections::HashMap<[u8; KEY_LEN], std::time::Instant>,
 }
 
 impl<'a> LinkSet<'a> {
@@ -180,9 +181,9 @@ impl<'a> LinkSet<'a> {
 
     /// Wrap a single link (single-peer callers).
     pub fn single(peer: [u8; KEY_LEN], link: &'a mut dyn Link) -> Self {
-        Self {
-            entries: vec![(peer, link)],
-        }
+        let mut set = Self::default();
+        set.add(peer, link);
+        set
     }
 
     pub fn add(&mut self, peer: [u8; KEY_LEN], link: &'a mut dyn Link) {
@@ -191,6 +192,9 @@ impl<'a> LinkSet<'a> {
         } else {
             self.entries.push((peer, link));
         }
+        self.last_write
+            .entry(peer)
+            .or_insert_with(std::time::Instant::now);
     }
 
     /// Peer keys currently in the set (for per-link maintain loops).
@@ -209,6 +213,8 @@ impl<'a> LinkSet<'a> {
     }
 
     /// Write one frame to the link for `target` (no entry = drop).
+    /// Stamps the send time, which drives Go-style lazy keepalives:
+    /// a keepalive goes out only after a full idle tick with no sends.
     pub async fn write(
         &mut self,
         target: [u8; KEY_LEN],
@@ -216,10 +222,18 @@ impl<'a> LinkSet<'a> {
         payload: &[u8],
     ) -> Result<(), Error> {
         if let Some(link) = self.get(&target) {
-            link.write_frame(ftype, payload).await
-        } else {
-            Ok(())
+            link.write_frame(ftype, payload).await?;
+            self.last_write.insert(target, std::time::Instant::now());
         }
+        Ok(())
+    }
+
+    /// Time since the last frame sent to `peer` (zero for unknown links).
+    pub fn idle_for(&self, peer: &[u8; KEY_LEN]) -> Duration {
+        self.last_write
+            .get(peer)
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO)
     }
 }
 
@@ -275,9 +289,10 @@ pub enum Scheme {
     Tls,
     Ws,
     Wss,
+    Quic,
 }
 
-/// Parse a `tcp://`, `tls://`, `ws://` or `wss://` peer URI.
+/// Parse a `tcp://`, `tls://`, `ws://`, `wss://` or `quic://` peer URI.
 pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     let (scheme, rest) = if let Some(r) = uri.strip_prefix("tcp://") {
         (Scheme::Tcp, r)
@@ -287,6 +302,8 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
         (Scheme::Ws, r)
     } else if let Some(r) = uri.strip_prefix("wss://") {
         (Scheme::Wss, r)
+    } else if let Some(r) = uri.strip_prefix("quic://") {
+        (Scheme::Quic, r)
     } else {
         return Err(Error::BadUri(uri.to_string()));
     };

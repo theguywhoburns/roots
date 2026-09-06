@@ -114,6 +114,9 @@ pub fn new_iface(phy: &mut MeshPhy, our_ip: std::net::Ipv6Addr, start: Instant) 
 
 /// Fresh TCP socket with 64 KiB buffers (mesh RTTs are high; small
 /// buffers stall throughput).
+// Shared module compiled per example: not every example uses every
+// helper (tun_ping has no TCP sockets).
+#[allow(dead_code)]
 pub fn new_tcp_socket(sockets: &mut SocketSet<'_>) -> smoltcp::iface::SocketHandle {
     let socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; 65535]),

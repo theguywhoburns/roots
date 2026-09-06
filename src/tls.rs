@@ -77,7 +77,7 @@ fn provider() -> rustls::crypto::CryptoProvider {
     rustls::crypto::ring::default_provider()
 }
 
-fn client_config() -> Arc<ClientConfig> {
+pub(crate) fn client_config() -> Arc<ClientConfig> {
     let prov = provider();
     let verifier = Arc::new(NoVerify(prov.clone()));
     Arc::new(
@@ -90,7 +90,7 @@ fn client_config() -> Arc<ClientConfig> {
     )
 }
 
-fn server_config() -> Arc<rustls::ServerConfig> {
+pub(crate) fn server_config() -> Arc<rustls::ServerConfig> {
     let key = rcgen::generate_simple_self_signed(vec!["roots".to_string()]).expect("self-signed");
     let cert_der = key.cert.der().to_vec();
     let key_der = key.key_pair.serialize_der();
@@ -291,7 +291,8 @@ mod tests {
         assert_eq!(sni_host(&p).unwrap(), "::1");
         let (s, _) = parse_link_uri("tcp://h:1").unwrap();
         assert_eq!(s, Scheme::Tcp);
-        assert!(parse_link_uri("quic://h:1").is_err());
+        let (s, _) = parse_link_uri("quic://h:1").unwrap();
+        assert_eq!(s, Scheme::Quic);
         // tcp-only parser still rejects tls.
         assert!(crate::link::parse_peer_uri("tls://h:1").is_err());
     }

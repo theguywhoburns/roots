@@ -25,28 +25,20 @@ async fn main() {
         .register(&mut conn, peer_key)
         .await
         .expect("register");
+    // One set for the whole run: per-link send clocks must survive slices.
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(30);
     while router.parent().is_none() && Instant::now() < end {
         router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
             .await
             .expect("link up");
     }
     println!("converged, listening (Ctrl-C to stop)");
     loop {
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
             .await
         {
             eprintln!("link dropped: {e}");

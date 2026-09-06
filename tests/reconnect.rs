@@ -30,8 +30,9 @@ async fn reconnect_delivers_after_drop() {
             assert_eq!(peer, c_pub);
             let mut router = Router::new(s_sk.clone());
             router.register(&mut conn, peer).await.expect("register");
+            let mut links = roots::LinkSet::single(peer, &mut conn);
             let mut no_out = Vec::new();
-            let _ = router.serve(&mut conn, peer, Some(hold), &mut no_out).await;
+            let _ = router.serve(&mut links, Some(hold), &mut no_out).await;
             inboxes.push(router.inbox);
         }
         inboxes

@@ -524,6 +524,7 @@ mod tests {
         assert_eq!(p.priority, 3);
         let (s, _) = parse_link_uri("wss://h:99").unwrap();
         assert_eq!(s, Scheme::Wss);
-        assert!(parse_link_uri("quic://h:1").is_err());
+        let (s, _) = parse_link_uri("quic://h:1").unwrap();
+        assert_eq!(s, Scheme::Quic);
     }
 }

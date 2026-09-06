@@ -95,8 +95,9 @@ async fn run_node(key: SigningKey, outgoing: Vec<([u8; 32], Vec<u8>)>) -> Router
         .await
         .expect("register");
     let mut outgoing = outgoing;
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     router
-        .serve(&mut conn, peer_key, Some(HOLD), &mut outgoing)
+        .serve(&mut links, Some(HOLD), &mut outgoing)
         .await
         .expect("serve link");
     router

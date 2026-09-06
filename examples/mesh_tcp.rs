@@ -17,12 +17,11 @@ use roots::{Client, Router};
 
 async fn drive(
     router: &mut Router,
-    conn: &mut roots::PeerConn<roots::Tcp>,
-    peer: [u8; 32],
+    links: &mut roots::LinkSet<'_>,
     outbox: &mut Vec<([u8; 32], Vec<u8>)>,
 ) -> bool {
     router
-        .serve(conn, peer, Some(Duration::from_millis(250)), outbox)
+        .serve(links, Some(Duration::from_millis(250)), outbox)
         .await
         .is_ok()
 }
@@ -50,10 +49,11 @@ async fn main() {
     let a_peer = a_conn.remote_key;
     let mut ra = Router::new(ca.key);
     ra.register(&mut a_conn, a_peer).await.expect("A register");
+    let mut a_links = roots::LinkSet::single(a_peer, &mut a_conn);
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(60);
     while ra.parent().is_none() && Instant::now() < end {
-        if !drive(&mut ra, &mut a_conn, a_peer, &mut no_out).await {
+        if !drive(&mut ra, &mut a_links, &mut no_out).await {
             eprintln!("A link dropped");
             std::process::exit(1);
         }
@@ -64,9 +64,10 @@ async fn main() {
     let b_peer = b_conn.remote_key;
     let mut rb = Router::new(cb.key);
     rb.register(&mut b_conn, b_peer).await.expect("B register");
+    let mut b_links = roots::LinkSet::single(b_peer, &mut b_conn);
     let end = Instant::now() + Duration::from_secs(60);
     while rb.parent().is_none() && Instant::now() < end {
-        if !drive(&mut rb, &mut b_conn, b_peer, &mut no_out).await {
+        if !drive(&mut rb, &mut b_links, &mut no_out).await {
             eprintln!("B link dropped");
             std::process::exit(1);
         }
@@ -101,11 +102,11 @@ async fn main() {
     let mut body = Vec::new();
     let end = Instant::now() + Duration::from_secs(150);
     let ok = loop {
-        if !drive(&mut ra, &mut a_conn, a_peer, &mut a_out).await {
+        if !drive(&mut ra, &mut a_links, &mut a_out).await {
             eprintln!("A link dropped");
             break false;
         }
-        if !drive(&mut rb, &mut b_conn, b_peer, &mut b_out).await {
+        if !drive(&mut rb, &mut b_links, &mut b_out).await {
             eprintln!("B link dropped");
             break false;
         }

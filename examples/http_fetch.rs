@@ -43,18 +43,16 @@ async fn main() {
         .register(&mut conn, peer_key)
         .await
         .expect("register");
+    // One set for the whole run: per-link send clocks must survive
+    // slices, or lazy keepalives never fire and the peer times us out.
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     let mut no_out = Vec::new();
 
     // Converge: short serve slices until we have a parent.
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {
         router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
             .await
             .expect("link up");
     }
@@ -63,7 +61,7 @@ async fn main() {
 
     // Address -> full node key over the DHT.
     let key = router
-        .resolve(&mut conn, peer_key, &target_addr, Duration::from_secs(60))
+        .resolve(&mut links, peer_key, &target_addr, Duration::from_secs(60))
         .await
         .expect("resolve target");
     println!("target key {}", hex::encode(key));
@@ -87,12 +85,7 @@ async fn main() {
     let page = loop {
         // Drive the mesh link briefly.
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
         {
             eprintln!("link dropped: {e}");

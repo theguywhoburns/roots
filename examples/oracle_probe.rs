@@ -27,15 +27,12 @@ async fn main() {
         .register(&mut conn, peer_key)
         .await
         .expect("register");
+    // One set for the whole run: per-link send clocks must survive slices.
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     let mut outbox = vec![(go_key, b"hello-oracle".to_vec())];
     for i in 0..120 {
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
         {
             eprintln!("link dropped: {e}");

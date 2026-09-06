@@ -31,8 +31,18 @@ async fn main() {
         run_probe(client, conn).await;
         return;
     }
+    if peer.starts_with("wss://") {
+        let conn = client.connect_wss(&peer).await.expect("dial wss peer");
+        run_probe(client, conn).await;
+        return;
+    }
     if peer.starts_with("tls://") {
         let conn = client.connect_tls(&peer).await.expect("dial tls peer");
+        run_probe(client, conn).await;
+        return;
+    }
+    if peer.starts_with("quic://") {
+        let conn = client.connect_quic(&peer).await.expect("dial quic peer");
         run_probe(client, conn).await;
         return;
     }
@@ -48,16 +58,13 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
         .register(&mut conn, peer_key)
         .await
         .expect("register");
+    // One set for the whole run (per-link send clocks must survive slices).
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(30);
     while router.parent().is_none() && Instant::now() < end {
         router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
             .await
             .expect("link up");
     }
@@ -71,35 +78,21 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
     // handshake, like Go's single-slot sessionBuffer — which is also
     // why the rest wait for the session: last write wins the buffer).
     router
-        .request_nodeinfo(
-            &mut roots::LinkSet::single(peer_key, &mut conn),
-            peer_key,
-            peer_key,
-        )
+        .request_nodeinfo(&mut links, peer_key, peer_key)
         .await
         .expect("nodeinfo req");
     let mut outbox: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let end = Instant::now() + Duration::from_secs(15);
     while !router.has_session(&peer_key) && Instant::now() < end {
         router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
             .expect("link up");
     }
     assert!(router.has_session(&peer_key), "session never opened");
     for what in [DEBUG_GETSELF_REQ, DEBUG_GETPEERS_REQ, DEBUG_GETTREE_REQ] {
         router
-            .request_debug(
-                &mut roots::LinkSet::single(peer_key, &mut conn),
-                peer_key,
-                peer_key,
-                what,
-            )
+            .request_debug(&mut links, peer_key, peer_key, what)
             .await
             .expect("debug req");
     }
@@ -109,12 +102,7 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
     let mut seen = 0;
     while Instant::now() < end {
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
         {
             eprintln!("link dropped: {e}");
@@ -160,12 +148,7 @@ async fn run_probe<T: roots::Transport>(client: Client, mut conn: roots::PeerCon
     let end = Instant::now() + Duration::from_secs(hold);
     while Instant::now() < end {
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
         {
             eprintln!("link dropped: {e}");

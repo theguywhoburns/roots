@@ -259,13 +259,9 @@ mod tests {
             };
             let mut router = Router::new(b_sk);
             router.register(&mut conn, key).await.unwrap();
+            let mut links = crate::link::LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(
-                    &mut conn,
-                    key,
-                    Some(Duration::from_secs(30)),
-                    &mut Vec::new(),
-                )
+                .serve(&mut links, Some(Duration::from_secs(30)), &mut Vec::new())
                 .await;
         });
         let uri = format!("tcp://{addr}");

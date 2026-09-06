@@ -13,7 +13,7 @@ use ed25519_dalek::SigningKey;
 use crate::address::KEY_LEN;
 use crate::bloom::BloomFilter;
 use crate::error::Error;
-use crate::frame::FrameType;
+use crate::frame::{FrameType, KEEPALIVE_DELAY};
 use crate::link::{Link, LinkSet};
 use crate::pathfind::NotifyInfo;
 use crate::session::Session;
@@ -210,6 +210,50 @@ impl Router {
         self.paths.get(key).map(|e| (e.path.clone(), e.seq))
     }
 
+    /// All learned source routes as `(key, path, seq)`, sorted by key
+    /// (for diagnostics / admin adapter).
+    pub fn get_paths(&self) -> Vec<([u8; KEY_LEN], Vec<u64>, u64)> {
+        let mut out: Vec<_> = self
+            .paths
+            .iter()
+            .map(|(k, e)| (*k, e.path.clone(), e.seq))
+            .collect();
+        out.sort_by_key(|(k, _, _)| *k);
+        out
+    }
+
+    /// Peer keys with an open E2E session, sorted (for diagnostics).
+    pub fn get_sessions(&self) -> Vec<[u8; KEY_LEN]> {
+        let mut out: Vec<_> = self.sessions.keys().copied().collect();
+        out.sort();
+        out
+    }
+
+    /// Direct link peers as `(key, port, priority, up, lag_ms)`, sorted by
+    /// key: `up` tracks the last SigReq round-trip, `lag_ms` saturates at
+    /// `u32::MAX` while unmeasured (for diagnostics / admin adapter).
+    pub fn link_peers(&self) -> Vec<([u8; KEY_LEN], u64, u8, bool, u128)> {
+        let mut out: Vec<_> = self
+            .peers
+            .iter()
+            .map(|(k, p)| (*k, p.port, p.prio, p.responded, p.lag.as_millis()))
+            .collect();
+        out.sort_by_key(|(k, _, _, _, _)| *k);
+        out
+    }
+
+    /// Spanning-tree entries as `(key, parent, seq)`, sorted by key
+    /// (for diagnostics / admin adapter).
+    pub fn tree_entries(&self) -> Vec<([u8; KEY_LEN], [u8; KEY_LEN], u64)> {
+        let mut out: Vec<_> = self
+            .infos
+            .iter()
+            .map(|(k, i)| (*k, i.parent, i.res.req.seq))
+            .collect();
+        out.sort_by_key(|(k, _, _)| *k);
+        out
+    }
+
     /// Register a peer after the link handshake: open SigReq, bloom, and
     /// replay of already-sent announces (Go `addPeer`). Call ONCE per link
     /// (not per serve slice): the peer answers every SigReq and replays
@@ -300,13 +344,11 @@ impl Router {
     /// [`Error::Timeout`].
     pub async fn resolve(
         &mut self,
-        conn: &mut dyn Link,
+        links: &mut LinkSet<'_>,
         conn_peer: [u8; KEY_LEN],
         addr: &crate::address::Address,
         timeout: Duration,
     ) -> Result<[u8; KEY_LEN], Error> {
-        let mut links = LinkSet::single(conn_peer, conn);
-        let links = &mut links;
         let partial = crate::address::lookup_key_for_addr(addr);
         let end = tokio::time::Instant::now() + timeout;
         let mut last_maintain = tokio::time::Instant::now();
@@ -333,7 +375,10 @@ impl Router {
                         .await?;
                 }
                 Ok(Err(e)) => return Err(e),
-                Err(_) => {}
+                // Quiet slice: keep the link alive for long lookups.
+                Err(_) => {
+                    self.keepalive_if_idle(links, conn_peer).await?;
+                }
             }
             let want = addr.0;
             let want_subnet = addr.0[0] == crate::address::NODE_PREFIX | crate::address::SUBNET_BIT;
@@ -393,8 +438,23 @@ impl Router {
             .retain(|_, (_, active)| *active + crate::session::SESSION_TIMEOUT > now);
     }
 
-    /// Handle one inbound frame: router protocol plus a keepalive reply for
-    /// every non-keepalive type (Go `peerMonitor` semantics).
+    /// Keepalive reply for an inbound frame, Go `peerMonitor` style: only
+    /// when we sent nothing to this link for a full tick. Any outbound
+    /// frame (announce, SigRes, session data) already proves liveness,
+    /// so per-frame replies would be pure chatter.
+    async fn keepalive_if_idle(
+        &self,
+        links: &mut LinkSet<'_>,
+        peer: [u8; KEY_LEN],
+    ) -> Result<(), Error> {
+        if links.idle_for(&peer) >= KEEPALIVE_DELAY {
+            links.write(peer, FrameType::KeepAlive, &[]).await?;
+        }
+        Ok(())
+    }
+
+    /// Handle one inbound frame: router protocol plus a lazy keepalive
+    /// reply for every non-keepalive type (Go `peerMonitor` semantics).
     pub(crate) async fn dispatch_frame(
         &mut self,
         links: &mut LinkSet<'_>,
@@ -410,7 +470,7 @@ impl Router {
                 {
                     self.handle_request(links, conn_peer, req).await?;
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::SigRes => {
                 if let Ok((res, n)) = SigRes::decode(payload)
@@ -419,7 +479,7 @@ impl Router {
                 {
                     self.handle_response(conn_peer, res);
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::Announce => {
                 if let Ok(ann) = Announce::decode_exact(payload)
@@ -433,18 +493,18 @@ impl Router {
                         self.announces_sent += 1;
                     }
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::BloomFilter => {
                 let _ = self.bloom_handle(conn_peer, payload);
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::PathLookup => {
                 if let Ok(lookup) = crate::pathfind::PathLookup::decode_exact(payload) {
                     self.handle_lookup(links, conn_peer, conn_peer, &lookup)
                         .await?;
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::PathNotify => {
                 if let Ok(notify) = crate::pathfind::PathNotify::decode_exact(payload)
@@ -452,19 +512,19 @@ impl Router {
                 {
                     self.handle_notify(links, conn_peer, &notify).await?;
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::PathBroken => {
                 if let Ok(broken) = crate::pathfind::PathBroken::decode_exact(payload) {
                     self.handle_broken(links, conn_peer, &broken).await?;
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
             FrameType::Traffic => {
                 if let Ok(tr) = crate::traffic::Traffic::decode(payload) {
                     self.handle_inbound_traffic(links, conn_peer, &tr).await?;
                 }
-                links.write(conn_peer, FrameType::KeepAlive, &[]).await?;
+                self.keepalive_if_idle(links, conn_peer).await?;
             }
         }
         Ok(())
@@ -478,15 +538,18 @@ impl Router {
     /// `(dest, payload)` pairs in `outgoing` are sent as session payloads
     /// (buffered behind lookup + handshake automatically). Payloads that
     /// fail mid-write are re-queued into `resend` for the next link.
+    ///
+    /// The `links` set is caller-owned and reused across slices: per-link
+    /// state (notably last-send times for lazy keepalives) must survive
+    /// from one slice to the next, so rebuilding the set per slice will
+    /// silently stop keepalives and get the link killed.
     pub async fn serve(
         &mut self,
-        conn: &mut dyn Link,
-        peer_key: [u8; KEY_LEN],
+        links: &mut LinkSet<'_>,
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
     ) -> Result<(), Error> {
-        self.serve_links(&mut LinkSet::single(peer_key, conn), hold_for, outgoing)
-            .await
+        self.serve_links(links, hold_for, outgoing).await
     }
 
     /// Serve every link in the set through one router: per-link maintain,
@@ -548,7 +611,13 @@ impl Router {
                         self.dispatch_frame(links, peer, ftype, &payload).await?;
                     }
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => {}
+                    // Quiet slice: top up links idle past a full tick so
+                    // the peer's liveness monitor never starves, even when
+                    // no frames arrive to answer (Go sends on the same
+                    // 1s timer instead of per-frame).
+                    Err(_) => {
+                        self.keepalive_if_idle(links, peer).await?;
+                    }
                 }
             }
         }
@@ -561,6 +630,51 @@ mod tests {
     use super::*;
     use crate::link::LinkOptions;
     use crate::link::Tcp;
+
+    #[test]
+    fn query_snapshots_read_state() {
+        // get_paths/get_sessions/link_peers/tree_entries are pure views:
+        // empty on a fresh router, sorted and complete once filled.
+        let sk = SigningKey::from_bytes(&[0x77; 32]);
+        let mut router = Router::new(sk);
+        assert!(router.get_paths().is_empty());
+        assert!(router.get_sessions().is_empty());
+        assert!(router.link_peers().is_empty());
+        assert!(router.tree_entries().is_empty());
+        let ka = [0xAA; 32];
+        let kb = [0xBB; 32];
+        router.peers.insert(
+            kb,
+            PeerState {
+                port: 3,
+                req: crate::tree::SigReq { seq: 1, nonce: 1 },
+                responded: true,
+                lag: Duration::from_millis(12),
+                sent_at: None,
+                prio: 0,
+                order: 0,
+            },
+        );
+        router.paths.insert(
+            ka,
+            crate::pathfind::PathEntry {
+                path: vec![4, 2],
+                seq: 9,
+                req_at: None,
+                deadline: Instant::now() + Duration::from_secs(60),
+                broken: false,
+            },
+        );
+        let peers = router.link_peers();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].0, kb);
+        assert_eq!(peers[0].1, 3);
+        assert!(peers[0].3);
+        let paths = router.get_paths();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], (ka, vec![4, 2], 9));
+        assert!(router.get_sessions().is_empty());
+    }
 
     #[tokio::test]
     async fn mixed_transport_links_share_one_router() {
@@ -590,13 +704,9 @@ mod tests {
             };
             let mut router = Router::new(s1_sk);
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(
-                    &mut conn,
-                    key,
-                    Some(Duration::from_secs(15)),
-                    &mut Vec::new(),
-                )
+                .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
         });
         let ws_listener = crate::ws::ws_listen("ws://127.0.0.1:0").await.unwrap();
@@ -608,13 +718,9 @@ mod tests {
             let key = conn.remote_key;
             let mut router = Router::new(s2_sk);
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(
-                    &mut conn,
-                    key,
-                    Some(Duration::from_secs(15)),
-                    &mut Vec::new(),
-                )
+                .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
         });
 
@@ -702,13 +808,9 @@ mod tests {
             // what we assert below, not a clean shutdown.
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(
-                    &mut conn,
-                    key,
-                    Some(Duration::from_millis(2600)),
-                    &mut no_out,
-                )
+                .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
                 .await;
             router
         });
@@ -720,13 +822,9 @@ mod tests {
         let mut router = Router::new(a_sk);
         let mut no_out = Vec::new();
         router.register(&mut conn, peer_key).await.unwrap();
+        let mut links = LinkSet::single(peer_key, &mut conn);
         let _ = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(2600)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
             .await;
         let b_router = server.await.unwrap();
         // Both sides adopted a parent (one rooted, the other attached).
@@ -763,8 +861,9 @@ mod tests {
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(&mut conn, key, Some(Duration::from_secs(10)), &mut no_out)
+                .serve(&mut links, Some(Duration::from_secs(10)), &mut no_out)
                 .await;
             router
         });
@@ -777,13 +876,9 @@ mod tests {
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
         let mut outgoing = vec![(b_pub, b"ping-0".to_vec())];
+        let mut links = LinkSet::single(peer_key, &mut conn);
         let _ = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_secs(10)),
-                &mut outgoing,
-            )
+            .serve(&mut links, Some(Duration::from_secs(10)), &mut outgoing)
             .await;
         let b_router = server.await.unwrap();
         assert!(
@@ -824,8 +919,9 @@ mod tests {
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(&mut conn, key, Some(Duration::from_secs(8)), &mut no_out)
+                .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
             router
         });
@@ -837,31 +933,30 @@ mod tests {
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
         // Converge first (mirrors serve slices): maintain + dispatch.
-        {
-            let mut links = LinkSet::single(peer_key, &mut conn);
-            let end = tokio::time::Instant::now() + Duration::from_secs(4);
-            while tokio::time::Instant::now() < end {
-                router.maintain(&mut links, peer_key).await.unwrap();
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(300),
-                    links.get(&peer_key).unwrap().read_frame(),
-                )
-                .await
-                {
-                    router.frames[ftype as usize] += 1;
-                    router
-                        .dispatch_frame(&mut links, peer_key, ftype, &payload)
-                        .await
-                        .unwrap();
-                }
-                if router.parent().is_some() && router.root_path().is_some() {
-                    break;
-                }
+        // The set lives across converge and resolve so send clocks persist.
+        let mut links = LinkSet::single(peer_key, &mut conn);
+        let end = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < end {
+            router.maintain(&mut links, peer_key).await.unwrap();
+            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                Duration::from_millis(300),
+                links.get(&peer_key).unwrap().read_frame(),
+            )
+            .await
+            {
+                router.frames[ftype as usize] += 1;
+                router
+                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if router.parent().is_some() && router.root_path().is_some() {
+                break;
             }
         }
         assert!(router.parent().is_some(), "A converged");
         let found = router
-            .resolve(&mut conn, peer_key, &b_addr, Duration::from_secs(5))
+            .resolve(&mut links, peer_key, &b_addr, Duration::from_secs(5))
             .await
             .expect("resolve B addr");
         assert_eq!(found, b_pub);
@@ -897,8 +992,9 @@ mod tests {
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
+            let mut links = LinkSet::single(key, &mut conn);
             let _ = router
-                .serve(&mut conn, key, Some(Duration::from_secs(8)), &mut no_out)
+                .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
             router
         });
@@ -909,31 +1005,29 @@ mod tests {
         let peer_key = conn.remote_key;
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
-        {
-            let mut links = LinkSet::single(peer_key, &mut conn);
-            let end = tokio::time::Instant::now() + Duration::from_secs(4);
-            while tokio::time::Instant::now() < end {
-                router.maintain(&mut links, peer_key).await.unwrap();
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(300),
-                    links.get(&peer_key).unwrap().read_frame(),
-                )
-                .await
-                {
-                    router.frames[ftype as usize] += 1;
-                    router
-                        .dispatch_frame(&mut links, peer_key, ftype, &payload)
-                        .await
-                        .unwrap();
-                }
-                if router.parent().is_some() && router.root_path().is_some() {
-                    break;
-                }
+        let mut links = LinkSet::single(peer_key, &mut conn);
+        let end = tokio::time::Instant::now() + Duration::from_secs(4);
+        while tokio::time::Instant::now() < end {
+            router.maintain(&mut links, peer_key).await.unwrap();
+            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
+                Duration::from_millis(300),
+                links.get(&peer_key).unwrap().read_frame(),
+            )
+            .await
+            {
+                router.frames[ftype as usize] += 1;
+                router
+                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .await
+                    .unwrap();
+            }
+            if router.parent().is_some() && router.root_path().is_some() {
+                break;
             }
         }
         assert!(router.parent().is_some(), "A converged");
         let found = router
-            .resolve(&mut conn, peer_key, &target, Duration::from_secs(10))
+            .resolve(&mut links, peer_key, &target, Duration::from_secs(10))
             .await;
         let found = found.expect("resolve B subnet addr");
         assert_eq!(found, b_pub);

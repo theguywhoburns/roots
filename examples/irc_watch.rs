@@ -45,23 +45,20 @@ async fn main() {
         .register(&mut conn, peer_key)
         .await
         .expect("register");
+    // One set for the whole run (see http_fetch).
+    let mut links = roots::LinkSet::single(peer_key, &mut conn);
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {
         router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut no_out,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
             .await
             .expect("link up");
     }
     assert!(router.parent().is_some(), "mesh convergence timed out");
 
     let key = router
-        .resolve(&mut conn, peer_key, &target_addr, Duration::from_secs(60))
+        .resolve(&mut links, peer_key, &target_addr, Duration::from_secs(60))
         .await
         .expect("resolve target");
     println!("target key {} as {nick}", hex::encode(key));
@@ -91,12 +88,7 @@ async fn main() {
 
     loop {
         if let Err(e) = router
-            .serve(
-                &mut conn,
-                peer_key,
-                Some(Duration::from_millis(250)),
-                &mut outbox,
-            )
+            .serve(&mut links, Some(Duration::from_millis(250)), &mut outbox)
             .await
         {
             eprintln!("link dropped: {e}");
