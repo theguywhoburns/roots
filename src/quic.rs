@@ -17,8 +17,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::Error;
 use crate::link::{
-    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, LinkOptions, PeerConn, Scheme, Transport, merge_opts,
-    parse_link_uri,
+    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, LinkOptions, PeerConn, Scheme, Transport, parse_link_uri,
 };
 
 /// Go `quic.Config` values (`link_quic.go` `newLinkQUIC`).
@@ -160,25 +159,14 @@ pub async fn quic_dial(
     if scheme != Scheme::Quic {
         return Err(Error::BadUri(uri.to_string()));
     }
-    let merged = merge_opts(&peer, opts);
     let sni = crate::tls::sni_host(&peer)?;
-    let mut stream = tokio::time::timeout(
+    let stream = tokio::time::timeout(
         DIAL_TIMEOUT,
         quic_connect(&peer.host_port, &sni, DIAL_TIMEOUT),
     )
     .await
     .map_err(|_| Error::Timeout)??;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, &merged, false),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    crate::link::complete_dial(stream, &peer, local, opts).await
 }
 
 /// QUIC endpoint bound for `quic://host:port` (UDP socket + endpoint pair;
@@ -220,18 +208,8 @@ pub async fn quic_accept(
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-    let mut stream = QuicStream::new(endpoint.clone(), conn.clone(), send, recv);
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, opts, true),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    let stream = QuicStream::new(endpoint.clone(), conn.clone(), send, recv);
+    crate::link::complete_accept(stream, local, opts).await
 }
 
 #[cfg(test)]

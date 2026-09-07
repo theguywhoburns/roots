@@ -26,10 +26,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async, client_async};
 
 use crate::error::Error;
-use crate::link::{
-    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, LinkOptions, PeerConn, Scheme, Transport, merge_opts,
-    parse_link_uri,
-};
+use crate::link::{DIAL_TIMEOUT, LinkOptions, PeerConn, Scheme, Transport, parse_link_uri};
 
 /// Required WebSocket subprotocol (Go `link_ws.go` accept path + dial).
 pub const WS_SUBPROTOCOL: &str = "ygg-ws";
@@ -243,21 +240,10 @@ pub async fn ws_dial(
     if scheme != Scheme::Ws {
         return Err(Error::BadUri(uri.to_string()));
     }
-    let merged = merge_opts(&peer, opts);
-    let mut stream = tokio::time::timeout(DIAL_TIMEOUT, Ws::dial(&peer.host_port, DIAL_TIMEOUT))
+    let stream = tokio::time::timeout(DIAL_TIMEOUT, Ws::dial(&peer.host_port, DIAL_TIMEOUT))
         .await
         .map_err(|_| Error::Timeout)??;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, &merged, false),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    crate::link::complete_dial(stream, &peer, local, opts).await
 }
 
 /// Bind a `ws://host:port` listener (plain TCP accept + WS upgrade pair).
@@ -279,18 +265,8 @@ pub async fn ws_accept(
     opts: &LinkOptions,
 ) -> Result<PeerConn<Ws>, Error> {
     let (sock, _) = listener.accept().await.map_err(Error::Io)?;
-    let mut stream = ws_server_handshake(sock).await?;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, opts, true),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    let stream = ws_server_handshake(sock).await?;
+    crate::link::complete_accept(stream, local, opts).await
 }
 
 /// WS server handshake over an established byte stream (plain TCP for
@@ -366,25 +342,14 @@ pub async fn wss_dial(
     if scheme != Scheme::Wss {
         return Err(Error::BadUri(uri.to_string()));
     }
-    let merged = merge_opts(&peer, opts);
     let sni = crate::tls::sni_host(&peer)?;
-    let mut stream = tokio::time::timeout(
+    let stream = tokio::time::timeout(
         DIAL_TIMEOUT,
         wss_connect(&peer.host_port, &sni, DIAL_TIMEOUT),
     )
     .await
     .map_err(|_| Error::Timeout)??;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, &merged, false),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    crate::link::complete_dial(stream, &peer, local, opts).await
 }
 
 /// Bind a `wss://host:port` listener (TCP + TLS acceptor + WS upgrade).
@@ -415,18 +380,8 @@ pub async fn wss_accept(
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Io(std::io::Error::other(e)))?
             .into();
-    let mut stream = ws_server_handshake(tls).await?;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, opts, true),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    let stream = ws_server_handshake(tls).await?;
+    crate::link::complete_accept(stream, local, opts).await
 }
 
 #[cfg(test)]

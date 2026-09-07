@@ -252,6 +252,16 @@ impl Default for BloomFilter {
     }
 }
 
+/// Multicast filter table: per-peer advertised/heard filters plus on-tree
+/// membership. Owned by [`crate::router::Router`].
+#[derive(Default)]
+pub(crate) struct BloomState {
+    pub(crate) send: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
+    pub(crate) recv: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
+    pub(crate) on_tree: std::collections::HashMap<[u8; KEY_LEN], bool>,
+    pub(crate) dirty: std::collections::HashMap<[u8; KEY_LEN], bool>,
+}
+
 /// DHT transform: yggdrasil-go uses `SubnetForKey(key).GetKey()`.
 pub fn xkey(key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
     crate::address::key_for_subnet(&crate::address::subnet_for_key(key))
@@ -259,33 +269,34 @@ pub fn xkey(key: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
 
 impl crate::router::Router {
     pub(crate) fn bloom_add_peer(&mut self, peer: [u8; KEY_LEN]) {
-        self.bloom_send.entry(peer).or_default();
-        self.bloom_recv.entry(peer).or_default();
-        self.bloom_on_tree.entry(peer).or_insert(false);
-        self.bloom_dirty.entry(peer).or_insert(false);
+        self.bloom.send.entry(peer).or_default();
+        self.bloom.recv.entry(peer).or_default();
+        self.bloom.on_tree.entry(peer).or_insert(false);
+        self.bloom.dirty.entry(peer).or_insert(false);
     }
 
     /// Recompute on-tree flags (Go `_fixOnTree`, minus its panic when we
     /// have no self info yet — that just means "not converged").
     pub(crate) fn bloom_fix(&mut self) {
-        let self_parent = match self.infos.get(&self.pubkey) {
+        let self_parent = match self.tree.infos.get(&self.pubkey) {
             Some(i) => i.parent,
             None => return,
         };
-        let keys: Vec<[u8; KEY_LEN]> = self.bloom_on_tree.keys().copied().collect();
+        let keys: Vec<[u8; KEY_LEN]> = self.bloom.on_tree.keys().copied().collect();
         for pk in keys {
             let on = self_parent == pk
                 || self
+                    .tree
                     .infos
                     .get(&pk)
                     .map(|i| i.parent == self.pubkey)
                     .unwrap_or(false);
-            let was = self.bloom_on_tree.insert(pk, on).unwrap_or(false);
+            let was = self.bloom.on_tree.insert(pk, on).unwrap_or(false);
             if was && !on {
                 // Dropped from the tree: advertise blank so the peer
                 // forgets our old bits instead of keeping false positives.
-                self.bloom_send.insert(pk, BloomFilter::new());
-                self.bloom_dirty.insert(pk, true);
+                self.bloom.send.insert(pk, BloomFilter::new());
+                self.bloom.dirty.insert(pk, true);
             }
         }
     }
@@ -298,18 +309,19 @@ impl crate::router::Router {
         let mut b = BloomFilter::new();
         b.add(&xkey(&self.pubkey));
         let mut others: Vec<[u8; KEY_LEN]> = self
-            .bloom_on_tree
+            .bloom
+            .on_tree
             .iter()
             .filter(|(k, on)| **on && **k != peer)
             .map(|(k, _)| *k)
             .collect();
         others.sort();
         for k in others {
-            if let Some(r) = self.bloom_recv.get(&k) {
+            if let Some(r) = self.bloom.recv.get(&k) {
                 b.merge(r);
             }
         }
-        if let Some(s) = self.bloom_send.get(&peer) {
+        if let Some(s) = self.bloom.send.get(&peer) {
             b.merge(s);
         }
         b
@@ -321,16 +333,17 @@ impl crate::router::Router {
     ) -> Result<(), crate::error::Error> {
         self.bloom_fix();
         let peers: Vec<[u8; KEY_LEN]> = self
-            .bloom_on_tree
+            .bloom
+            .on_tree
             .iter()
             .filter(|(_, on)| **on)
             .map(|(k, _)| *k)
             .collect();
         for pk in peers {
             let b = self.bloom_for(pk);
-            if self.bloom_send.get(&pk) != Some(&b) {
-                self.bloom_send.insert(pk, b.clone());
-                self.bloom_dirty.insert(pk, false);
+            if self.bloom.send.get(&pk) != Some(&b) {
+                self.bloom.send.insert(pk, b.clone());
+                self.bloom.dirty.insert(pk, false);
                 let bytes = b.encode();
                 links
                     .write(pk, crate::frame::FrameType::BloomFilter, &bytes)
@@ -346,8 +359,8 @@ impl crate::router::Router {
         payload: &[u8],
     ) -> Result<(), crate::error::Error> {
         let b = BloomFilter::decode_exact(payload)?;
-        if self.bloom_recv.contains_key(&from) {
-            self.bloom_recv.insert(from, b);
+        if self.bloom.recv.contains_key(&from) {
+            self.bloom.recv.insert(from, b);
         }
         Ok(())
     }
@@ -363,7 +376,8 @@ impl crate::router::Router {
     ) -> Result<(), crate::error::Error> {
         let x = xkey(&to_key);
         let mut keys: Vec<[u8; KEY_LEN]> = self
-            .bloom_on_tree
+            .bloom
+            .on_tree
             .iter()
             .filter(|(_, on)| **on)
             .map(|(k, _)| *k)
@@ -373,7 +387,7 @@ impl crate::router::Router {
             if k == from_key {
                 continue;
             }
-            let interested = self.bloom_recv.get(&k).map(|r| r.test(&x)).unwrap_or(false);
+            let interested = self.bloom.recv.get(&k).map(|r| r.test(&x)).unwrap_or(false);
             if !interested {
                 continue;
             }

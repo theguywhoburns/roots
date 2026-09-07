@@ -26,8 +26,8 @@ fn report(router: &Router) {
     println!(
         "known    {} nodes, announces sent {}/{}, frames {:?}",
         router.known_nodes(),
-        router.announces_sent,
-        router.announces_recv,
+        router.announces_sent(),
+        router.announces_recv(),
         router.frames
     );
     if std::env::var("ROOTS_DBG_DUMP").is_ok() {
@@ -35,14 +35,14 @@ fn report(router: &Router) {
     }
 }
 
-async fn run<T: roots::Transport>(
+async fn run(
     client: Client,
-    mut conn: roots::PeerConn<T>,
+    mut conn: impl roots::Link,
     hold: Option<std::time::Duration>,
     resolve: Option<roots::address::Address>,
 ) {
-    show("remote", &conn.remote_key);
-    let peer_key = conn.remote_key;
+    show("remote", &conn.remote_key());
+    let peer_key = conn.remote_key();
     let mut router = Router::new(client.key);
     let mut no_out = Vec::new();
     if let Err(e) = router.register(&mut conn, peer_key).await {
@@ -129,47 +129,8 @@ async fn main() {
     let key = ed25519_dalek::SigningKey::generate(&mut rng);
     let client = Client::new(key);
     println!("local  addr {}", client.address());
-    if uri.starts_with("tls://") {
-        match client.connect_tls(&uri).await {
-            Ok(conn) => run(client, conn, hold, resolve).await,
-            Err(e) => {
-                eprintln!("connect failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-    if uri.starts_with("ws://") {
-        match client.connect_ws(&uri).await {
-            Ok(conn) => run(client, conn, hold, resolve).await,
-            Err(e) => {
-                eprintln!("connect failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-    if uri.starts_with("wss://") {
-        match client.connect_wss(&uri).await {
-            Ok(conn) => run(client, conn, hold, resolve).await,
-            Err(e) => {
-                eprintln!("connect failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-    if uri.starts_with("quic://") {
-        match client.connect_quic(&uri).await {
-            Ok(conn) => run(client, conn, hold, resolve).await,
-            Err(e) => {
-                eprintln!("connect failed: {e}");
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-    match client.connect(&uri).await {
+    // Single scheme-erased dial path (see `link::dial_any`).
+    match client.connect_any(&uri).await {
         Ok(conn) => run(client, conn, hold, resolve).await,
         Err(e) => {
             eprintln!("connect failed: {e}");

@@ -210,6 +210,29 @@ pub(crate) struct SessionBuf {
     pub deadline: std::time::Instant,
 }
 
+/// E2E session table: open sessions, pending initiators, init sequence, and
+/// payloads to retry on the next link. Owned by [`crate::router::Router`];
+/// delivered payloads go to the router inbox (public API), not here.
+pub(crate) struct SessionState {
+    pub(crate) sessions: std::collections::HashMap<[u8; KEY_LEN], (Session, std::time::Instant)>,
+    pub(crate) bufs: std::collections::HashMap<[u8; KEY_LEN], SessionBuf>,
+    pub(crate) init_seq: std::sync::atomic::AtomicU64,
+    /// App payloads that failed mid-write on a dead link, retried on the
+    /// next link (at-least-once across reconnects; duplicates possible).
+    pub(crate) resend: Vec<([u8; KEY_LEN], Vec<u8>)>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            sessions: std::collections::HashMap::new(),
+            bufs: std::collections::HashMap::new(),
+            init_seq: std::sync::atomic::AtomicU64::new(0),
+            resend: Vec::new(),
+        }
+    }
+}
+
 impl crate::router::Router {
     pub(crate) fn box_priv(&self) -> [u8; 32] {
         ed_to_curve_priv(&self.key.to_bytes())
@@ -246,19 +269,19 @@ impl crate::router::Router {
                 let Some(init) = SessionInit::decrypt_msg(&box_priv, &from, data) else {
                     return Ok(());
                 };
-                if !self.sessions.contains_key(&from) {
+                if !self.sess.sessions.contains_key(&from) {
                     // New session (Go `_sessionForInit`): adopt buffered
                     // initiator keys when we initiated first, then always
                     // handle the message as an init — even acks (Go
                     // `_handleAck` !isOld path) — and flush queued payload.
                     let mut s = Session::for_init(from, &init);
-                    let buffered = self.session_bufs.remove(&from);
+                    let buffered = self.sess.bufs.remove(&from);
                     if let Some(buf) = &buffered {
                         s.adopt_buffered(buf.send_pub, buf.send_priv, buf.next_pub, buf.next_priv);
                     }
-                    self.sessions.insert(from, (s, now));
+                    self.sess.sessions.insert(from, (s, now));
                     let ack_seq = self.next_init_seq();
-                    let ack_init = self.sessions.get_mut(&from).and_then(|(s, active)| {
+                    let ack_init = self.sess.sessions.get_mut(&from).and_then(|(s, active)| {
                         *active = now;
                         s.handle_init(&init, ack_seq)
                     });
@@ -273,14 +296,14 @@ impl crate::router::Router {
                     return Ok(());
                 }
                 if is_ack {
-                    if let Some((s, active)) = self.sessions.get_mut(&from) {
+                    if let Some((s, active)) = self.sess.sessions.get_mut(&from) {
                         *active = now;
                         s.handle_ack(&init);
                     }
                     return Ok(());
                 }
                 let ack_seq = self.next_init_seq();
-                let ack_init = self.sessions.get_mut(&from).and_then(|(s, active)| {
+                let ack_init = self.sess.sessions.get_mut(&from).and_then(|(s, active)| {
                     *active = now;
                     s.handle_init(&init, ack_seq)
                 });
@@ -293,11 +316,11 @@ impl crate::router::Router {
                 // Fresh seq up front: the decrypt-fail arm needs one while
                 // the session is borrowed (counter skips are harmless).
                 let reinit_seq = self.next_init_seq();
-                if let Some((s, active)) = self.sessions.get_mut(&from) {
+                if let Some((s, active)) = self.sess.sessions.get_mut(&from) {
                     match s.decrypt(data) {
                         Some(payload) => {
                             *active = now;
-                            if let Some(e) = self.paths.get_mut(&from)
+                            if let Some(e) = self.path.entries.get_mut(&from)
                                 && !e.broken
                             {
                                 e.deadline = now + crate::pathfind::PATH_TIMEOUT;
@@ -363,7 +386,7 @@ impl crate::router::Router {
         let mut wrapped = Vec::with_capacity(msg.len() + 1);
         wrapped.push(kind);
         wrapped.extend_from_slice(&msg);
-        let enc = self.sessions.get_mut(&dest).map(|(s, active)| {
+        let enc = self.sess.sessions.get_mut(&dest).map(|(s, active)| {
             *active = std::time::Instant::now();
             s.encrypt(&wrapped)
         });
@@ -371,7 +394,7 @@ impl crate::router::Router {
             let sent = self.net_send(links, conn_peer, dest, enc).await;
             if sent.is_err() {
                 // Link died mid-write: retry the raw plaintext on the next link.
-                self.resend.push((dest, msg));
+                self.sess.resend.push((dest, msg));
                 sent?;
             }
         }
@@ -401,7 +424,7 @@ impl crate::router::Router {
         kind: u8,
         msg: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
-        if self.sessions.contains_key(&dest) {
+        if self.sess.sessions.contains_key(&dest) {
             return self
                 .session_send_inner(links, conn_peer, dest, kind, msg)
                 .await;
@@ -410,7 +433,7 @@ impl crate::router::Router {
         let sk = self.key.clone();
         let init_seq = self.next_init_seq();
         let enc = {
-            let buf = self.session_bufs.entry(dest).or_insert_with(|| {
+            let buf = self.sess.bufs.entry(dest).or_insert_with(|| {
                 let (cp, cs) = fresh_box();
                 let (np, ns) = fresh_box();
                 SessionBuf {

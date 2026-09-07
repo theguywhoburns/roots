@@ -183,10 +183,50 @@ impl Info {
     }
 }
 
+/// Spanning-tree table: peers, known infos, and parent-selection flags.
+/// Owned by [`crate::router::Router`]; algorithms here take only what they
+/// need so tree rules stay independent of path/session state.
+pub(crate) struct TreeState {
+    pub(crate) peers: HashMap<[u8; KEY_LEN], crate::peer::PeerState>,
+    pub(crate) infos: HashMap<[u8; KEY_LEN], Info>,
+    pub(crate) deadlines: HashMap<[u8; KEY_LEN], Instant>,
+    pub(crate) responses: HashMap<[u8; KEY_LEN], SigRes>,
+    pub(crate) sent: HashMap<[u8; KEY_LEN], std::collections::HashSet<[u8; KEY_LEN]>>,
+    pub(crate) next_port: u64,
+    pub(crate) refresh: bool,
+    pub(crate) do_root1: bool,
+    pub(crate) do_root2: bool,
+    pub(crate) self_refresh_at: Option<Instant>,
+    pub(crate) peer_order: u64,
+    pub(crate) announces_sent: u64,
+    pub(crate) announces_recv: u64,
+}
+
+impl Default for TreeState {
+    fn default() -> Self {
+        Self {
+            peers: HashMap::new(),
+            infos: HashMap::new(),
+            deadlines: HashMap::new(),
+            responses: HashMap::new(),
+            sent: HashMap::new(),
+            next_port: 1,
+            refresh: false,
+            do_root1: false,
+            do_root2: true,
+            self_refresh_at: None,
+            peer_order: 0,
+            announces_sent: 0,
+            announces_recv: 0,
+        }
+    }
+}
+
 impl crate::router::Router {
     pub(crate) fn new_req(&self) -> SigReq {
         SigReq {
             seq: self
+                .tree
                 .infos
                 .get(&self.pubkey)
                 .map(|i| i.res.req.seq + 1)
@@ -200,7 +240,7 @@ impl crate::router::Router {
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let req = self.new_req();
-        if let Some(p) = self.peers.get_mut(&peer_key) {
+        if let Some(p) = self.tree.peers.get_mut(&peer_key) {
             p.req = req;
             p.responded = false;
             p.sent_at = Some(Instant::now());
@@ -216,7 +256,7 @@ impl crate::router::Router {
         peer_key: [u8; KEY_LEN],
         req: SigReq,
     ) -> Result<(), Error> {
-        let port = self.peers.get(&peer_key).map(|p| p.port).unwrap_or(0);
+        let port = self.tree.peers.get(&peer_key).map(|p| p.port).unwrap_or(0);
         let res = SigRes::seal(req, port, &peer_key, &self.key, &self.pubkey);
         let mut out = Vec::new();
         res.encode(&mut out);
@@ -226,11 +266,13 @@ impl crate::router::Router {
     /// updating the RTT estimate (Go `_handleResponse` + peer `srst/srrt`).
     pub(crate) fn handle_response(&mut self, peer_key: [u8; KEY_LEN], res: SigRes) {
         let rtt = self
+            .tree
             .peers
             .get(&peer_key)
             .and_then(|p| p.sent_at)
             .map(|t| t.elapsed());
         let matches = self
+            .tree
             .peers
             .get(&peer_key)
             .map(|p| p.req == res.req)
@@ -238,8 +280,8 @@ impl crate::router::Router {
         if !matches || !res.check(&self.pubkey, &peer_key) {
             return;
         }
-        self.responses.entry(peer_key).or_insert(res);
-        if let (Some(p), Some(rtt)) = (self.peers.get_mut(&peer_key), rtt)
+        self.tree.responses.entry(peer_key).or_insert(res);
+        if let (Some(p), Some(rtt)) = (self.tree.peers.get_mut(&peer_key), rtt)
             && !p.responded
         {
             p.responded = true;
@@ -255,7 +297,7 @@ impl crate::router::Router {
     /// higher seq wins, then lower parent, then lower nonce. Returns true if
     /// the info was adopted.
     fn update(&mut self, ann: &Announce) -> bool {
-        if let Some(info) = self.infos.get(&ann.key) {
+        if let Some(info) = self.tree.infos.get(&ann.key) {
             let fresh = (
                 ann.res.req.seq,
                 std::cmp::Reverse(ann.parent),
@@ -270,7 +312,7 @@ impl crate::router::Router {
                 return false;
             }
         }
-        for sent in self.sent.values_mut() {
+        for sent in self.tree.sent.values_mut() {
             sent.remove(&ann.key);
         }
         let deadline = if ann.key == self.pubkey {
@@ -278,9 +320,10 @@ impl crate::router::Router {
         } else {
             TREE_TIMEOUT
         };
-        self.info_deadlines
+        self.tree
+            .deadlines
             .insert(ann.key, Instant::now() + deadline);
-        self.infos.insert(
+        self.tree.infos.insert(
             ann.key,
             Info {
                 parent: ann.parent,
@@ -293,25 +336,27 @@ impl crate::router::Router {
     pub(crate) fn expire(&mut self) {
         let now = Instant::now();
         let dead: Vec<[u8; KEY_LEN]> = self
-            .info_deadlines
+            .tree
+            .deadlines
             .iter()
             .filter(|(_, d)| **d <= now)
             .map(|(k, _)| *k)
             .collect();
         for k in dead {
-            self.info_deadlines.remove(&k);
-            self.infos.remove(&k);
-            for sent in self.sent.values_mut() {
+            self.tree.deadlines.remove(&k);
+            self.tree.infos.remove(&k);
+            for sent in self.tree.sent.values_mut() {
                 sent.remove(&k);
             }
         }
-        if self.self_refresh_at.map(|t| t <= now).unwrap_or(false) {
-            self.refresh = true;
-            self.self_refresh_at = Some(now + TREE_REFRESH);
+        if self.tree.self_refresh_at.map(|t| t <= now).unwrap_or(false) {
+            self.tree.refresh = true;
+            self.tree.self_refresh_at = Some(now + TREE_REFRESH);
         }
     }
     fn cost(&self, peer_key: &[u8; KEY_LEN]) -> u64 {
         let ms = self
+            .tree
             .peers
             .get(peer_key)
             .map(|p| p.lag.as_millis() as u64)
@@ -327,7 +372,7 @@ impl crate::router::Router {
             if dists.contains_key(&next) {
                 break;
             }
-            if let Some(info) = self.infos.get(&next) {
+            if let Some(info) = self.tree.infos.get(&next) {
                 root = next;
                 dists.insert(next, dist);
                 dist += 1;
@@ -344,12 +389,12 @@ impl crate::router::Router {
         links: &mut LinkSet<'_>,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
-        let self_info = self.infos.get(&self.pubkey).copied();
+        let self_info = self.tree.infos.get(&self.pubkey).copied();
         let mut best_root = self.pubkey;
         let mut best_parent = self.pubkey;
         let mut best_cost = u64::MAX;
         if let Some(info) = self_info
-            && self.peers.contains_key(&info.parent)
+            && self.tree.peers.contains_key(&info.parent)
         {
             let (root, dists) = self.root_and_dists(&self.pubkey);
             if root < best_root
@@ -361,10 +406,10 @@ impl crate::router::Router {
             }
         }
         let mut candidates: Vec<([u8; KEY_LEN], SigRes)> =
-            self.responses.iter().map(|(k, r)| (*k, *r)).collect();
+            self.tree.responses.iter().map(|(k, r)| (*k, *r)).collect();
         candidates.sort_by_key(|(k, _)| *k);
         for (pk, _res) in &candidates {
-            let Some(_) = self.infos.get(pk) else {
+            let Some(_) = self.tree.infos.get(pk) else {
                 continue;
             };
             let (p_root, p_dists) = self.root_and_dists(pk);
@@ -384,7 +429,7 @@ impl crate::router::Router {
                 continue;
             }
             let cur_parent = self_info.map(|i| i.parent);
-            if (self.refresh && cost.saturating_mul(2) < best_cost)
+            if (self.tree.refresh && cost.saturating_mul(2) < best_cost)
                 || (Some(best_parent) != cur_parent && cost < best_cost)
             {
                 best_root = p_root;
@@ -393,23 +438,27 @@ impl crate::router::Router {
             }
         }
         let cur_parent = self_info.map(|i| i.parent);
-        if self.refresh || self.do_root1 || self.do_root2 || cur_parent != Some(best_parent) {
+        if self.tree.refresh
+            || self.tree.do_root1
+            || self.tree.do_root2
+            || cur_parent != Some(best_parent)
+        {
             if best_root != self.pubkey
-                && let Some(res) = self.responses.get(&best_parent).copied()
+                && let Some(res) = self.tree.responses.get(&best_parent).copied()
                 && self.use_response(best_parent, &res)
             {
-                self.refresh = false;
-                self.do_root1 = false;
-                self.do_root2 = false;
+                self.tree.refresh = false;
+                self.tree.do_root1 = false;
+                self.tree.do_root2 = false;
                 self.send_all_reqs(links).await?;
-            } else if self.do_root2 {
+            } else if self.tree.do_root2 {
                 self.become_root();
-                self.refresh = false;
-                self.do_root1 = false;
-                self.do_root2 = false;
+                self.tree.refresh = false;
+                self.tree.do_root1 = false;
+                self.tree.do_root2 = false;
                 self.send_all_reqs(links).await?;
-            } else if !self.do_root1 {
-                self.do_root1 = true;
+            } else if !self.tree.do_root1 {
+                self.tree.do_root1 = true;
             }
         }
         let _ = peer_key;
@@ -441,12 +490,12 @@ impl crate::router::Router {
         };
         debug_assert!(ann.check());
         self.update(&ann);
-        self.self_refresh_at = Some(Instant::now() + TREE_REFRESH);
+        self.tree.self_refresh_at = Some(Instant::now() + TREE_REFRESH);
     }
     async fn send_all_reqs(&mut self, links: &mut LinkSet<'_>) -> Result<(), Error> {
         // Go `_sendReqs` clears req/res state and re-requests every peer.
-        self.responses.clear();
-        let keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
+        self.tree.responses.clear();
+        let keys: Vec<[u8; KEY_LEN]> = self.tree.peers.keys().copied().collect();
         for k in keys {
             self.send_req(links, k).await?;
         }
@@ -456,7 +505,7 @@ impl crate::router::Router {
         let mut anc = vec![*key];
         let mut here = *key;
         loop {
-            if let Some(info) = self.infos.get(&here) {
+            if let Some(info) = self.tree.infos.get(&here) {
                 if anc.contains(&info.parent) {
                     break;
                 }
@@ -481,7 +530,7 @@ impl crate::router::Router {
         let self_anc = self.ancestry(&self.pubkey);
         let peer_anc = self.ancestry(&peer_key);
         {
-            let sent = self.sent.entry(peer_key).or_default();
+            let sent = self.tree.sent.entry(peer_key).or_default();
             for k in self_anc.into_iter().chain(peer_anc) {
                 if !sent.contains(&k) {
                     sent.insert(k);
@@ -490,12 +539,12 @@ impl crate::router::Router {
             }
         }
         for k in to_send {
-            if let Some(info) = self.infos.get(&k) {
+            if let Some(info) = self.tree.infos.get(&k) {
                 let ann = info.announce(k);
                 let mut buf = Vec::new();
                 ann.encode(&mut buf);
                 links.write(peer_key, FrameType::Announce, &buf).await?;
-                self.announces_sent += 1;
+                self.tree.announces_sent += 1;
             }
         }
         Ok(())
@@ -508,17 +557,18 @@ impl crate::router::Router {
     ) -> Option<Announce> {
         // Returns a "here is better" reply announce when warranted, so the
         // caller can send it back to the original sender only.
-        self.announces_recv += 1;
+        self.tree.announces_recv += 1;
         let adopted = self.update(ann);
         if adopted {
             if ann.key == self.pubkey {
-                self.refresh = true;
+                self.tree.refresh = true;
             }
-            self.sent.entry(from).or_default().insert(ann.key);
+            self.tree.sent.entry(from).or_default().insert(ann.key);
             None
         } else {
-            self.sent.entry(from).or_default().insert(ann.key);
-            self.infos
+            self.tree.sent.entry(from).or_default().insert(ann.key);
+            self.tree
+                .infos
                 .get(&ann.key)
                 .filter(|info| {
                     **info

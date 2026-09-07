@@ -14,8 +14,8 @@ use tokio::net::TcpStream;
 
 use crate::error::Error;
 use crate::link::{
-    DIAL_TIMEOUT, HANDSHAKE_TIMEOUT, LinkOptions, PeerConn, PeerUri, Scheme, TLS_HANDSHAKE_TIMEOUT,
-    Transport, merge_opts, parse_link_uri,
+    DIAL_TIMEOUT, LinkOptions, PeerConn, PeerUri, Scheme, TLS_HANDSHAKE_TIMEOUT, Transport,
+    parse_link_uri,
 };
 
 /// TLS transport, usable for both dial (client) and accept (server) ends
@@ -160,26 +160,15 @@ async fn tls_dial_peer(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tls>, Error> {
-    let merged = merge_opts(peer, opts);
     let sni = sni_host(peer)?;
-    let mut stream: tokio_rustls::TlsStream<TcpStream> = tokio::time::timeout(
+    let stream: tokio_rustls::TlsStream<TcpStream> = tokio::time::timeout(
         DIAL_TIMEOUT,
         tls_connect(&peer.host_port, &sni, DIAL_TIMEOUT),
     )
     .await
     .map_err(|_| Error::Timeout)??
     .into();
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, &merged, false),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    crate::link::complete_dial(stream, peer, local, opts).await
 }
 
 /// Bind a `tls://host:port` listener (TCP accept + TLS acceptor pair).
@@ -210,23 +199,13 @@ pub async fn tls_accept(
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tls>, Error> {
     let (sock, _) = listener.accept().await.map_err(Error::Io)?;
-    let mut stream: tokio_rustls::TlsStream<TcpStream> =
+    let stream: tokio_rustls::TlsStream<TcpStream> =
         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(sock))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Io(std::io::Error::other(e)))?
             .into();
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        crate::link::run_handshake(&mut stream, local, opts, true),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    crate::link::complete_accept(stream, local, opts).await
 }
 
 #[cfg(test)]

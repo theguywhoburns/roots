@@ -40,6 +40,28 @@ pub const PATH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60)
 /// Minimum gap between lookups for one destination (Go `pathThrottle`).
 pub const PATH_THROTTLE: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Source-routing table: learned paths, pending DHT rumors, and our latest
+/// signed notify. Owned by [`crate::router::Router`].
+pub(crate) struct PathState {
+    pub(crate) entries: std::collections::HashMap<[u8; KEY_LEN], PathEntry>,
+    pub(crate) rumors: std::collections::HashMap<[u8; KEY_LEN], RumorEntry>,
+    pub(crate) notify: NotifyInfo,
+}
+
+impl Default for PathState {
+    fn default() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            rumors: std::collections::HashMap::new(),
+            notify: NotifyInfo {
+                seq: 0,
+                path: Vec::new(),
+                sig: [0u8; 64],
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathLookup {
     pub source: [u8; KEY_LEN],
@@ -208,7 +230,7 @@ impl crate::router::Router {
             if !seen.insert(next) {
                 return None; // loop
             }
-            let info = self.infos.get(&next)?;
+            let info = self.tree.infos.get(&next)?;
             if next == info.parent {
                 break; // root: no self port
             }
@@ -246,7 +268,7 @@ impl crate::router::Router {
                 return None;
             }
         }
-        let mut keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
+        let mut keys: Vec<[u8; KEY_LEN]> = self.tree.peers.keys().copied().collect();
         keys.sort();
         let mut cands: Vec<[u8; KEY_LEN]> = Vec::new();
         for k in &keys {
@@ -262,7 +284,7 @@ impl crate::router::Router {
         let mut best_cost = u64::MAX;
         let mut best_d = u64::MAX;
         for k in cands {
-            let p = &self.peers[&k];
+            let p = &self.tree.peers[&k];
             let dist = Self::coords_dist(path, &self.root_path_for(&k).unwrap_or_default());
             let cost = (p.lag.as_millis() as u64).max(1);
             let take = match best {
@@ -273,7 +295,7 @@ impl crate::router::Router {
                 _ if dist > best_d => false,
                 _ if cost < best_cost => true,
                 _ if cost > best_cost => false,
-                _ => p.order < self.peers[&best.unwrap()].order,
+                _ => p.order < self.tree.peers[&best.unwrap()].order,
             };
             if take {
                 best = Some(k);
@@ -291,7 +313,7 @@ impl crate::router::Router {
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
-        if let Some(e) = self.paths.get_mut(&dest) {
+        if let Some(e) = self.path.entries.get_mut(&dest) {
             e.req_at = Some(std::time::Instant::now());
         }
         let lookup = PathLookup {
@@ -325,11 +347,11 @@ impl crate::router::Router {
             path: coords,
             sig: [0u8; 64],
         };
-        if info.seq != self.notify_info.seq || info.path != self.notify_info.path {
+        if info.seq != self.path.notify.seq || info.path != self.path.notify.path {
             info.sign(&self.key);
-            self.notify_info = info.clone();
+            self.path.notify = info.clone();
         } else {
-            info = self.notify_info.clone();
+            info = self.path.notify.clone();
         }
         let notify = PathNotify {
             path: lookup.from.clone(),
@@ -358,9 +380,9 @@ impl crate::router::Router {
         if notify.dest != self.pubkey {
             return Ok(());
         }
-        if self.paths.contains_key(&notify.source) {
+        if self.path.entries.contains_key(&notify.source) {
             let (old_seq, old_path) = {
-                let e = &self.paths[&notify.source];
+                let e = &self.path.entries[&notify.source];
                 (e.seq, e.path.clone())
             };
             if notify.info.seq <= old_seq || notify.info.path == old_path {
@@ -369,7 +391,7 @@ impl crate::router::Router {
             if !notify.check() {
                 return Ok(());
             }
-            if let Some(e) = self.paths.get_mut(&notify.source) {
+            if let Some(e) = self.path.entries.get_mut(&notify.source) {
                 e.path = notify.info.path.clone();
                 e.seq = notify.info.seq;
                 e.broken = false;
@@ -377,6 +399,7 @@ impl crate::router::Router {
             }
         } else {
             if !self
+                .path
                 .rumors
                 .contains_key(&crate::bloom::xkey(&notify.source))
             {
@@ -385,7 +408,7 @@ impl crate::router::Router {
             if !notify.check() {
                 return Ok(());
             }
-            self.paths.insert(
+            self.path.entries.insert(
                 notify.source,
                 PathEntry {
                     path: notify.info.path.clone(),
@@ -397,6 +420,7 @@ impl crate::router::Router {
             );
         }
         if let Some(data) = self
+            .path
             .rumors
             .get_mut(&crate::bloom::xkey(&notify.source))
             .and_then(|r| r.pending.take())
@@ -423,8 +447,8 @@ impl crate::router::Router {
         if broken.source != self.pubkey {
             return Ok(());
         }
-        if self.paths.contains_key(&broken.dest) {
-            if let Some(e) = self.paths.get_mut(&broken.dest) {
+        if self.path.entries.contains_key(&broken.dest) {
+            if let Some(e) = self.path.entries.get_mut(&broken.dest) {
                 e.broken = true;
             }
             let dest = broken.dest;
@@ -445,6 +469,7 @@ impl crate::router::Router {
         let now = std::time::Instant::now();
         let x = crate::bloom::xkey(&dest);
         if self
+            .path
             .rumors
             .get(&x)
             .and_then(|r| r.send_at)
@@ -453,7 +478,7 @@ impl crate::router::Router {
         {
             return Ok(());
         }
-        let e = self.rumors.entry(x).or_insert(RumorEntry {
+        let e = self.path.rumors.entry(x).or_insert(RumorEntry {
             dest,
             send_at: None,
             deadline: now + PATH_TIMEOUT,
@@ -475,7 +500,8 @@ impl crate::router::Router {
         payload: Vec<u8>,
     ) -> Result<(), Error> {
         let path = self
-            .paths
+            .path
+            .entries
             .get(&dest)
             .filter(|e| !e.broken)
             .map(|e| e.path.clone());
@@ -491,7 +517,7 @@ impl crate::router::Router {
             return self.route_traffic(links, &tr).await;
         }
         self.rumor_lookup(links, conn_peer, dest).await?;
-        if let Some(r) = self.rumors.get_mut(&crate::bloom::xkey(&dest)) {
+        if let Some(r) = self.path.rumors.get_mut(&crate::bloom::xkey(&dest)) {
             r.pending = Some(payload);
         }
         Ok(())

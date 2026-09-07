@@ -59,13 +59,28 @@ pub const NODEINFO_DEFAULT: &[u8] = b"{}";
 /// anything under ~64 KiB is safe on a live link.
 pub const PROTO_RESPONSE_MAX: usize = 65535 - 64;
 
+/// Session-protocol state: our advertised nodeinfo. Owned by
+/// [`crate::router::Router`]; responses land in the router `proto_inbox`.
+#[derive(Debug, Clone)]
+pub(crate) struct ProtoState {
+    pub(crate) nodeinfo: Vec<u8>,
+}
+
+impl Default for ProtoState {
+    fn default() -> Self {
+        Self {
+            nodeinfo: NODEINFO_DEFAULT.to_vec(),
+        }
+    }
+}
+
 impl crate::router::Router {
     /// Replace our advertised nodeinfo (raw JSON, ≤ 16384 bytes).
     pub fn set_nodeinfo(&mut self, json: Vec<u8>) -> Result<(), crate::error::Error> {
         if json.len() > NODEINFO_MAX {
             return Err(crate::error::Error::InvalidLength);
         }
-        self.nodeinfo = json;
+        self.proto.nodeinfo = json;
         Ok(())
     }
 
@@ -132,9 +147,9 @@ impl crate::router::Router {
         match kind {
             PROTO_DUMMY => {}
             PROTO_NODEINFO_REQ => {
-                let mut out = Vec::with_capacity(self.nodeinfo.len() + 1);
+                let mut out = Vec::with_capacity(self.proto.nodeinfo.len() + 1);
                 out.push(PROTO_NODEINFO_RES);
-                out.extend_from_slice(&self.nodeinfo);
+                out.extend_from_slice(&self.proto.nodeinfo);
                 self.proto_send(links, conn_peer, from, out).await?;
             }
             PROTO_NODEINFO_RES => {
@@ -167,7 +182,7 @@ impl crate::router::Router {
                 let body = format!(
                     "{{\"key\":\"{}\",\"routing_entries\":\"{}\"}}",
                     hex::encode(self.pubkey),
-                    self.infos.len()
+                    self.tree.infos.len()
                 );
                 let mut out = Vec::with_capacity(body.len() + 2);
                 out.push(PROTO_DEBUG);
@@ -178,7 +193,7 @@ impl crate::router::Router {
             DEBUG_GETPEERS_REQ => {
                 // Go `_handleGetPeersRequest`: concatenated link-peer keys,
                 // MTU-capped. Our link peers are the router peer keys.
-                let mut keys: Vec<[u8; KEY_LEN]> = self.peers.keys().copied().collect();
+                let mut keys: Vec<[u8; KEY_LEN]> = self.tree.peers.keys().copied().collect();
                 keys.sort();
                 let out = concat_keys(PROTO_DEBUG, DEBUG_GETPEERS_RES, &keys);
                 self.proto_send(links, conn_peer, from, out).await?;
@@ -186,7 +201,7 @@ impl crate::router::Router {
             DEBUG_GETTREE_REQ => {
                 // Go `_handleGetTreeRequest`: concatenated known-tree keys,
                 // MTU-capped.
-                let mut keys: Vec<[u8; KEY_LEN]> = self.infos.keys().copied().collect();
+                let mut keys: Vec<[u8; KEY_LEN]> = self.tree.infos.keys().copied().collect();
                 keys.sort();
                 let out = concat_keys(PROTO_DEBUG, DEBUG_GETTREE_RES, &keys);
                 self.proto_send(links, conn_peer, from, out).await?;
@@ -249,12 +264,13 @@ mod tests {
             let (sock, _) = listener.accept().await.unwrap();
             let mut sock = sock;
             let opts = LinkOptions::default();
-            let (key, _) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
+            let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
             let mut conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
+                kind,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);

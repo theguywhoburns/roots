@@ -109,6 +109,13 @@ pub type LinkWrite<'a> =
 pub trait Link: Send {
     /// Link priority from the handshake (lowest wins among same-key links).
     fn priority(&self) -> u8;
+    /// Remote node key from the handshake.
+    fn remote_key(&self) -> [u8; KEY_LEN];
+    /// Which implementation the peer runs (vendor-tag based; defaults to
+    /// Go for hand-rolled test links).
+    fn peer_kind(&self) -> crate::peer::PeerKind {
+        crate::peer::PeerKind::Go
+    }
     fn read_frame<'a>(&'a mut self) -> LinkRead<'a>;
     fn write_frame<'a>(&'a mut self, ftype: FrameType, payload: &'a [u8]) -> LinkWrite<'a>;
 }
@@ -116,6 +123,14 @@ pub trait Link: Send {
 impl<T: Transport> Link for PeerConn<T> {
     fn priority(&self) -> u8 {
         self.priority
+    }
+
+    fn remote_key(&self) -> [u8; KEY_LEN] {
+        self.remote_key
+    }
+
+    fn peer_kind(&self) -> crate::peer::PeerKind {
+        self.kind.clone()
     }
 
     fn read_frame<'a>(&'a mut self) -> LinkRead<'a> {
@@ -133,6 +148,7 @@ impl<T: Transport> Link for PeerConn<T> {
 pub struct AnyConn {
     pub remote_key: [u8; KEY_LEN],
     pub priority: u8,
+    pub kind: crate::peer::PeerKind,
     pub stream: Box<dyn LinkStream>,
 }
 
@@ -144,6 +160,7 @@ impl AnyConn {
         Self {
             remote_key: conn.remote_key,
             priority: conn.priority,
+            kind: conn.kind,
             stream: Box::new(conn.stream),
         }
     }
@@ -152,6 +169,14 @@ impl AnyConn {
 impl Link for AnyConn {
     fn priority(&self) -> u8 {
         self.priority
+    }
+
+    fn remote_key(&self) -> [u8; KEY_LEN] {
+        self.remote_key
+    }
+
+    fn peer_kind(&self) -> crate::peer::PeerKind {
+        self.kind.clone()
     }
 
     fn read_frame<'a>(&'a mut self) -> LinkRead<'a> {
@@ -266,6 +291,7 @@ impl Transport for Tcp {
 pub struct PeerConn<T: Transport = Tcp> {
     pub remote_key: [u8; KEY_LEN],
     pub priority: u8,
+    pub kind: crate::peer::PeerKind,
     pub stream: T::Stream,
 }
 
@@ -374,13 +400,15 @@ pub fn parse_peer_uri(uri: &str) -> Result<PeerUri, Error> {
 }
 
 /// Run the `meta` exchange over any stream. `is_inbound` gates the allowlist
-/// check (Go skips it for link-local/multicast peers).
+/// check (Go skips it for link-local/multicast peers). Returns the peer key,
+/// negotiated priority, and the peer implementation kind (vendor-tag based;
+/// absent vendor means Go).
 pub async fn run_handshake<S>(
     stream: &mut S,
     local: &SigningKey,
     opts: &LinkOptions,
     is_inbound: bool,
-) -> Result<([u8; KEY_LEN], u8), Error>
+) -> Result<([u8; KEY_LEN], u8, crate::peer::PeerKind), Error>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -424,7 +452,11 @@ where
     {
         return Err(Error::KeyNotAllowed);
     }
-    Ok((theirs.public_key, theirs.priority.max(opts.priority)))
+    Ok((
+        theirs.public_key,
+        theirs.priority.max(opts.priority),
+        theirs.peer_kind(),
+    ))
 }
 
 /// Bind a `tcp://host:port` listener. Query strings are ignored except that
@@ -442,18 +474,8 @@ pub async fn accept(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tcp>, Error> {
-    let (mut stream, _) = listener.accept().await.map_err(Error::Io)?;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        run_handshake(&mut stream, local, opts, true),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    let (stream, _) = listener.accept().await.map_err(Error::Io)?;
+    complete_accept(stream, local, opts).await
 }
 
 /// Per-type frame counters from a [`PeerConn::run`] session.
@@ -554,21 +576,10 @@ pub async fn dial(
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tcp>, Error> {
     let peer = parse_peer_uri(uri)?;
-    let merged = merge_opts(&peer, opts);
-    let mut stream = tokio::time::timeout(DIAL_TIMEOUT, Tcp::dial(&peer.host_port, DIAL_TIMEOUT))
+    let stream = tokio::time::timeout(DIAL_TIMEOUT, Tcp::dial(&peer.host_port, DIAL_TIMEOUT))
         .await
         .map_err(|_| Error::Timeout)??;
-    let (remote_key, priority) = tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        run_handshake(&mut stream, local, &merged, false),
-    )
-    .await
-    .map_err(|_| Error::Timeout)??;
-    Ok(PeerConn {
-        remote_key,
-        priority,
-        stream,
-    })
+    complete_dial(stream, &peer, local, opts).await
 }
 
 /// Merge URI query options over the configured defaults (Go `links.add`).
@@ -582,6 +593,69 @@ pub(crate) fn merge_opts(peer: &PeerUri, opts: &LinkOptions) -> LinkOptions {
         priority: opts.priority.max(peer.priority),
         pinned_key: peer.pinned_key.or(opts.pinned_key),
         allowed_keys: opts.allowed_keys.clone(),
+    }
+}
+
+/// Transport template: finish a dial from a connected stream. Shared tail
+/// for all `*_dial` (merge opts + `meta` handshake + `PeerConn` build), so
+/// each transport only supplies stream acquisition.
+pub async fn complete_dial<T: Transport>(
+    stream: T::Stream,
+    peer: &PeerUri,
+    local: &SigningKey,
+    opts: &LinkOptions,
+) -> Result<PeerConn<T>, Error> {
+    let merged = merge_opts(peer, opts);
+    let mut stream = stream;
+    let (remote_key, priority, kind) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        run_handshake(&mut stream, local, &merged, false),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
+    Ok(PeerConn {
+        remote_key,
+        priority,
+        kind,
+        stream,
+    })
+}
+
+/// Transport template: finish an accept from an accepted stream. Shared
+/// tail for all `*_accept`.
+pub async fn complete_accept<T: Transport>(
+    stream: T::Stream,
+    local: &SigningKey,
+    opts: &LinkOptions,
+) -> Result<PeerConn<T>, Error> {
+    let mut stream = stream;
+    let (remote_key, priority, kind) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        run_handshake(&mut stream, local, opts, true),
+    )
+    .await
+    .map_err(|_| Error::Timeout)??;
+    Ok(PeerConn {
+        remote_key,
+        priority,
+        kind,
+        stream,
+    })
+}
+
+/// Dial any scheme and type-erase to [`AnyConn`]: one `match` on [`Scheme`]
+/// instead of per-callsite `if starts_with` chains (`main.rs`, `admin.rs`,
+/// `proto_probe.rs`).
+pub async fn dial_any(uri: &str, local: &SigningKey, opts: &LinkOptions) -> Result<AnyConn, Error> {
+    let (scheme, _) = parse_link_uri(uri)?;
+    match scheme {
+        Scheme::Tcp => Ok(AnyConn::new(dial(uri, local, opts).await?)),
+        Scheme::Tls => Ok(AnyConn::new(crate::tls::tls_dial(uri, local, opts).await?)),
+        Scheme::Ws => Ok(AnyConn::new(crate::ws::ws_dial(uri, local, opts).await?)),
+        Scheme::Wss => Ok(AnyConn::new(crate::ws::wss_dial(uri, local, opts).await?)),
+        Scheme::Quic => Ok(AnyConn::new(
+            crate::quic::quic_dial(uri, local, opts).await?,
+        )),
     }
 }
 
@@ -672,8 +746,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(conn.remote_key, server_sk.verifying_key().to_bytes());
-        let (seen_key, _) = server.await.unwrap();
+        assert!(conn.kind.is_roots(), "roots dial advertises vendor");
+        let (seen_key, _, seen_kind) = server.await.unwrap();
         assert_eq!(seen_key, client_sk.verifying_key().to_bytes());
+        assert!(seen_kind.is_roots(), "roots accept sees vendor");
     }
 
     #[tokio::test]
@@ -732,6 +808,7 @@ mod tests {
             let mut tmp = PeerConn::<Tcp> {
                 remote_key: [0; KEY_LEN],
                 priority: 0,
+                kind: crate::peer::PeerKind::Go,
                 stream: sock,
             };
             let (ftype, payload) = tmp.read_frame().await.unwrap();

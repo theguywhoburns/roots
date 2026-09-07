@@ -24,12 +24,14 @@
 - [x] Slice 16 — crossed session opens converge (per-router monotonic `next_init_seq` + fresh `next` keys in `apply_update`, both Go-faithful). DONE 2026-09-06: same-second seq collisions no longer deadlock fast crossed opens; regression test `crossed_session_open_delivers_both_ways` (second flight asserts delivery; first-flight loss on exact cross is protocol-inherent, same in Go). Session↔Go interop re-verified live (4/4 proto replies).
 - [x] Slice 17 — `main.rs` small client (`[peer] [hold] [resolve-ipv6]`: converge → optional resolve + nodeinfo fetch → hold → report).
 - [x] Slice 18 — admin `addPeer`/`removePeer` with persistent redial (Go-style per-URI backoff; dead-link eviction keeps survivors serving; empty-set serve sleeps instead of spinning). DONE 2026-09-07: kill/restart cycle vs stock Go node recovers to Up; 63 unit tests green.
-- [ ] Slice 19+ — public-mesh TUN run (needs TUN host + second live node; loopback-verified only).
+- [x] Slice 19 — router cleanup: god-object split (facade `Router` + `TreeState`/`PathState`/`BloomState`/`SessionState`/`ProtoState` tables, `driver.rs` I/O, `views.rs` snapshots + `Snapshot` trait), transport templates (`complete_dial`/`complete_accept`/`dial_any`, `Link::remote_key`), lib supervisor (`SupervisedPeer`), Go/roots peer differentiation via vendor TLV (Go ignores unknown tags; `dump` shows `impl=go/roots`). DONE: 71 unit tests green, clippy/fmt clean.
+- [ ] Slice 20+ — public-mesh TUN run (needs TUN host + second live node; loopback-verified only).
 
 ## Remaining work (as of 2026-09-07)
-- Code cleanup: DONE (see Slice 7 line) + `LinkSet` persistence migration: all callers own one set per link-collection across slices.
+- Code cleanup: DONE (Slice 19: tables + driver/views split, transport templates, supervisor, peer differentiation).
 - **Library:** feature-complete for a client (all 5 transports, tree/DHT/sessions/proto incl. crossed-open convergence, reconnect, lazy keepalive, dead-link eviction).
-- **Demo client:** admin `addPeer` redials persistently (Go-style per-URI backoff) but removal drops immediately (Go only stops redialing); TUN is loopback-verified only (needs TUN host + second live node for a public-mesh run).
+- **Demo client:** admin `addPeer` redials persistently via the lib supervisor but removal drops immediately (Go only stops redialing); TUN is loopback-verified only (needs TUN host + second live node for a public-mesh run).
+- **Compat rule:** vendor/feature TLVs are Go-ignored (no `default` arm in `version.go` `decode`, signature covers only the key); all behavior fixes gate on `PeerKind::supports(_)`, defaulting to Go-exact.
 
 ## Notes for a fresh session
 - Go ref cloned at /tmp/opencode/ygg-ref/yggdrasil-go (depth 1, HEAD 422836e). Trust it over docs.

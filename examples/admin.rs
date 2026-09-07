@@ -327,22 +327,9 @@ async fn main() {
         router: &mut Router,
         uri: &str,
     ) -> Result<OwnedLink, String> {
-        // Scheme dispatch mirrors Client::connect_*; failures surface as
-        // Go-style "unable to parse peering URI" / dial errors.
-        async fn handshake<T: roots::Transport>(
-            mut conn: roots::PeerConn<T>,
-            router: &mut Router,
-        ) -> Result<roots::AnyConn, String>
-        where
-            T::Stream: 'static,
-        {
-            let peer = conn.remote_key;
-            router
-                .register(&mut conn, peer)
-                .await
-                .map_err(|e| format!("register failed: {e}"))?;
-            Ok(roots::AnyConn::new(conn))
-        }
+        // Single scheme-erased path over `connect_any` (see
+        // `link::dial_any`); failures surface as Go-style
+        // "unable to parse peering URI" / dial errors.
         let tmp = Client::with_options(dial_key.clone(), dial_opts.clone());
         let bad = |e: roots::Error| {
             let msg = e.to_string();
@@ -352,22 +339,12 @@ async fn main() {
                 msg
             }
         };
-        let (key, conn) = if uri.starts_with("tls://") {
-            let c = tmp.connect_tls(uri).await.map_err(bad)?;
-            (c.remote_key, handshake(c, router).await?)
-        } else if uri.starts_with("ws://") {
-            let c = tmp.connect_ws(uri).await.map_err(bad)?;
-            (c.remote_key, handshake(c, router).await?)
-        } else if uri.starts_with("wss://") {
-            let c = tmp.connect_wss(uri).await.map_err(bad)?;
-            (c.remote_key, handshake(c, router).await?)
-        } else if uri.starts_with("quic://") {
-            let c = tmp.connect_quic(uri).await.map_err(bad)?;
-            (c.remote_key, handshake(c, router).await?)
-        } else {
-            let c = tmp.connect(uri).await.map_err(bad)?;
-            (c.remote_key, handshake(c, router).await?)
-        };
+        let mut conn = tmp.connect_any(uri).await.map_err(bad)?;
+        let key = conn.remote_key;
+        router
+            .register(&mut conn, key)
+            .await
+            .map_err(|e| format!("register failed: {e}"))?;
         Ok(OwnedLink {
             key,
             uri: uri.to_string(),
@@ -379,14 +356,10 @@ async fn main() {
     let first = dial_owned(&dial_key, &dial_opts, &mut router, &peer)
         .await
         .expect("dial public peer");
-    /// One configured peer: redialed with backoff while configured,
-    /// like Go's persistent links (removal drops it immediately and
-    /// forgets it, unlike Go which only stops redialing).
-    struct PeerCfg {
-        uri: String,
-        failures: u32,
-        next_retry: Instant,
-    }
+    // Configured peers redial with backoff while configured, like Go's
+    // persistent links (removal drops immediately and forgets, unlike Go
+    // which only stops redialing). State lives in the lib supervisor
+    // (`src/supervisor.rs`), not example-local counters.
     // Owned links: the set below borrows them, so topology changes
     // (addPeer/removePeer) rebuild the set afterwards. Fresh clocks on
     // rebuild only cost one quiet second, well under peer timeouts.
@@ -394,12 +367,8 @@ async fn main() {
     // (key, uri) mirror for admin arms: `owned` is mutably borrowed by
     // the link set during serve, so reads go here instead.
     let mut uris = vec![(owned[0].key, peer.clone())];
-    let mut configured: Vec<PeerCfg> = Vec::new();
-    configured.push(PeerCfg {
-        uri: peer.clone(),
-        failures: 0,
-        next_retry: Instant::now(),
-    });
+    let mut configured: Vec<roots::SupervisedPeer> = Vec::new();
+    configured.push(roots::SupervisedPeer::new(peer.clone()));
     let mut no_out = Vec::new();
     // One set for the whole run (see main loop below).
     let mut links = roots::LinkSet::new();
@@ -439,32 +408,20 @@ async fn main() {
     }
     loop {
         // Redial configured peers missing a live link (Go persistent
-        // links; failures back off per URI). Runs before the set is
-        // built so fresh clocks start clean.
-        let now = Instant::now();
-        let missing: Vec<usize> = configured
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| now >= c.next_retry && !owned.iter().any(|o| o.uri == c.uri))
-            .map(|(i, _)| i)
-            .collect();
-        for i in missing {
+        // links; failures back off per URI via the lib supervisor).
+        // Runs before the set is built so fresh clocks start clean.
+        let live_uris: Vec<String> = owned.iter().map(|o| o.uri.clone()).collect();
+        for i in roots::due_indices(&configured, Instant::now(), &live_uris) {
             let uri = configured[i].uri.clone();
             match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
                 Ok(link) => {
-                    configured[i].failures = 0;
+                    configured[i].record_success();
                     uris.push((link.key, uri));
                     owned.push(link);
                 }
                 Err(e) => {
                     eprintln!("redial {uri}: {e}");
-                    configured[i].failures = configured[i].failures.saturating_add(1).min(32);
-                    let cap = roots::parse_link_uri(&uri)
-                        .ok()
-                        .and_then(|(_, p)| p.max_backoff)
-                        .unwrap_or(roots::link::DEFAULT_MAX_BACKOFF);
-                    configured[i].next_retry =
-                        now + roots::link::backoff_delay(configured[i].failures, cap);
+                    configured[i].record_failure(roots::backoff_cap(&uri));
                 }
             }
         }
@@ -561,10 +518,9 @@ async fn main() {
             // (backoff-gated) and rebuilds. Without this, an empty set
             // idles here forever and redials never run.
             let now = Instant::now();
+            let live: Vec<String> = uris.iter().map(|(_, u)| u.clone()).collect();
             if want.iter().any(|k| !links.peers().contains(k))
-                || configured
-                    .iter()
-                    .any(|c| now >= c.next_retry && !uris.iter().any(|(_, u)| u == &c.uri))
+                || !roots::due_indices(&configured, now, &live).is_empty()
             {
                 break;
             }
@@ -587,11 +543,7 @@ async fn main() {
                             Ok(link) => {
                                 uris.push((link.key, uri.clone()));
                                 owned.push(link);
-                                configured.push(PeerCfg {
-                                    uri,
-                                    failures: 0,
-                                    next_retry: Instant::now(),
-                                });
+                                configured.push(roots::SupervisedPeer::new(uri));
                                 write_admin_response(sock, &echo, "success", "", json!({})).await;
                             }
                             Err(e) => {

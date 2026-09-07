@@ -31,6 +31,11 @@ const TAG_MINOR: u16 = 1;
 const TAG_PUBKEY: u16 = 2;
 /// TLV tag: link priority, 1B value.
 const TAG_PRIORITY: u16 = 3;
+/// TLV tag: implementation vendor, UTF-8 (e.g. `roots`). Ignored by Go's
+/// decoder (no `default` arm in `version.go` `decode`), so safe to send.
+const TAG_VENDOR: u16 = crate::peer::TAG_VENDOR;
+/// TLV tag: feature bitflags, BE32. Ignored by Go.
+const TAG_FEATURES: u16 = crate::peer::TAG_FEATURES;
 /// TLV field header length (tag BE16 + len BE16).
 const FIELD_HEADER_LEN: usize = 4;
 
@@ -40,6 +45,10 @@ pub struct Meta {
     pub minor: u16,
     pub public_key: [u8; KEY_LEN],
     pub priority: u8,
+    /// Advertised vendor (`None` = omit tag, i.e. speak bare Go).
+    pub vendor: Option<Vec<u8>>,
+    /// Advertised feature bits (`None` = omit tag).
+    pub features: Option<u32>,
 }
 
 impl Meta {
@@ -49,6 +58,20 @@ impl Meta {
             minor: PROTOCOL_MINOR,
             public_key: *public_key,
             priority,
+            vendor: Some(crate::peer::VENDOR_ROOTS.to_vec()),
+            features: Some(crate::peer::feat::NONE),
+        }
+    }
+
+    /// Bare-Go meta without vendor tags (for interop probes / tests).
+    pub fn local_go(public_key: &[u8; KEY_LEN], priority: u8) -> Self {
+        Self {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+            public_key: *public_key,
+            priority,
+            vendor: None,
+            features: None,
         }
     }
 
@@ -63,6 +86,12 @@ impl Meta {
         push_field(&mut out, TAG_MINOR, &self.minor.to_be_bytes());
         push_field(&mut out, TAG_PUBKEY, &self.public_key);
         push_field(&mut out, TAG_PRIORITY, &[self.priority]);
+        if let Some(v) = &self.vendor {
+            push_field(&mut out, TAG_VENDOR, v);
+        }
+        if let Some(f) = self.features {
+            push_field(&mut out, TAG_FEATURES, &f.to_be_bytes());
+        }
         let hash = keyed_hash(&self.public_key, password)?;
         out.extend_from_slice(&secret.sign(&hash).to_bytes());
         let body_len = (out.len() - HEADER_LEN) as u16;
@@ -86,6 +115,8 @@ impl Meta {
             minor: 0,
             public_key: [0u8; KEY_LEN],
             priority: 0,
+            vendor: None,
+            features: None,
         };
         let mut rest = fields;
         while rest.len() >= FIELD_HEADER_LEN {
@@ -112,6 +143,19 @@ impl Meta {
                 TAG_MAJOR | TAG_MINOR | TAG_PUBKEY | TAG_PRIORITY => {
                     return Err(Error::InvalidLength);
                 }
+                TAG_VENDOR => {
+                    // Cap length for hygiene; overlong vendor falls back to
+                    // Go treatment (ignored). Empty vendor = absent.
+                    if !val.is_empty() && val.len() <= crate::peer::VENDOR_MAX {
+                        meta.vendor = Some(val.to_vec());
+                    }
+                }
+                TAG_FEATURES if val.len() == 4 => {
+                    meta.features = Some(u32::from_be_bytes([val[0], val[1], val[2], val[3]]));
+                }
+                TAG_FEATURES => {
+                    return Err(Error::InvalidLength);
+                }
                 _ => {} // forward-compatible: ignore unknown tags
             }
             rest = tail;
@@ -133,6 +177,11 @@ impl Meta {
             return Err(Error::BadVersion(self.major, self.minor));
         }
         Ok(())
+    }
+
+    /// Which implementation sent this meta (vendor-tag based).
+    pub fn peer_kind(&self) -> crate::peer::PeerKind {
+        crate::peer::PeerKind::from_tlvs(self.vendor.as_deref(), self.features)
     }
 }
 
@@ -179,6 +228,8 @@ mod tests {
                     minor,
                     public_key: sk.verifying_key().to_bytes(),
                     priority: prio,
+                    vendor: None,
+                    features: None,
                 };
                 let enc = m.encode(&sk, password).unwrap();
                 let dec = Meta::decode(&enc, password).unwrap();
@@ -230,8 +281,31 @@ mod tests {
             minor: 9,
             public_key: [0; KEY_LEN],
             priority: 0,
+            vendor: None,
+            features: None,
         };
         assert!(matches!(m.check(), Err(Error::BadVersion(9, 9))));
         assert!(Meta::local(&[0; KEY_LEN], 0).check().is_ok());
+    }
+
+    #[test]
+    fn vendor_roundtrip_and_go_interop() {
+        use crate::peer::PeerKind;
+        let sk = key(9);
+        let pk = sk.verifying_key().to_bytes();
+        // Roots local advertises vendor; decodes as Roots.
+        let m = Meta::local(&pk, 0);
+        let enc = m.encode(&sk, b"").unwrap();
+        let dec = Meta::decode(&enc, b"").unwrap();
+        assert_eq!(dec, m);
+        assert!(dec.peer_kind().is_roots());
+        // Bare Go meta (no vendor tags) decodes as Go.
+        let g = Meta::local_go(&pk, 0);
+        let genc = g.encode(&sk, b"").unwrap();
+        let gdec = Meta::decode(&genc, b"").unwrap();
+        assert_eq!(gdec.peer_kind(), PeerKind::Go);
+        // Roots decodes Go meta as Go (forward path for mixed meshes).
+        // Go ignores our vendor tags: strip them manually is equivalent to
+        // Go's skip-unknown behavior, covered by decode ignoring unknowns.
     }
 }

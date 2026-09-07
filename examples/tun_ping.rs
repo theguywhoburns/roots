@@ -66,10 +66,10 @@ async fn main() {
             let (sock, _) = listener.accept().await.unwrap();
             let mut sock = sock;
             let opts = roots::LinkOptions::default();
-            let (key, _) = roots::link::run_handshake(&mut sock, &b_sk, &opts, true)
+            let (key, _, kind) = roots::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            (sock, key)
+            (sock, key, kind)
         }
     });
     let ca = Client::new(a_sk);
@@ -79,11 +79,12 @@ async fn main() {
     let mut ra = Router::new(ca.key);
     ra.register(&mut a_conn, a_peer).await.expect("A register");
     let mut a_links = roots::LinkSet::single(a_peer, &mut a_conn);
-    let (b_sock, b_peer) = accepted.await.unwrap();
+    let (b_sock, b_peer, b_kind) = accepted.await.unwrap();
     let cb = Client::new(b_sk);
     let mut b_conn = roots::PeerConn::<roots::Tcp> {
         remote_key: b_peer,
         priority: 0,
+        kind: b_kind,
         stream: b_sock,
     };
     let mut rb = Router::new(cb.key);

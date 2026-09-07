@@ -6,18 +6,23 @@
 
 pub mod address;
 pub mod bloom;
+pub mod driver;
 pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod link;
 pub mod pathfind;
+pub mod peer;
 pub mod proto;
 pub mod quic;
 pub mod router;
 pub mod session;
+pub mod supervisor;
 pub mod tls;
 pub mod traffic;
+pub mod traits;
 pub mod tree;
+pub mod views;
 pub mod ws;
 
 pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
@@ -25,11 +30,15 @@ pub use error::Error;
 pub use frame::FrameType;
 pub use handshake::Meta;
 pub use link::{
-    AnyConn, Link, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport, parse_link_uri,
+    AnyConn, Link, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport,
+    complete_accept, complete_dial, dial_any, parse_link_uri,
 };
+pub use peer::{PeerKind, feat};
 pub use quic::Quic;
 pub use router::Router;
+pub use supervisor::{SupervisedPeer, backoff_cap, due_indices};
 pub use tls::Tls;
+pub use traits::Snapshot;
 pub use ws::{Ws, Wss};
 
 use ed25519_dalek::SigningKey;
@@ -80,6 +89,13 @@ impl Client {
         crate::ws::wss_dial(uri, &self.key, &self.opts).await
     }
 
+    /// Connect with any scheme, type-erased to [`AnyConn`]. Replaces the
+    /// per-callsite `if starts_with` chains with one [`Scheme`] match
+    /// (see `link::dial_any`).
+    pub async fn connect_any(&self, uri: &str) -> Result<AnyConn, Error> {
+        link::dial_any(uri, &self.key, &self.opts).await
+    }
+
     /// Connect to a `quic://` peer URI and complete the handshake.
     pub async fn connect_quic(&self, uri: &str) -> Result<PeerConn<crate::quic::Quic>, Error> {
         crate::quic::quic_dial(uri, &self.key, &self.opts).await
@@ -100,51 +116,49 @@ impl Client {
     /// (`1s << failures`, 2s after the first failure), repeat. Router state
     /// (tree, paths, sessions) persists across links, so traffic self-heals.
     /// Returns after `max_serves` completed links (`None` = forever).
+    /// Single code path over [`AnyConn`]: no per-scheme match (the old
+    /// 5-arm `drive` fan-out is kept below for typed callers).
     pub async fn run_peer(
         &self,
         uri: &str,
         outgoing: &mut Vec<([u8; 32], Vec<u8>)>,
         max_serves: Option<u64>,
     ) -> Result<(), Error> {
-        let (scheme, peer) = link::parse_link_uri(uri)?;
+        let (_, peer) = link::parse_link_uri(uri)?;
         let max_backoff = peer.max_backoff.unwrap_or(link::DEFAULT_MAX_BACKOFF);
         let mut router = Router::new(self.key.clone());
-        match scheme {
-            Scheme::Tcp => {
-                drive(&mut router, max_backoff, outgoing, max_serves, || {
-                    link::dial(uri, &self.key, &self.opts)
-                })
-                .await
+        let mut supervised = crate::supervisor::SupervisedPeer::new(uri.to_string());
+        let mut served: u64 = 0;
+        loop {
+            match self.connect_any(uri).await {
+                Ok(mut conn) => {
+                    supervised.record_success();
+                    let peer_key = conn.remote_key;
+                    if router.register(&mut conn, peer_key).await.is_ok() {
+                        let mut links = LinkSet::single(peer_key, &mut conn);
+                        let _ = router.serve(&mut links, None, outgoing).await;
+                        served += 1;
+                        if max_serves.is_some_and(|m| served >= m) {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(_) => {
+                    supervised.record_failure(max_backoff);
+                }
             }
-            Scheme::Tls => {
-                drive(&mut router, max_backoff, outgoing, max_serves, || {
-                    crate::tls::tls_dial(uri, &self.key, &self.opts)
-                })
-                .await
-            }
-            Scheme::Ws => {
-                drive(&mut router, max_backoff, outgoing, max_serves, || {
-                    crate::ws::ws_dial(uri, &self.key, &self.opts)
-                })
-                .await
-            }
-            Scheme::Wss => {
-                drive(&mut router, max_backoff, outgoing, max_serves, || {
-                    crate::ws::wss_dial(uri, &self.key, &self.opts)
-                })
-                .await
-            }
-            Scheme::Quic => {
-                drive(&mut router, max_backoff, outgoing, max_serves, || {
-                    crate::quic::quic_dial(uri, &self.key, &self.opts)
-                })
-                .await
-            }
+            let wait = supervised
+                .next_retry
+                .saturating_duration_since(std::time::Instant::now());
+            tokio::time::sleep(wait).await;
         }
     }
 }
 
-/// Reconnect driver shared by all transports.
+/// Reconnect driver for typed links (compile-time transport). The
+/// scheme-erased [`Client::run_peer`] covers the common case; this stays as
+/// the typed template for callers holding a `PeerConn<T>` directly.
+#[allow(dead_code)]
 async fn drive<T, F, Fut>(
     router: &mut Router,
     max_backoff: std::time::Duration,
