@@ -212,6 +212,17 @@ impl<'a> LinkSet<'a> {
         None
     }
 
+    /// Drop a link from the set (dead links; the caller owns the conn).
+    /// Send clocks for remaining links are untouched.
+    pub fn remove(&mut self, peer: &[u8; KEY_LEN]) {
+        self.entries.retain(|(k, _)| k != peer);
+    }
+
+    /// True when no links remain.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Write one frame to the link for `target` (no entry = drop).
     /// Stamps the send time, which drives Go-style lazy keepalives:
     /// a keepalive goes out only after a full idle tick with no sends.

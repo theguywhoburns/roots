@@ -379,6 +379,14 @@ async fn main() {
     let first = dial_owned(&dial_key, &dial_opts, &mut router, &peer)
         .await
         .expect("dial public peer");
+    /// One configured peer: redialed with backoff while configured,
+    /// like Go's persistent links (removal drops it immediately and
+    /// forgets it, unlike Go which only stops redialing).
+    struct PeerCfg {
+        uri: String,
+        failures: u32,
+        next_retry: Instant,
+    }
     // Owned links: the set below borrows them, so topology changes
     // (addPeer/removePeer) rebuild the set afterwards. Fresh clocks on
     // rebuild only cost one quiet second, well under peer timeouts.
@@ -386,6 +394,12 @@ async fn main() {
     // (key, uri) mirror for admin arms: `owned` is mutably borrowed by
     // the link set during serve, so reads go here instead.
     let mut uris = vec![(owned[0].key, peer.clone())];
+    let mut configured: Vec<PeerCfg> = Vec::new();
+    configured.push(PeerCfg {
+        uri: peer.clone(),
+        failures: 0,
+        next_retry: Instant::now(),
+    });
     let mut no_out = Vec::new();
     // One set for the whole run (see main loop below).
     let mut links = roots::LinkSet::new();
@@ -424,19 +438,58 @@ async fn main() {
         },
     }
     loop {
+        // Redial configured peers missing a live link (Go persistent
+        // links; failures back off per URI). Runs before the set is
+        // built so fresh clocks start clean.
+        let now = Instant::now();
+        let missing: Vec<usize> = configured
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| now >= c.next_retry && !owned.iter().any(|o| o.uri == c.uri))
+            .map(|(i, _)| i)
+            .collect();
+        for i in missing {
+            let uri = configured[i].uri.clone();
+            match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
+                Ok(link) => {
+                    configured[i].failures = 0;
+                    uris.push((link.key, uri));
+                    owned.push(link);
+                }
+                Err(e) => {
+                    eprintln!("redial {uri}: {e}");
+                    configured[i].failures = configured[i].failures.saturating_add(1).min(32);
+                    let cap = roots::parse_link_uri(&uri)
+                        .ok()
+                        .and_then(|(_, p)| p.max_backoff)
+                        .unwrap_or(roots::link::DEFAULT_MAX_BACKOFF);
+                    configured[i].next_retry =
+                        now + roots::link::backoff_delay(configured[i].failures, cap);
+                }
+            }
+        }
         let mut links = roots::LinkSet::new();
         for o in owned.iter_mut() {
             links.add(o.key, &mut o.conn);
         }
+        // Keys the set was built with: if eviction drops one mid-loop,
+        // break out so the outer loop redials the missing peer.
+        let want: Vec<[u8; 32]> = links.peers();
         // Deferred init: only topology requests break the serve loop,
         // always carrying their staged change.
-        let topo: Topo;
+        let mut topo: Option<Topo> = None;
         loop {
             tokio::select! {
                 r = router.serve(&mut links, Some(Duration::from_millis(250)), &mut outbox) => {
                     if let Err(e) = r {
-                        eprintln!("link dropped: {e}");
-                        std::process::exit(1);
+                        // All links dead (eviction empties the set) or a
+                        // write failed: drop everything suspect and let
+                        // the outer loop redial with backoff.
+                        eprintln!("serve error, redialing: {e}");
+                        owned.clear();
+                        uris.clear();
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        break;
                     }
                 }
                 a = listener.accept() => {
@@ -481,10 +534,10 @@ async fn main() {
                                         if uri.is_empty() {
                                             write_admin_response(sock, &echo, "error", "unable to parse peering URI: empty", Value::Null).await;
                                         } else if name == "addpeer" {
-                                            topo = Topo::Add { sock, echo, uri };
+                                            topo = Some(Topo::Add { sock, echo, uri });
                                             break;
                                         } else {
-                                            topo = Topo::Remove { sock, echo, uri };
+                                            topo = Some(Topo::Remove { sock, echo, uri });
                                             break;
                                         }
                                     } else {
@@ -502,44 +555,67 @@ async fn main() {
             if let Some(scope) = links.peers().into_iter().next() {
                 service_pending(&mut router, &mut links, scope, &mut pending).await;
             }
+            // Break out when the set no longer matches reality: an
+            // evicted link left `owned` behind, or a redial came due for
+            // a configured-but-absent peer. The outer loop then redials
+            // (backoff-gated) and rebuilds. Without this, an empty set
+            // idles here forever and redials never run.
+            let now = Instant::now();
+            if want.iter().any(|k| !links.peers().contains(k))
+                || configured
+                    .iter()
+                    .any(|c| now >= c.next_retry && !uris.iter().any(|(_, u)| u == &c.uri))
+            {
+                break;
+            }
         }
         // Set dropped: safe to mutate the owned links.
-        match topo {
-            Topo::Add { sock, echo, uri } => {
-                if owned.iter().any(|o| o.uri == uri) {
-                    write_admin_response(
-                        sock,
-                        &echo,
-                        "error",
-                        "peer is already configured",
-                        Value::Null,
-                    )
-                    .await;
-                } else {
-                    match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
-                        Ok(link) => {
-                            uris.push((link.key, uri));
-                            owned.push(link);
-                            write_admin_response(sock, &echo, "success", "", json!({})).await;
+        if let Some(topo) = topo {
+            match topo {
+                Topo::Add { sock, echo, uri } => {
+                    if configured.iter().any(|c| c.uri == uri) {
+                        write_admin_response(
+                            sock,
+                            &echo,
+                            "error",
+                            "peer is already configured",
+                            Value::Null,
+                        )
+                        .await;
+                    } else {
+                        match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
+                            Ok(link) => {
+                                uris.push((link.key, uri.clone()));
+                                owned.push(link);
+                                configured.push(PeerCfg {
+                                    uri,
+                                    failures: 0,
+                                    next_retry: Instant::now(),
+                                });
+                                write_admin_response(sock, &echo, "success", "", json!({})).await;
+                            }
+                            Err(e) => {
+                                write_admin_response(sock, &echo, "error", &e, Value::Null).await
+                            }
                         }
-                        Err(e) => write_admin_response(sock, &echo, "error", &e, Value::Null).await,
                     }
                 }
-            }
-            Topo::Remove { sock, echo, uri } => {
-                if owned.iter().any(|o| o.uri == uri) {
-                    owned.retain(|o| o.uri != uri);
-                    uris.retain(|(_, u)| *u != uri);
-                    write_admin_response(sock, &echo, "success", "", json!({})).await;
-                } else {
-                    write_admin_response(
-                        sock,
-                        &echo,
-                        "error",
-                        "peer is not configured",
-                        Value::Null,
-                    )
-                    .await;
+                Topo::Remove { sock, echo, uri } => {
+                    if configured.iter().any(|c| c.uri == uri) {
+                        configured.retain(|c| c.uri != uri);
+                        owned.retain(|o| o.uri != uri);
+                        uris.retain(|(_, u)| *u != uri);
+                        write_admin_response(sock, &echo, "success", "", json!({})).await;
+                    } else {
+                        write_admin_response(
+                            sock,
+                            &echo,
+                            "error",
+                            "peer is not configured",
+                            Value::Null,
+                        )
+                        .await;
+                    }
                 }
             }
         }

@@ -596,6 +596,16 @@ impl Router {
             {
                 break;
             }
+            let timeout = end
+                .map(|e| e.saturating_duration_since(now))
+                .unwrap_or(MAINTENANCE_INTERVAL)
+                .min(MAINTENANCE_INTERVAL);
+            if links.peers().is_empty() {
+                // No links: sleep the budget instead of spinning — an
+                // empty read/dispatch loop has no await point that parks.
+                tokio::time::sleep(timeout).await;
+                continue;
+            }
             for (dest, msg) in std::mem::take(outgoing) {
                 // Outbox sends are link-agnostic (pathfinder routes); the
                 // first peer key only scopes per-link state refreshes.
@@ -608,10 +618,6 @@ impl Router {
                     self.maintain(links, peer).await?;
                 }
             }
-            let timeout = end
-                .map(|e| e.saturating_duration_since(now))
-                .unwrap_or(MAINTENANCE_INTERVAL)
-                .min(MAINTENANCE_INTERVAL);
             // Drain every link. A single link blocks for the whole budget
             // (exact old `serve` timing); several links take short slices
             // each so one quiet link never starves the rest.
@@ -630,7 +636,16 @@ impl Router {
                         self.frames[ftype as usize] += 1;
                         self.dispatch_frame(links, peer, ftype, &payload).await?;
                     }
-                    Ok(Err(e)) => return Err(e),
+                    // A dead link is evicted, not fatal: remaining links
+                    // keep serving (single-link callers see an empty set
+                    // below and get the last error, preserving the old
+                    // `serve` contract).
+                    Ok(Err(e)) => {
+                        links.remove(&peer);
+                        if links.is_empty() {
+                            return Err(e);
+                        }
+                    }
                     // Quiet slice: top up links idle past a full tick so
                     // the peer's liveness monitor never starves, even when
                     // no frames arrive to answer (Go sends on the same
@@ -798,6 +813,78 @@ mod tests {
             }
         }
         assert!(router.has_session(&s1_pub), "session over dyn TCP link");
+        srv1.abort();
+        srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn serve_links_evicts_dead_link() {
+        // Two loopback links, one peer dies mid-serve: the dead link is
+        // evicted from the set and the survivor keeps serving (instead
+        // of one dead link aborting the whole serve like single-link
+        // `serve` does when its only link drops).
+        async fn run_server(
+            listener: tokio::net::TcpListener,
+            sk: SigningKey,
+            die_after: Option<Duration>,
+        ) {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut sock = sock;
+            let opts = LinkOptions::default();
+            let (key, _) = crate::link::run_handshake(&mut sock, &sk, &opts, true)
+                .await
+                .unwrap();
+            let mut conn = crate::link::PeerConn::<Tcp> {
+                remote_key: key,
+                priority: 0,
+                stream: sock,
+            };
+            let mut router = Router::new(sk);
+            router.register(&mut conn, key).await.unwrap();
+            if let Some(d) = die_after {
+                // Die abruptly: no FIN handshake, just drop the socket.
+                tokio::time::sleep(d).await;
+                return;
+            }
+            let mut links = LinkSet::single(key, &mut conn);
+            let _ = router
+                .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
+                .await;
+        }
+
+        let c_sk = SigningKey::from_bytes(&[0x41; 32]);
+        let s1_sk = SigningKey::from_bytes(&[0x11; 32]);
+        let s2_sk = SigningKey::from_bytes(&[0x21; 32]);
+
+        let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a1 = l1.local_addr().unwrap();
+        let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a2 = l2.local_addr().unwrap();
+        let srv1 = tokio::spawn(run_server(l1, s1_sk, None));
+        let srv2 = tokio::spawn(run_server(l2, s2_sk, Some(Duration::from_secs(1))));
+
+        let mut c1 = crate::link::dial(&format!("tcp://{a1}"), &c_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let p1 = c1.remote_key;
+        let mut c2 = crate::link::dial(&format!("tcp://{a2}"), &c_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let p2 = c2.remote_key;
+
+        let mut router = Router::new(c_sk);
+        router.register(&mut c1, p1).await.unwrap();
+        router.register(&mut c2, p2).await.unwrap();
+        let mut links = LinkSet::single(p1, &mut c1);
+        links.add(p2, &mut c2);
+        // Must return Ok at hold expiry even though p2 died mid-serve.
+        router
+            .serve_links(&mut links, Some(Duration::from_secs(5)), &mut Vec::new())
+            .await
+            .expect("survivor keeps serving");
+        assert!(router.parent().is_some(), "converged via survivor");
+        assert!(!links.peers().contains(&p2), "dead link evicted");
+        assert!(links.peers().contains(&p1), "live link kept");
         srv1.abort();
         srv2.abort();
     }
