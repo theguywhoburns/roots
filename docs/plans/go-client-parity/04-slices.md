@@ -161,7 +161,7 @@ Three ordering rules that are not obvious from the list:
       | Reverted behaviour | Killed by (all in `node_loop`) |
       |---|---|
       | `link_id` dedup — a duplicate stacks a second dial (`link.go:236-245`) | `assertion failed: the duplicate dial never connected` (`accepted` 2 ≠ 1) |
-      | `Drop` keeps the link that is already up (`api.go:207-211`) | `timed out after 15s waiting for the dropped peer's live link still carries traffic` |
+      | `Drop` keeps the link that is already up (`api.go:207-211` — a decision, not parity: Go closes the link, `link.go:433-438`, as Slice 8 measured) | `timed out after 15s waiting for the dropped peer's live link still carries traffic` |
       | `Drop` cancels the redial loop | `assertion failed: a dropped peer must not be dialled again` (`accepted` 2 ≠ 1) |
       | a dead link is survivable, not fatal | `the node loop ends cleanly: Io(UnexpectedEof)` |
 
@@ -390,7 +390,7 @@ Three ordering rules that are not obvious from the list:
         the *log line*). Worth the ten minutes: a wrong cite in a doc whose whole
         job is citing bytes is worse than no cite.
 
-- [ ] **Slice 8 — `getPeers` says what Go says.** `sort` argument with Go's
+- [x] **Slice 8 — `getPeers` says what Go says.** `sort` argument with Go's
       three stable orderings, and the full `PeerEntry` field set fed by Slice 4:
       `up`, `inbound`, `cost` (via `peer_cost`, Go's floor-at-1 millisecond
       number), `uptime`, `bytes_recvd`/`bytes_sent`, `rate_recvd`/`rate_sent`,
@@ -407,14 +407,179 @@ Three ordering rules that are not obvious from the list:
       *Proves:* the three sort modes each order a crafted 3-link fixture
       differently, and a live `yggdrasilctl getPeers` against a real node lists
       fields side by side with Go's output on the same page of docs.
+      **Done 2026-09-25:** the library half is `src/link.rs` — a `LinkId` minted
+      per completed connection, `AnyConn::{id, remote_addr}`, `stats(&id)` where
+      it was `stats(&key)`, `LinkStats` with `rx_rate`/`tx_rate`, and
+      `update_rates()` on Go's one-second window (`link.go:106-129`) — plus
+      `src/tree.rs` stamping the `SigReq` send only once the write succeeds and
+      the `SigRes` arrival on the signature alone (`peers.go:318-334`), surfaced
+      through a named `LinkPeer` on `Router::link_peers()`. The client half is
+      `client/src/links.rs` (one `Entry` per *peering*, `LinkKind::{Persistent,
+      Ephemeral, Incoming}` = Go's `linkType`, each holding the `LinkId` of the
+      socket it made), `client/src/node.rs` (a row's `up`/`key`/`port`/`cost`/
+      `latency`/bytes all come from one `links.stats(id)` lookup), and
+      `client/src/admin.rs` (all 16 `PeerEntry` fields, Go's three `sort` modes,
+      `sort_stable`). `client/tests/peer_rows.rs` is new (3 tests, 2.4 s),
+      `admin_loopback` gained `admin_getpeers_reports_every_field_go_does`,
+      `links.rs` and `admin.rs` gained 3 + 6 unit tests, and
+      `proof/7-admin-inbound.sh` is superseded by `proof/8-getpeers.sh`. The CI
+      trio is green (111 unit + 20 integration, ~35 s).
+
+      **The row set was the hard half, and the fix is an identity, not a
+      container.** The slice text offered "a set that holds two links to one
+      key, or per-link direction". Neither. Go's `LinkSet` counterpart keys by
+      *URI* (`link.go:54-57`), which is why two directions to one node are two
+      links there, and ironwood keeps a *map* of peers per key
+      (`peers.go:47-62`) — but our `LinkSet` keys by node public key on purpose
+      (Slice 4: the per-link send clocks and queue live in the slot, and the
+      router may only hold one link per peer). So the slot model stays and each
+      **connection** gets a number that is never reused: `LinkId` is Go's
+      `map[net.Conn]DebugPeerInfo` join (`api.go:73-77,96-103`) with the pointer
+      replaced by a counter. A row asks "is *my* link still the one in the slot",
+      which is the question `stats(&key)` could not ask — and answering it is
+      what makes `inbound`, `up` and the byte counters stop being borrowed from
+      whichever link arrived last.
+
+      **The two rules about which rows exist** came out of `core/link.go` and are
+      now both ours and both tested: a dial's row is created *before* it connects
+      and is deleted only when the dial goroutine returns (`:249-257`,
+      `:307-311`), so a dead dial keeps reporting `up: false` with its error; an
+      accepted link's row is created at accept time and deleted by the `defer`
+      that closes it (`:534-571`), so a dead inbound row vanishes. `LinkId` also
+      carries a second consequence: an id is minted from a global atomic, so a
+      caller cannot fabricate "my link is up" — the only way to get a matching
+      one is to hold the connection.
+
+      **The proof bar, run for real.**
+      `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/8-getpeers.sh`
+      — exits 0, `== all checks passed ==`, captured 2026-09-25. Two Go 0.5.14
+      nodes and two of ours in one private netns, this time with *different*
+      keys so the links are real:
+
+      | Phase | What it pins |
+      |---|---|
+      | A — we dial Go | both sides list the one link and disagree only about direction (`inbound: false` / `true`), Go names its row by the accepted socket (`tcp://127.0.0.1:38684`); bytes, uptime, latency and a *rate* on both sides (`rate_sent` ours, `rate_recvd` Go's — the same 2 keepalive bytes/s), the unreachable peer's row still listed on both with its error aged |
+      | B — Go dials us | the link we accepted is a row at all (Slice 7 answered `{"peers": []}`), named by the accepted socket and carrying the peer's key and counters |
+      | sorts | `sort=cost` and `sort=uptime` against both nodes: same rows, non-decreasing in the sort key |
+      | error wording | **printed, not asserted** — Go says `dial tcp 127.0.0.1:12499: connect: connection refused`, we say `io: Connection refused (os error 111)` |
+      | C — crossed peering | on a second pair, both dialling each other from a cold start with nothing torn down: neither side ever answers with two live rows, both keep their own dial listed in all three samples, the accepted direction gets its own row, and *which one is live moves between samples* |
+
+      Phase C is the deviation this slice will not fix, and it replaced the
+      hypothesis it was meant to test: the first draft asserted "Go holds both
+      directions up at once, we hold one". Measured, that is false — Go never
+      reports two live rows either, because `handler` closes the newcomer when it
+      already holds a connection to that key (`link.go:544-548`) and ironwood
+      keeps one port per peer. What actually happens on **both** implementations
+      is a flap: each side's redial and the other side's accept trade slots, so
+      `Connected`/`Disconnected` lines pile up in Go's log (15 in a 10 s window)
+      and the live row changes identity between samples. Ours churns the same way
+      through `LinkSet::add`'s displacement (`src/link.rs:303-332`) plus the drop
+      of the returned `AnyConn` (`client/src/node.rs:324,357`). Recorded as a
+      TODO, not a parity fix.
+
+      **Every behaviour reverted one at a time.** Twelve reverts in the library,
+      three in the client's row set, ten in the admin body — a mutation counted
+      as killed only if a test names it, and cargo stops at the first failing
+      test target, so each client revert ran against both files separately.
+
+      *8a — the library (`src/link.rs`, `src/tree.rs`):*
+
+      | Reverted behaviour | Killed by |
+      |---|---|
+      | `stats` keyed by node key again (the slot, not the connection) | `link_identity_stops_matching_when_displaced` |
+      | rate window dropped (a rate divided by elapsed time) | `rates_are_the_bytes_since_the_last_sample` |
+      | accepted socket's address not plumbed through the handshake | `anyconn_records_direction` |
+      | `srrt` stamped only when the reply matches our current request | `a_valid_sigres_refreshes_latency_even_when_stale` |
+      | `srst` stamped before the send instead of after it | `a_sigreq_that_never_left_starts_no_clock` |
+      | latency not rounded to 1/100 ms | `a_valid_sigres_refreshes_latency_even_when_stale` |
+
+      *8b — the row set (`client/src/node.rs`):*
+
+      | Reverted behaviour | Killed by |
+      |---|---|
+      | an accepted link creates no row | `an_accepted_link_gets_its_own_row`, `two_directions_to_one_peer_get_two_rows` (`peer_rows` only — the admin fixture has no accepted link, and `admin_loopback` correctly survives this one) |
+      | `up` reported for every row | all three `peer_rows` tests, plus `admin_getpeers_reports_every_field_go_does` and `admin_getpeers_reports_the_link_uri_not_the_operators` |
+      | direction read from the link set instead of the row | `an_accepted_link_gets_its_own_row`, `two_directions_to_one_peer_get_two_rows`, `admin_getpeers_reports_every_field_go_does` |
+
+      *8c — the admin body and sorts (`client/src/admin.rs`):*
+
+      | Reverted behaviour | Killed by |
+      |---|---|
+      | no sort at all | `getpeers_sort_modes_match_go_three_for_three`, `getpeers_uptime_is_the_last_tiebreak_in_the_other_two_modes`, `getpeers_sorts_where_go_s_truncation_breaks_a_total_order` |
+      | Go's `int(float)` truncation replaced by `total_cmp` | `getpeers_sorts_where_go_s_truncation_breaks_a_total_order` |
+      | default mode drops the direction key | `getpeers_sort_modes_match_go_three_for_three` |
+      | cost mode compares the key before the cost | the same test, at the `sort=cost` case |
+      | the trailing `uptime` key cut from `by_default` / `by_cost` | `getpeers_uptime_is_the_last_tiebreak_in_the_other_two_modes` |
+      | `sort_by` instead of `sort_stable` | `getpeers_sorts_where_go_s_truncation_breaks_a_total_order` — panics on the 300-row fixture, which is what the truncation makes unsortable |
+      | `latency: 0` | `admin_getpeers_reports_every_field_go_does` |
+      | rates hardcoded 0 | the same test |
+      | `last_error_time` reported without an error | `getpeers_reports_an_error_age_only_with_an_error` |
+      | `priority` joined from the row instead of the live link | `an_accepted_link_gets_its_own_row` |
+
+      **Two gates no test covers, said plainly rather than counted as proven.**
+      The `inbound` flag is `live.is_some() && kind == Incoming`, and no test
+      separates the two halves of that conjunction from each other (killing the
+      `live.is_some()` part alone fails the *other* asserts first); and
+      `Links::busy()` — the rule that an inbound link may not claim a URI whose
+      row already has a live connection — is exercised only incidentally by the
+      crossed tests, never by a case that would fail if the gate were inverted.
+      Both are Go-parity behaviours, both are cheap to pin, and neither is
+      pinned today.
+
+      **`cost` and `latency` are the two fields this slice fills but does not
+      claim.** A single pair of samples disagreed by 100× (ours 106 ms / 53 ms,
+      Go's 160 ms / 0.52 ms on the same link), and reading `_getCost`
+      (ironwood `router.go:221-228`, `:431-441`) explains why the comparison is
+      meaningless rather than which side is wrong: `cost` is a lag EWMA seeded at
+      `rtt*2` and eased 7/8 toward the *stored* timestamps, not a measured RTT,
+      and `latency` is `srrt - srst` over timestamps that age between queries.
+      The formulas are ported and cited; what remains open is why our numbers run
+      so far above a Go peer's. Recorded as a TODO.
+
+      **Three Go behaviours found while reading the code for this, none of them
+      Slice 8's subject — and two of them measured, because the binaries are
+      here.** Reading Go's `remove` rather than its doc comment (and then
+      confirming it against a live pair in a netns) shows that **`removePeer`
+      closes the link**: `state.cancel()` and `conn.Close()` are both in the same
+      actor block (`link.go:433-438`), so `removePeer uri=<a live dial>` returns
+      `{}`, the row disappears from `getPeers` *and* from the peer's, and the
+      dialling node logs `Disconnected outbound … use of closed network
+      connection`. The "The peer is not disconnected immediately" comment
+      (`api.go:203`) describes nothing that happens. Our `Cmd::Drop` keeps the
+      link up — which is a **divergence we own**, pinned by
+      `node_loop`'s `the_dropped_peer…` test, and every doc that cited that
+      comment as the reason now says so. Second: **`removePeer` on the URI of a
+      live *inbound* row makes Go panic** — the inbound path builds its `link`
+      without a context (`link.go:536-543`) and `remove` calls `state.cancel()`
+      unconditionally, so `link.go:434` dereferences nil and the node dies
+      (measured: `panic: runtime error: invalid memory address or nil pointer
+      dereference`, yggdrasilctl gets `EOF`). We must not reproduce that
+      faithfully. Third: `getTree`/`getSelf`'s missing self-entry — Slice 7's
+      "recorded for Slice 8" — is a router seeding gap (Go seeds its own key with
+      `sequence: 1`) that none of this slice's bodies touch, so it stays open.
+
+      Docs: `docs/protocol/21-admin.md` gained "Which rows, and in what order"
+      (the `_links` keying, the two `defer`s, the `conns[conn]` join, all three
+      comparators with the truncation bug and the 200/300/400-row panic
+      measurement) and a real captured byte pair from phase A, with the caveat
+      that the two answers were taken in sequence so only the *shape* is a pair;
+      `AGENTS.md` and `docs/architecture-map.md` carry the new `LinkId` seam and
+      the crossed-peering flap as an invariant and a gotcha.
 
 - [ ] **Slice 9 — remote queries and `removePeer` stop lying.** Remote
       (`getNodeInfo`, `debug_remoteGet*`) route through `next_hop(key)` instead
-      of `links.peers().next()`, and `removePeer` removes only the redial
-      entry — Go's comment is explicit: "The peer is not disconnected
-      immediately."
+      of `links.peers().next()`. `removePeer` needs a **decision, not a copy**:
+      Slice 8 read Go instead of trusting its comment, and Go's `remove` cancels
+      the redial context *and* closes the live connection (`link.go:433-438`),
+      while our `Cmd::Drop` cancels the redial and keeps the link (Slice 5,
+      pinned by `node_loop_two_peers_dedup_drop_and_survival`). Pick one — Go's
+      behaviour, or ours with the divergence documented in `21-admin.md`, which
+      already records both — and make `removePeer`'s reply match whatever the
+      row set then shows. It must not reproduce Go's nil-context panic on the URI
+      of an inbound row.
       *Proves:* a two-destination test where the wrong-hop choice is
-      distinguishable, and `getPeers` still shows a removed-but-live link as up.
+      distinguishable, and a removed-but-live link reported the one way the slice
+      decided on.
 
 - [ ] **Slice 10 — multicast in the library (codec + state machine).**
       `src/multicast.rs`: `Advertisement` encode/decode with Go's

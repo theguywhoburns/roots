@@ -8,6 +8,7 @@
 //! are the sync seams (expiry, views) plus the transport template.
 
 use crate::address::KEY_LEN;
+use crate::views::LinkPeer;
 
 /// Read-only diagnostics snapshot (admin adapter, `dump`, tests).
 pub trait Snapshot {
@@ -19,7 +20,7 @@ pub trait Snapshot {
     fn path_details(&self, key: &[u8; KEY_LEN]) -> Option<(Vec<u64>, u64)>;
     fn get_paths(&self) -> Vec<([u8; KEY_LEN], Vec<u64>, u64)>;
     fn get_sessions(&self) -> Vec<[u8; KEY_LEN]>;
-    fn link_peers(&self) -> Vec<([u8; KEY_LEN], u64, u8, bool, u128)>;
+    fn link_peers(&self) -> Vec<LinkPeer>;
     fn tree_entries(&self) -> Vec<([u8; KEY_LEN], [u8; KEY_LEN], u64)>;
     fn dump(&self) -> String;
 }

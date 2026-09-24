@@ -11,9 +11,10 @@
 //! serialise alphabetically, and `serde_json`'s `preserve_order` feature is off
 //! deliberately ([`crate::config`] sorts its maps for the same reason).
 
+use std::cmp::Ordering;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -208,6 +209,11 @@ fn is_false(v: &bool) -> bool {
 /// Go's `omitempty` for a number: zero disappears.
 fn is_zero(v: &u64) -> bool {
     *v == 0
+}
+
+/// ... and for a `float64`, which is what `uptime` is.
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// A stream the admin socket can serve: either transport Go's `AdminListen`
@@ -534,7 +540,7 @@ async fn dispatch(
     let snap = report(tx).await?;
     Ok(match name {
         "getself" => Body::Self_(get_self(&snap)),
-        "getpeers" => Body::Peers(get_peers(&snap)),
+        "getpeers" => Body::Peers(get_peers(&snap, args)),
         "gettree" => Body::Tree(get_tree(&snap)),
         "getpaths" => Body::Paths(get_paths(&snap)),
         "getsessions" => Body::Sessions(get_sessions(&snap)),
@@ -595,10 +601,15 @@ fn get_self(snap: &Snapshot) -> GetSelfResponse<'static> {
     }
 }
 
-/// Go's `PeerEntry` (`getpeers.go:21-38`) minus `rate_recvd`, `rate_sent` and
-/// `last_error_time`: the library measures no throughput and timestamps no link
-/// error, so there is nothing true to put in them. Absent rather than zero —
-/// Go's `omitempty` drops a zero rate too, but it would show one it measured.
+/// Go's `PeerEntry` (`getpeers.go:21-38`), field for field and in field order:
+/// `encoding/json` writes a struct in declaration order, so a body with the same
+/// keys in another order is a different answer on the wire.
+///
+/// Every `omitempty` is carried over, including the ones that hide a real zero —
+/// a link with no traffic reports no `bytes_recvd` key at all rather than
+/// `"bytes_recvd": 0`. `uptime` is Go's `float64` seconds (see
+/// [`go_seconds`]); `latency` and `last_error_time` are `time.Duration`, which
+/// marshals as an integer count of nanoseconds.
 #[derive(Serialize)]
 struct PeerEntry {
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -615,10 +626,16 @@ struct PeerEntry {
     bytes_recvd: u64,
     #[serde(skip_serializing_if = "is_zero")]
     bytes_sent: u64,
-    #[serde(skip_serializing_if = "Value::is_null")]
-    uptime: Value,
+    #[serde(skip_serializing_if = "is_zero")]
+    rate_recvd: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    rate_sent: u64,
+    #[serde(skip_serializing_if = "is_zero_f64", serialize_with = "go_seconds")]
+    uptime: f64,
     #[serde(skip_serializing_if = "is_zero")]
     latency: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    last_error_time: u64,
     #[serde(skip_serializing_if = "String::is_empty")]
     last_error: String,
 }
@@ -628,8 +645,12 @@ struct GetPeersResponse {
     peers: Vec<PeerEntry>,
 }
 
-fn get_peers(snap: &Snapshot) -> GetPeersResponse {
-    let peers = snap
+fn get_peers(snap: &Snapshot, args: &Value) -> GetPeersResponse {
+    // One instant for the whole body, so two rows that failed at the same moment
+    // print the same age (Go calls `time.Since` once per row, which can differ by
+    // the odd nanosecond between them).
+    let now = Instant::now();
+    let mut peers: Vec<PeerEntry> = snap
         .peers
         .iter()
         .map(|p| PeerEntry {
@@ -647,33 +668,146 @@ fn get_peers(snap: &Snapshot) -> GetPeersResponse {
             cost: p.cost,
             bytes_recvd: p.rx_bytes,
             bytes_sent: p.tx_bytes,
-            uptime: go_seconds(p.up_for),
-            // Slice 8: Go's `latency` is the raw last SigReq round trip
-            // (`debug.go:85`, `peer.srrt.Sub(peer.srst)` rounded to 10 µs), a
-            // different measurement from the `cost` EWMA above, and the library
-            // keeps only the EWMA. Zero means `omitempty`, which is what a link
-            // with no sample shows in Go too — but a link with one should not
-            // read as if it had none.
-            latency: 0,
+            rate_recvd: p.rx_rate,
+            rate_sent: p.tx_rate,
+            uptime: p.up_for.as_secs_f64(),
+            // Go keeps the raw round trip, not the cost EWMA above
+            // (`debug.go:84-86`), and drops one that is not positive — which
+            // `roots::Router::link_peers` has already done for us.
+            latency: p.latency.map(|d| d.as_nanos() as u64).unwrap_or(0),
+            // The *age* of the error, and only when there is one: Go gates both
+            // fields on `p.LastError != nil` (`getpeers.go:64-67`), so a row with
+            // a timestamp but no message prints neither.
+            last_error_time: match (&p.last_error, p.err_at) {
+                (Some(_), Some(at)) => now.duration_since(at).as_nanos() as u64,
+                _ => 0,
+            },
             last_error: p.last_error.clone().unwrap_or_default(),
         })
         .collect();
-    // Slice 8: Go sorts here (`getpeers.go:70-101`, three comparators). Until
-    // then the rows stay in configuration order, which is what `Links` keeps.
+    // Go's `switch strings.ToLower(req.SortBy)` (`getpeers.go:70-77`): anything
+    // that is not `uptime` or `cost` gets the default order, including a request
+    // with no `sort` at all.
+    let by = match args
+        .get("sort")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase()
+        .as_str()
+    {
+        "uptime" => by_uptime as fn(&PeerEntry, &PeerEntry) -> Ordering,
+        "cost" => by_cost,
+        _ => by_default,
+    };
+    // `slices.SortStableFunc` is a *stable* sort, not `sort_unstable`: rows a
+    // comparator calls equal stay in configuration order.
+    sort_stable(&mut peers, by);
     GetPeersResponse { peers }
 }
 
-/// Go's `float64` seconds: `encoding/json` writes a whole float without a
-/// decimal point where `serde_json` writes `1.0`, and `omitempty` drops zero.
-fn go_seconds(d: Duration) -> Value {
-    let secs = d.as_secs_f64();
-    if secs == 0.0 {
-        return Value::Null;
+/// Go's `slices.SortStableFunc` (`getpeers.go:71-77`), written out.
+///
+/// Deliberately not `slice::sort_by`. Go's uptime key is `int(a - b)`, which
+/// calls two rows equal when they differ by less than a whole second, so "equal"
+/// is not transitive: `a` ties `b` and `b` ties `c` while `a` and `c` are a
+/// second apart. Rust looks for exactly that and panics with "user-provided
+/// comparison function does not correctly implement a total order" once the
+/// slice is big enough to leave its run-detection path — which would take the
+/// node down over a `getPeers` with `sort: uptime`. Insertion sort has no such
+/// check, is stable the way Go's is, and costs O(n²) on a peer list that is tens
+/// of rows long; Go's own answer for a non-transitive comparator is
+/// implementation-defined at large `n` anyway.
+fn sort_stable(rows: &mut [PeerEntry], by: fn(&PeerEntry, &PeerEntry) -> Ordering) {
+    for at in 1..rows.len() {
+        let mut from = at;
+        while from > 0 && by(&rows[from - 1], &rows[from]) == Ordering::Greater {
+            rows.swap(from - 1, from);
+            from -= 1;
+        }
     }
-    if secs.fract() == 0.0 {
-        return Value::from(secs as u64);
+}
+
+/// Go's `if d := a - b; d != 0 { return int(d) }` on two `uint64`s: `None` means
+/// the two are identical and the comparison moves on to the next key.
+fn go_u64(a: u64, b: u64) -> Option<Ordering> {
+    (a != b).then(|| (a.wrapping_sub(b) as i64).cmp(&0))
+}
+
+/// The same line on two `float64`s, where the `int(d)` conversion is the point:
+/// a difference smaller than one whole second returns *from the comparator* as 0,
+/// which means "equal" — and the keys after it are never consulted. Sorting by
+/// uptime therefore leaves two links from the same second in configuration order,
+/// in both directions. Reproduce it: `a.total_cmp(&b)` orders rows Go does not.
+fn go_f64(a: f64, b: f64) -> Option<Ordering> {
+    let d = a - b;
+    (d != 0.0).then(|| (d as i64).cmp(&0))
+}
+
+/// `strings.Compare` on the hex key — byte order, which for fixed-length lowercase
+/// hex is the same as the key's own order. A row with no key compares as the empty
+/// string, which is before every real one.
+fn go_key(a: &str, b: &str) -> Option<Ordering> {
+    (a != b).then(|| a.cmp(b))
+}
+
+/// Go's `sortByDefault` (`getpeers.go:81-101`): outbound rows first, then key,
+/// priority, cost, uptime. Direction is the only thing that outranks a key.
+fn by_default(a: &PeerEntry, b: &PeerEntry) -> Ordering {
+    if a.inbound != b.inbound {
+        return if a.inbound {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        };
     }
-    Value::from(secs)
+    if let Some(d) = go_key(&a.key, &b.key) {
+        return d;
+    }
+    if let Some(d) = go_u64(a.priority, b.priority) {
+        return d;
+    }
+    if let Some(d) = go_u64(a.cost, b.cost) {
+        return d;
+    }
+    go_f64(a.uptime, b.uptime).unwrap_or(Ordering::Equal)
+}
+
+/// Go's `sortByCost` (`getpeers.go:103-117`): cost, then key, priority, uptime.
+fn by_cost(a: &PeerEntry, b: &PeerEntry) -> Ordering {
+    if let Some(d) = go_u64(a.cost, b.cost) {
+        return d;
+    }
+    if let Some(d) = go_key(&a.key, &b.key) {
+        return d;
+    }
+    if let Some(d) = go_u64(a.priority, b.priority) {
+        return d;
+    }
+    go_f64(a.uptime, b.uptime).unwrap_or(Ordering::Equal)
+}
+
+/// Go's `sortByUptime` (`getpeers.go:119-133`): uptime, then key, priority, cost.
+fn by_uptime(a: &PeerEntry, b: &PeerEntry) -> Ordering {
+    if let Some(d) = go_f64(a.uptime, b.uptime) {
+        return d;
+    }
+    if let Some(d) = go_key(&a.key, &b.key) {
+        return d;
+    }
+    if let Some(d) = go_u64(a.priority, b.priority) {
+        return d;
+    }
+    go_u64(a.cost, b.cost).unwrap_or(Ordering::Equal)
+}
+
+/// Go's `float64` seconds: `encoding/json` writes a whole float without a decimal
+/// point where `serde_json` writes `1.0`.
+fn go_seconds<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    if v.fract() == 0.0 {
+        s.serialize_u64(*v as u64)
+    } else {
+        s.serialize_f64(*v)
+    }
 }
 
 #[derive(Serialize)]
@@ -795,5 +929,256 @@ async fn change_peer(
         Ok(Ok(())) => Ok(Body::Empty),
         Ok(Err(e)) => Err(e.message()),
         Err(_) => Err("node did not answer".to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::PeerRow;
+    use serde_json::json;
+
+    /// A row built to be sorted: `key` is the first byte of a node key, so the
+    /// hex text Go compares comes out `aa00…`, `bb00…`, and a first byte of 0
+    /// stands for the no-key row a down link reports.
+    fn row(
+        remote: &str,
+        first: u8,
+        inbound: bool,
+        priority: u8,
+        cost: u64,
+        uptime: f64,
+    ) -> PeerRow {
+        let mut key = [0u8; 32];
+        key[0] = first;
+        PeerRow {
+            uri: remote.to_string(),
+            sintf: String::new(),
+            key: (first != 0).then_some(key),
+            up: first != 0,
+            inbound,
+            port: 1,
+            priority,
+            cost,
+            latency: None,
+            up_for: Duration::from_secs_f64(uptime),
+            rx_bytes: 0,
+            tx_bytes: 0,
+            rx_rate: 0,
+            tx_rate: 0,
+            last_error: None,
+            err_at: None,
+        }
+    }
+
+    fn snapshot(peers: Vec<PeerRow>) -> Snapshot {
+        Snapshot {
+            key: [7u8; 32],
+            routing_entries: 1,
+            tree: Vec::new(),
+            paths: Vec::new(),
+            sessions: Vec::new(),
+            peers,
+        }
+    }
+
+    /// The URIs in the order `getPeers` printed them. Every row is named, so a
+    /// wrong order is visible rather than a count that happens to match.
+    fn order(peers: Vec<PeerRow>, args: Value) -> Vec<String> {
+        get_peers(&snapshot(peers), &args)
+            .peers
+            .into_iter()
+            .map(|p| p.remote)
+            .collect()
+    }
+
+    /// Five rows chosen so that all three comparators — and the configuration
+    /// order they all start from — answer with five different orders.
+    ///
+    /// The uptimes are not free choices. `go_f64` calls two rows equal when they
+    /// differ by less than a whole second, so a group whose members sit inside
+    /// one second must be at least a second away from every other row's uptime:
+    /// otherwise "equal" is not transitive (`cc` would tie `aa` *and* `dd`, which
+    /// do not tie each other), and a comparator with a cycle like that is not the
+    /// order Go sorts by either.
+    fn five() -> Vec<PeerRow> {
+        vec![
+            row("out3", 0xbb, false, 0, 5, 4.0),
+            row("cc", 0xcc, false, 0, 2, 1.4),
+            row("aa", 0xaa, true, 0, 4, 1.0),
+            row("dead", 0, false, 0, 0, 0.0),
+            row("dd", 0xdd, false, 0, 2, 2.5),
+        ]
+    }
+
+    #[test]
+    fn getpeers_sort_modes_match_go_three_for_three() {
+        // `sortByDefault`: direction, then key, priority, cost, uptime. The
+        // inbound row is `aa`, which leads every other key — so it comes last
+        // here and first in the other two modes.
+        assert_eq!(
+            order(five(), json!({"sort": ""})),
+            ["dead", "out3", "cc", "dd", "aa"],
+            "the default order puts outbound rows first"
+        );
+        // `sortByCost`: cost, then key. `cc` and `dd` share cost 2 and are then
+        // ordered by key, and neither is where the default order put them.
+        assert_eq!(
+            order(five(), json!({"sort": "cost"})),
+            ["dead", "cc", "dd", "aa", "out3"],
+            "`sort: cost` ignores direction, and the key only breaks a cost tie"
+        );
+        // `sortByUptime`: whole seconds, because Go returns `int(a - b)` from the
+        // comparator — so `cc` at 1.4 s and `aa` at 1.0 s are *equal*, and a
+        // stable sort leaves them in configuration order rather than putting the
+        // smaller uptime (or the smaller key) first.
+        assert_eq!(
+            order(five(), json!({"sort": "uptime"})),
+            ["dead", "cc", "aa", "dd", "out3"],
+            "sub-second uptime differences do not reorder rows"
+        );
+    }
+
+    #[test]
+    fn getpeers_sort_argument_is_go_indifferent() {
+        // `strings.ToLower(req.SortBy)` (`getpeers.go:70`), and the `default` arm
+        // of the switch covers every other value — including no argument at all.
+        let want = order(five(), json!({"sort": "cost"}));
+        assert_eq!(order(five(), json!({"sort": "CoSt"})), want);
+        assert_eq!(
+            order(five(), json!({"sort": "nonsense"})),
+            order(five(), json!({}))
+        );
+        assert_eq!(
+            order(five(), json!({"sort": null})),
+            order(five(), Value::Null),
+            "a null `sort` and no arguments both mean the default order"
+        );
+        assert_eq!(
+            order(five(), json!({"sort": "UPTIME"})),
+            order(five(), json!({"sort": "uptime"}))
+        );
+    }
+
+    #[test]
+    fn getpeers_priority_ranks_after_the_key_and_before_the_cost() {
+        // Two rows with the same key: the default order falls through to
+        // priority, and priority outranks the cost that follows it. Go's
+        // comparator reads key, priority, cost, uptime in that order
+        // (`getpeers.go:88-99`) and the cost mode inverts the answer.
+        let same = || {
+            vec![
+                row("low-priority", 0xaa, false, 1, 1, 0.0),
+                row("high-cost", 0xaa, false, 0, 9, 0.0),
+            ]
+        };
+        assert_eq!(
+            order(same(), json!({"sort": ""})),
+            ["high-cost", "low-priority"],
+            "priority decides when the keys are equal"
+        );
+        assert_eq!(
+            order(same(), json!({"sort": "cost"})),
+            ["low-priority", "high-cost"],
+            "and loses to cost in the cost mode"
+        );
+    }
+
+    /// Go's uptime key makes "equal" non-transitive, and Rust's `sort_by` reacts
+    /// to that by panicking. 300 shuffled rows is what it takes to see it: below
+    /// Rust's small-sort threshold the check never runs, so 200 rows sort quietly
+    /// and a mutation to `sort_by` would survive a smaller set. The assertion is
+    /// that an answer comes back at all, and that it is the same set of rows.
+    #[test]
+    fn getpeers_sorts_where_go_s_truncation_breaks_a_total_order() {
+        let n = 300usize;
+        let many: Vec<PeerRow> = (0..n)
+            .map(|i| {
+                row(
+                    &format!("p{i:03}"),
+                    (i % 250 + 1) as u8,
+                    false,
+                    0,
+                    0,
+                    0.5 + f64::from((i * 7919 % n) as u32) * 0.5,
+                )
+            })
+            .collect();
+        let got = order(many, json!({"sort": "uptime"}));
+        assert_eq!(got.len(), n, "every row must still be answered for");
+        let mut sorted = got.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "no row was duplicated or dropped");
+    }
+
+    #[test]
+    fn getpeers_uptime_is_the_last_tiebreak_in_the_other_two_modes() {
+        // Nothing above reaches a comparator's trailing uptime key: `five` gives
+        // every row its own cost and key. Two rows that tie on cost *and* key *and*
+        // priority force the sort down to the last step in `sortByDefault`
+        // (`getpeers.go:96-99`) and `sortByCost` (`:114-117`). Their uptimes are a
+        // whole second and a half apart, because a smaller gap would be reported as
+        // equal and leave them in configuration order.
+        let tied = |first: f64, second: f64| {
+            vec![
+                row("first", 0xaa, false, 3, 7, first),
+                row("second", 0xaa, false, 3, 7, second),
+            ]
+        };
+        // Configuration order is the wrong answer for both modes, so a comparator
+        // that stops short of the uptime key fails here rather than passing by
+        // accident.
+        assert_eq!(
+            order(tied(2.5, 1.0), json!({"sort": ""})),
+            ["second", "first"],
+            "the default order falls through to uptime"
+        );
+        assert_eq!(
+            order(tied(2.5, 1.0), json!({"sort": "cost"})),
+            ["second", "first"],
+            "and so does the cost order"
+        );
+        assert_eq!(
+            order(tied(1.0, 2.5), json!({"sort": ""})),
+            ["first", "second"],
+            "the answer follows the uptimes, not the configuration order"
+        );
+    }
+
+    /// Go gates both error fields on the *message* (`getpeers.go:64-67`), so a row
+    /// that carries a timestamp but no message prints neither. Nothing in the node
+    /// produces that combination — `Links` writes both together — which is why the
+    /// gate is checked here rather than over a socket.
+    #[test]
+    fn getpeers_reports_an_error_age_only_with_an_error() {
+        let mut silent = row("silent", 0xbb, false, 0, 0, 0.0);
+        silent.err_at = Some(Instant::now());
+        let mut loud = row("loud", 0xcc, false, 0, 0, 0.0);
+        loud.err_at = Some(Instant::now());
+        loud.last_error = Some("connection refused".to_string());
+
+        let peers = get_peers(&snapshot(vec![silent, loud]), &json!({})).peers;
+        let quiet = peers
+            .iter()
+            .find(|p| p.remote == "silent")
+            .expect("the row with a timestamp and no message");
+        let loud = peers
+            .iter()
+            .find(|p| p.remote == "loud")
+            .expect("the row with both");
+        assert_eq!(
+            quiet.last_error_time, 0,
+            "a timestamp with no message is not an error Go would age"
+        );
+        assert!(
+            quiet.last_error.is_empty(),
+            "and no message is invented for it either"
+        );
+        assert!(
+            loud.last_error_time > 0,
+            "a real error prints the nanoseconds since it happened"
+        );
+        assert_eq!(loud.last_error, "connection refused");
     }
 }

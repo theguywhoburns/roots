@@ -58,6 +58,7 @@ impl Router {
             responded: false,
             lag,
             sent_at: Some(Instant::now()),
+            srrt: None,
             prio: conn.priority(),
             order,
             kind: conn.peer_kind(),

@@ -1,7 +1,7 @@
 //! The admin socket's framing, checked against bytes captured from a real Go
 //! 0.5.14 node (`docs/protocol/21-admin.md`, Slice 7).
 //!
-//! Six claims, all of them loopback:
+//! Seven claims, all of them loopback:
 //! 1. both transports Go's `AdminListen` understands answer identically, and the
 //!    socket file gets Go's mode;
 //! 2. a body keeps Go's struct field order, which a `serde_json::Value` would
@@ -11,13 +11,21 @@
 //!    request when decoding never got that far;
 //! 5. a peer is reported by its link URI, so a `?password=` never comes back out;
 //! 6. an argument of the wrong JSON type is refused in Go's own words, before
-//!    the command runs.
+//!    the command runs;
+//! 7. `getPeers` prints Go's `PeerEntry` fields — all sixteen of them, and only
+//!    the ones its `omitempty` tags do not hide.
+//!
+//! The three `sort` modes are proved in `admin.rs`'s own tests instead: they need
+//! rows whose cost, uptime and direction are chosen, which no loopback mesh can
+//! be asked to arrange.
 
 use std::os::unix::fs::PermissionsExt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+use roots::LinkOptions;
 use roots_client::admin::{Bound, bind_admin, serve_admin};
+use roots_client::listen::spawn_listeners;
 use roots_client::node::{Cmd, Node};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -43,7 +51,12 @@ struct Server {
 
 impl Server {
     async fn tcp() -> Self {
-        let tx = spawn_node().await;
+        Self::on(spawn_node().await).await
+    }
+
+    /// A socket on top of a node the caller drives, for the tests that need a
+    /// peer to report on rather than an empty table.
+    async fn on(tx: mpsc::UnboundedSender<Cmd>) -> Self {
         let bound = bind_admin("tcp://127.0.0.1:0")
             .await
             .expect("bind_admin")
@@ -578,4 +591,236 @@ async fn admin_argument_types_match_go() {
         "success"
     );
     reader.expect_closed().await;
+}
+
+/// Go's `PeerEntry` declaration order (`getpeers.go:22-37`). The order *is* the
+/// protocol: `encoding/json` writes struct fields in the order they are declared,
+/// so a body with the same keys in another order is a different answer.
+const PEER_FIELDS: &[&str] = &[
+    "remote",
+    "up",
+    "inbound",
+    "address",
+    "key",
+    "port",
+    "priority",
+    "cost",
+    "bytes_recvd",
+    "bytes_sent",
+    "rate_recvd",
+    "rate_sent",
+    "uptime",
+    "latency",
+    "last_error_time",
+    "last_error",
+];
+
+/// Which of Go's fields a row printed, checked in order against the raw bytes.
+/// A parsed `Value` has already lost the order — `preserve_order` is off — so the
+/// text is the only witness. `omitempty` makes the *set* different per row, which
+/// is why each row is checked against its own list rather than against all 16.
+fn printed_fields(row: &Value, text: &str) -> Vec<&'static str> {
+    for key in row.as_object().expect("a row is an object").keys() {
+        assert!(
+            PEER_FIELDS.contains(&key.as_str()),
+            "getPeers invented a field {key} that Go does not have: {text}"
+        );
+    }
+    let present: Vec<&'static str> = PEER_FIELDS
+        .iter()
+        .copied()
+        .filter(|k| row.get(*k).is_some())
+        .collect();
+    assert!(
+        in_order(text, &present),
+        "getPeers fields are not in Go's order, which wants {present:?}: {text}"
+    );
+    present
+}
+
+/// Ask for `getPeers` until the answer holds exactly one row that `want` accepts,
+/// and return it with the bytes it arrived in. One row on purpose: the order check
+/// reads the whole frame, and a second row would put its keys in the way.
+async fn ask_one_row<S>(reader: &mut Reader<S>, want: impl Fn(&Value) -> bool) -> (Value, String)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame = reader
+            .ask(r#"{"request":"getPeers","keepalive":true}"#)
+            .await;
+        let text = pretty(&frame);
+        let body: Value = serde_json::from_slice(&frame).expect("one value");
+        assert_eq!(body["status"], "success", "{text}");
+        let peers = body["response"]["peers"].as_array().expect("peers");
+        if peers.len() == 1 && want(&peers[0]) {
+            return (peers[0].clone(), text);
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the row I asked about: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The whole `PeerEntry` field set, on two rows that between them cover every
+/// field: a dial that cannot succeed (error, age, nothing else) and a live link
+/// (bytes, rates, uptime, latency, address). `rate_recvd`, `rate_sent` and
+/// `latency` were the gap Slice 7 left: the library measured no throughput,
+/// stamped no error moment and kept no round trip, so there was nothing true to
+/// print.
+#[tokio::test]
+async fn admin_getpeers_reports_every_field_go_does() {
+    // B has no socket and nothing to do but be dialled.
+    let b_sk = SigningKey::from_bytes(&[0xB0; 32]);
+    let b_key = b_sk.verifying_key().to_bytes();
+    let (mut b, b_tx) = Node::new(b_sk.clone());
+    let served = spawn_listeners(
+        &b_sk,
+        &LinkOptions::default(),
+        &["tcp://127.0.0.1:0".to_string()],
+        &b_tx,
+    )
+    .await
+    .expect("B binds a listener")[0]
+        .clone();
+    tokio::spawn(async move {
+        let _ = b.run().await;
+    });
+
+    let (mut a, tx) = Node::new(SigningKey::from_bytes(&[0xA0; 32]));
+    let server = Server::on(tx.clone()).await;
+    tokio::spawn(async move {
+        let _ = a.run().await;
+    });
+    let mut reader = Reader::new(server.connect().await);
+
+    // Phase one: nothing listens on port 1, so this row is all failure.
+    reader
+        .send(r#"{"request":"addPeer","arguments":{"uri":"tcp://127.0.0.1:1"},"keepalive":true}"#)
+        .await;
+    reader.frame("addPeer").await;
+    let (row, text) = ask_one_row(&mut reader, |r| r["last_error"].is_string()).await;
+    assert_eq!(row["up"], false, "{text}");
+    assert_eq!(row["inbound"], false, "{text}");
+    assert_eq!(
+        row["key"], "",
+        "`key` has no `omitempty` in Go, so a row with no node key prints an empty one"
+    );
+    assert_eq!(
+        row["address"],
+        Value::Null,
+        "and `address` does, so the same row omits it: {text}"
+    );
+    assert!(
+        row["last_error_time"].as_u64().is_some_and(|n| n > 0),
+        "Go prints the error's age as a `time.Duration` in exact nanoseconds: {text}"
+    );
+    assert_eq!(
+        printed_fields(&row, &text),
+        [
+            "remote",
+            "up",
+            "inbound",
+            "key",
+            "port",
+            "priority",
+            "cost",
+            "last_error_time",
+            "last_error",
+        ],
+        "a failed row prints exactly Go's non-zero fields, no more"
+    );
+
+    // Phase two: the dead row out of the way, and a live link in its place.
+    reader
+        .send(
+            r#"{"request":"removePeer","arguments":{"uri":"tcp://127.0.0.1:1"},"keepalive":true}"#,
+        )
+        .await;
+    reader.frame("removePeer").await;
+    reader
+        .send(&format!(
+            r#"{{"request":"addPeer","arguments":{{"uri":"{served}"}},"keepalive":true}}"#
+        ))
+        .await;
+    reader.frame("addPeer to B").await;
+    let (row, text) = ask_one_row(&mut reader, |r| r["up"] == true).await;
+    assert_eq!(row["remote"], served, "{text}");
+    assert_eq!(row["inbound"], false, "we dialled this one: {text}");
+    assert_eq!(row["key"], hex::encode(b_key), "{text}");
+    assert_eq!(
+        row["address"],
+        roots::addr_for_key(&b_key).to_string(),
+        "Go derives the address from the key in the same breath"
+    );
+    assert!(
+        row["port"].as_u64().is_some_and(|p| p >= 1),
+        "a registered peer has a port: {text}"
+    );
+    assert!(
+        row["cost"].as_u64().is_some_and(|c| c >= 1),
+        "Go floors the cost at one millisecond: {text}"
+    );
+    assert!(
+        row["bytes_recvd"].as_u64().is_some_and(|b| b > 0)
+            && row["bytes_sent"].as_u64().is_some_and(|b| b > 0),
+        "the handshake and the tree chatter are counted both ways: {text}"
+    );
+    assert!(
+        row["uptime"].as_f64().is_some_and(|u| u > 0.0 && u < 60.0),
+        "`uptime` is Go's float64 seconds since the link came up: {text}"
+    );
+    let present = printed_fields(&row, &text);
+    for must in [
+        "remote",
+        "up",
+        "inbound",
+        "address",
+        "key",
+        "port",
+        "priority",
+        "cost",
+        "bytes_recvd",
+        "bytes_sent",
+        "uptime",
+    ] {
+        assert!(
+            present.contains(&must),
+            "a live row must print {must}: {text}"
+        );
+    }
+    assert!(
+        row.get("last_error").is_none(),
+        "a healthy link has nothing to report, and must not print a stale one: {text}"
+    );
+
+    // The rates are Go's bytes-per-second counters, which the node fills as the
+    // chatter arrives: asking again is how a row that never reports one is caught
+    // rather than talked around. Each must be positive — the link is being served
+    // — and cannot exceed the total it is a slice of.
+    let (row, text) = ask_one_row(&mut reader, |r| {
+        r.get("rate_recvd").is_some() && r.get("rate_sent").is_some()
+    })
+    .await;
+    for (rate, total) in [("rate_recvd", "bytes_recvd"), ("rate_sent", "bytes_sent")] {
+        let value = row[rate].as_u64().expect(rate);
+        assert!(
+            value > 0 && value <= row[total].as_u64().expect(total),
+            "{rate} is the traffic since the last measure, so it is positive and no \
+             larger than {total}: {text}"
+        );
+    }
+
+    // `latency` is the last `SigReq` round trip, re-read at query time
+    // (`debug.go:84-86`), so it is absent while a fresh request is in flight —
+    // but it has to appear, or nobody ever measured one.
+    let (row, text) = ask_one_row(&mut reader, |r| r.get("latency").is_some()).await;
+    let latency = row["latency"].as_u64().expect("latency");
+    assert!(
+        latency > 0 && latency % 10_000 == 0,
+        "Go rounds the round trip to hundredths of a millisecond: {text}"
+    );
 }

@@ -243,11 +243,18 @@ impl crate::router::Router {
         if let Some(p) = self.tree.peers.get_mut(&peer_key) {
             p.req = req;
             p.responded = false;
-            p.sent_at = Some(Instant::now());
         }
         let mut out = Vec::new();
         req.encode(&mut out);
-        links.write(peer_key, FrameType::SigReq, &out).await
+        let sent = links.write(peer_key, FrameType::SigReq, &out).await;
+        // Go stamps the send time in the write's `done` callback, so the round
+        // trip it later measures excludes our own queueing (`peers.go:318-321`).
+        if let Some(p) = self.tree.peers.get_mut(&peer_key)
+            && sent.is_ok()
+        {
+            p.sent_at = Some(Instant::now());
+        }
+        sent
     }
     /// Answer an inbound SigReq (Go `_handleRequest`).
     pub(crate) async fn handle_request(
@@ -265,19 +272,30 @@ impl crate::router::Router {
     /// Handle an inbound SigRes, checking it answers our open request and
     /// updating the RTT estimate (Go `_handleResponse` + peer `srst/srrt`).
     pub(crate) fn handle_response(&mut self, peer_key: [u8; KEY_LEN], res: SigRes) {
+        // Go's check order, exactly: the signature is verified and the arrival
+        // stamped *before* any of the router's own tests
+        // (`peers.go:327-334`), so a SigRes answering a request we have already
+        // replaced still refreshes the round trip `getPeers` reads. The EWMA
+        // below is the part that does require a match.
+        if !res.check(&self.pubkey, &peer_key) {
+            return;
+        }
         let rtt = self
             .tree
             .peers
             .get(&peer_key)
             .and_then(|p| p.sent_at)
             .map(|t| t.elapsed());
+        if let Some(p) = self.tree.peers.get_mut(&peer_key) {
+            p.srrt = Some(Instant::now());
+        }
         let matches = self
             .tree
             .peers
             .get(&peer_key)
             .map(|p| p.req == res.req)
             .unwrap_or(false);
-        if !matches || !res.check(&self.pubkey, &peer_key) {
+        if !matches {
             return;
         }
         self.tree.responses.entry(peer_key).or_insert(res);
@@ -613,6 +631,113 @@ mod tests {
         let (dec2, n2) = SigReq::decode(&buf).unwrap();
         assert_eq!(dec2, req);
         assert_eq!(n2, buf.len() - 1);
+    }
+
+    #[test]
+    fn a_valid_sigres_refreshes_latency_even_when_stale() {
+        // Go stamps `srrt` inside the signature branch of `_handleSigRes`,
+        // *before* the req / port / parent tests (`peers.go:327-334`), and
+        // `Debug.GetPeers` re-reads `srrt - srst` at query time
+        // (`debug.go:84-86`). Three consequences, three assertions here: a reply
+        // to a request we have already replaced still moves the number
+        // `getPeers` reports, a forged one does not, and a fresh `SigReq` puts
+        // `srst` past `srrt`, which reports as no latency rather than a small one.
+        let me = keys(0x11);
+        let my_pub = me.verifying_key().to_bytes();
+        let peer = keys(0x22);
+        let peer_pub = peer.verifying_key().to_bytes();
+        let mut router = Router::new(me);
+        router.tree.peers.insert(
+            peer_pub,
+            crate::peer::PeerState {
+                port: 1,
+                req: SigReq { seq: 7, nonce: 1 },
+                responded: false,
+                lag: UNKNOWN_LATENCY,
+                sent_at: Some(Instant::now() - Duration::from_millis(20)),
+                srrt: None,
+                prio: 0,
+                order: 0,
+                kind: crate::peer::PeerKind::Go,
+            },
+        );
+        assert!(
+            router.link_peers()[0].latency.is_none(),
+            "no reply has arrived yet"
+        );
+
+        // Answered by the wrong key: the signature test fails and nothing moves.
+        router.handle_response(
+            peer_pub,
+            SigRes {
+                req: SigReq { seq: 6, nonce: 2 },
+                port: 9,
+                psig: [0u8; 64],
+            },
+        );
+        assert!(
+            router.link_peers()[0].latency.is_none(),
+            "a bad signature is not a round trip"
+        );
+
+        // Correctly signed, but answering a request we have since replaced.
+        let stale = SigRes::seal(SigReq { seq: 6, nonce: 2 }, 9, &my_pub, &peer, &peer_pub);
+        router.handle_response(peer_pub, stale);
+        let got = router.link_peers()[0]
+            .latency
+            .expect("a valid reply stamps the round trip even when stale");
+        assert!(
+            got >= Duration::from_millis(19) && got < Duration::from_millis(60),
+            "the latency is the gap since the send, not a fixed number: {got:?}"
+        );
+        assert_eq!(
+            got.as_nanos() % 10_000,
+            0,
+            "Go rounds the round trip to 1/100 ms (`debug.go:84`): {got:?}"
+        );
+        let p = &router.link_peers()[0];
+        assert!(!p.responded, "the EWMA still requires a matching request");
+        assert_eq!(p.lag_ms, 4294, "so the lag stays at Go's sentinel");
+
+        router.tree.peers.get_mut(&peer_pub).unwrap().sent_at = Some(Instant::now());
+        assert!(
+            router.link_peers()[0].latency.is_none(),
+            "a send after the last reply reads as no latency, not a negative one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sigreq_that_never_left_starts_no_clock() {
+        // Go stamps `srst` in the write's `done` callback (`peers.go:318-321`),
+        // which keeps our own queueing out of the measurement — and means a
+        // `SigReq` that never reached the link must not start one at all, or a
+        // later reply reports a round trip from a send that never happened.
+        let mut router = Router::new(keys(0x31));
+        let peer = keys(0x32).verifying_key().to_bytes();
+        router.tree.peers.insert(
+            peer,
+            crate::peer::PeerState {
+                port: 1,
+                req: SigReq { seq: 1, nonce: 1 },
+                responded: false,
+                lag: UNKNOWN_LATENCY,
+                sent_at: None,
+                srrt: None,
+                prio: 0,
+                order: 0,
+                kind: crate::peer::PeerKind::Go,
+            },
+        );
+        let mut links = LinkSet::new();
+        let e = router
+            .send_req(&mut links, peer)
+            .await
+            .expect_err("a request for a peer with no link must report it");
+        assert!(matches!(e, Error::NoLink), "got {e:?}");
+        assert!(
+            router.tree.peers[&peer].sent_at.is_none(),
+            "the failed send leaves the clock alone"
+        );
     }
 
     fn make_tree() -> (SigningKey, SigningKey, SigningKey, Announce, Announce) {

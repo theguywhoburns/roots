@@ -142,6 +142,25 @@ impl<T: Transport> Link for PeerConn<T> {
     }
 }
 
+/// Identity of one completed connection, minted where the connection is built.
+///
+/// Go joins a `getPeers` row to its router state by `net.Conn` pointer
+/// (`core/api.go:73-103`: a `map[net.Conn]DebugPeerInfo`), so a row knows
+/// *which* link it is describing, not merely which node it reaches. An index
+/// into the set would move when a link is removed, so this is a counter: one
+/// number per connection, never reused, which stops matching the moment the
+/// link it names is displaced or evicted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LinkId(u64);
+
+static NEXT_LINK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl LinkId {
+    fn next() -> Self {
+        Self(NEXT_LINK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// Type-erased authenticated peer connection: same shape as
 /// [`PeerConn`], but the stream is boxed, so links of different
 /// transports share one concrete type.
@@ -152,6 +171,11 @@ pub struct AnyConn {
     /// Which way the socket came up (dial = outbound, accept = inbound);
     /// `getPeers` reports it, so it must survive type erasure.
     pub inbound: bool,
+    /// Which connection this is, for as long as it lasts ([`LinkId`]).
+    pub id: LinkId,
+    /// [`PeerConn::remote_addr`], kept so the client can name an inbound link
+    /// the way Go's admin socket does without the concrete transport in hand.
+    pub remote_addr: Option<String>,
     pub stream: Box<dyn LinkStream>,
 }
 
@@ -162,6 +186,8 @@ impl AnyConn {
             priority: conn.priority,
             kind: conn.kind,
             inbound: conn.inbound,
+            id: LinkId::next(),
+            remote_addr: conn.remote_addr,
             stream: Box::new(conn.stream),
         }
     }
@@ -175,6 +201,7 @@ impl std::fmt::Debug for AnyConn {
             .field("remote_key", &hex::encode(self.remote_key))
             .field("priority", &self.priority)
             .field("inbound", &self.inbound)
+            .field("id", &self.id)
             .finish_non_exhaustive()
     }
 }
@@ -208,17 +235,32 @@ struct LinkEntry {
     up: std::time::Instant,
     rx: u64,
     tx: u64,
+    /// Counters as of the last rate sample, which is what makes a rate a
+    /// measurement rather than a division by an elapsed time.
+    lastrx: u64,
+    lasttx: u64,
+    rxrate: u64,
+    txrate: u64,
 }
 
 /// What the set measures about one live link. This is the source for
-/// `getPeers`' `uptime`, `bytes_recvd`, `bytes_sent` and `inbound`.
+/// `getPeers`' `uptime`, `bytes_recvd`/`bytes_sent`, `rate_recvd`/`rate_sent`
+/// and `inbound`.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkStats {
     pub up: Duration,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Bytes in the last whole sample window, as Go's `_updateAverages`
+    /// measures them — a difference of counters, not a smoothed average.
+    pub rx_rate: u64,
+    pub tx_rate: u64,
     pub inbound: bool,
 }
+
+/// Go's rate window (`link.go:127` `time.AfterFunc(time.Second, …)`): one tick
+/// for every link at once, and a rate is simply the bytes since that tick.
+const RATE_WINDOW: Duration = Duration::from_secs(1);
 
 /// The multi-peer connection map (Slice 10b): one entry per link keyed
 /// by the peer's node key. The set **owns** its links, so it is `'static`
@@ -235,6 +277,10 @@ pub struct LinkStats {
 pub struct LinkSet {
     entries: Vec<LinkEntry>,
     last_write: std::collections::HashMap<[u8; KEY_LEN], std::time::Instant>,
+    /// When the byte rates were last differenced. Go keeps this in the actor's
+    /// own timer; we are called from the node's tick, so the set carries the
+    /// phase and a caller may call as often as it likes.
+    sampled_at: Option<std::time::Instant>,
 }
 
 impl LinkSet {
@@ -251,7 +297,9 @@ impl LinkSet {
 
     /// Insert (or replace, keyed by remote) a link, returning the displaced
     /// one. The send clock survives a replace — it is the keepalive state the
-    /// next slice depends on — everything else belongs to the new link.
+    /// next slice depends on — everything else belongs to the new link,
+    /// including its [`LinkId`]: a row that pointed at the displaced connection
+    /// must stop matching, which is the whole reason an id exists.
     pub fn add(&mut self, conn: AnyConn) -> Option<AnyConn> {
         let peer = conn.remote_key;
         self.last_write
@@ -263,6 +311,10 @@ impl LinkSet {
             slot.up = now;
             slot.rx = 0;
             slot.tx = 0;
+            slot.lastrx = 0;
+            slot.lasttx = 0;
+            slot.rxrate = 0;
+            slot.txrate = 0;
             return Some(displaced);
         }
         self.entries.push(LinkEntry {
@@ -271,6 +323,10 @@ impl LinkSet {
             up: now,
             rx: 0,
             tx: 0,
+            lastrx: 0,
+            lasttx: 0,
+            rxrate: 0,
+            txrate: 0,
         });
         None
     }
@@ -304,17 +360,46 @@ impl LinkSet {
         self.entries.len()
     }
 
-    /// Counters for one live link, or `None` if we hold no link to that key.
-    pub fn stats(&self, peer: &[u8; KEY_LEN]) -> Option<LinkStats> {
+    /// Counters for one *identified* link, or `None` once that connection is no
+    /// longer live. Keyed by [`LinkId`] rather than by node key on purpose: two
+    /// links to one node are one slot in this set, and a caller that asks by key
+    /// gets the other link's direction and counters — which is how Slice 7 came
+    /// to report an accepted link's `inbound: true` against a dial URI.
+    pub fn stats(&self, id: LinkId) -> Option<LinkStats> {
         self.entries
             .iter()
-            .find(|e| &e.peer == peer)
+            .find(|e| e.link.id == id)
             .map(|e| LinkStats {
                 up: e.up.elapsed(),
                 rx_bytes: e.rx,
                 tx_bytes: e.tx,
+                rx_rate: e.rxrate,
+                tx_rate: e.txrate,
                 inbound: e.link.inbound,
             })
+    }
+
+    /// Difference every link's counters, once per [`RATE_WINDOW`] — Go's
+    /// `_updateAverages` (`link.go:106-129`), which walks all links on one
+    /// timer and stores the delta outright. So a link that came up partway
+    /// through a window reports everything it has moved so far as its first
+    /// rate, and a quiet link reports exactly zero rather than a small average.
+    pub fn update_rates(&mut self) {
+        let now = std::time::Instant::now();
+        let due = self
+            .sampled_at
+            .map(|t| now.duration_since(t) >= RATE_WINDOW)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.sampled_at = Some(now);
+        for e in &mut self.entries {
+            e.rxrate = e.rx - e.lastrx;
+            e.txrate = e.tx - e.lasttx;
+            e.lastrx = e.rx;
+            e.lasttx = e.tx;
+        }
     }
 
     /// Hard send: `target` is a link the caller believes it is serving, so a
@@ -423,6 +508,13 @@ pub struct PeerConn<T: Transport = Tcp> {
     /// Set by [`complete_accept`], cleared by [`complete_dial`]: which way the
     /// socket came up.
     pub inbound: bool,
+    /// Where the accepted socket came from, as Go prints it
+    /// (`net.TCPAddr.String()`: an IPv6 address bracketed). Go keeps this only
+    /// to build the admin URI — "In order to populate a somewhat sane looking
+    /// connection URI in the admin socket, we need to replace the host in the
+    /// listener URL with the remote address" (`link.go:514-518`) — and a dial
+    /// never needs it, because its row is named by the URI that was dialled.
+    pub remote_addr: Option<String>,
     pub stream: T::Stream,
 }
 
@@ -613,8 +705,8 @@ pub async fn accept(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tcp>, Error> {
-    let (stream, _) = listener.accept().await.map_err(Error::Io)?;
-    complete_accept(stream, local, opts).await
+    let (stream, addr) = listener.accept().await.map_err(Error::Io)?;
+    complete_accept(stream, local, opts, Some(addr.to_string())).await
 }
 
 /// Per-type frame counters from a [`PeerConn::run`] session.
@@ -757,16 +849,20 @@ pub async fn complete_dial<T: Transport>(
         priority,
         kind,
         inbound: false,
+        remote_addr: None,
         stream,
     })
 }
 
 /// Transport template: finish an accept from an accepted stream. Shared
-/// tail for all `*_accept`.
+/// tail for all `*_accept`. `remote_addr` is the peer end of the socket, in
+/// Go's text form, which is the only thing that can name an inbound row the
+/// way Go's admin socket does (`link.go:514-524`).
 pub async fn complete_accept<T: Transport>(
     stream: T::Stream,
     local: &SigningKey,
     opts: &LinkOptions,
+    remote_addr: Option<String>,
 ) -> Result<PeerConn<T>, Error> {
     let mut stream = stream;
     let (remote_key, priority, kind) = tokio::time::timeout(
@@ -780,6 +876,7 @@ pub async fn complete_accept<T: Transport>(
         priority,
         kind,
         inbound: true,
+        remote_addr,
         stream,
     })
 }
@@ -1012,9 +1109,21 @@ mod tests {
                 .await
                 .unwrap();
             assert!(conn.inbound, "accept template marks inbound");
-            let links = LinkSet::single(AnyConn::new(conn));
-            let peer = links.peers()[0];
-            links.stats(&peer).unwrap().inbound
+            let remote = conn.remote_addr.clone();
+            let any = AnyConn::new(conn);
+            // The accepted socket's own address rode through the erasure too,
+            // which is what names an inbound row the way Go's does.
+            assert_eq!(remote, any.remote_addr);
+            assert!(
+                any.remote_addr
+                    .as_deref()
+                    .is_some_and(|a| a.starts_with("127.0.0.1:")),
+                "inbound link carries the peer's socket address: {:?}",
+                any.remote_addr
+            );
+            let id = any.id;
+            let links = LinkSet::single(any);
+            links.stats(id).unwrap().inbound
         });
         let conn = dial(
             &format!("tcp://{addr}"),
@@ -1024,33 +1133,147 @@ mod tests {
         .await
         .unwrap();
         assert!(!conn.inbound, "dial template marks outbound");
+        assert_eq!(
+            conn.remote_addr, None,
+            "a dialled link is named by its URI, not its socket"
+        );
         let peer = conn.remote_key;
-        let mut links = LinkSet::single(AnyConn::new(conn));
-        let stats = links.stats(&peer).unwrap();
+        let any = AnyConn::new(conn);
+        let id = any.id;
+        let mut links = LinkSet::single(any);
+        let stats = links.stats(id).unwrap();
         assert!(!stats.inbound, "erased link keeps the outbound flag");
         assert_eq!(links.len(), 1);
         assert_eq!(stats.rx_bytes, 0);
         assert_eq!(stats.tx_bytes, 0);
         assert!(stats.up < Duration::from_secs(5));
         assert!(
-            links.stats(&[0; KEY_LEN]).is_none(),
-            "no counters for a peer we hold no link to"
+            // A freshly minted id belongs to no link in this set — asking with
+            // it is how a caller learns the connection it named is gone.
+            links.stats(LinkId::next()).is_none(),
+            "no counters for a link this set does not hold"
         );
         // Ownership round trip: `remove` hands the link back to the caller and
         // `add` takes it again, while the send clock — the keepalive state the
-        // next slice's queue depends on — survives.
+        // next slice's queue depends on — survives. The id survives too, because
+        // it is the same connection.
         let idle_before = links.idle_for(&peer);
         let back = links.remove(&peer).unwrap();
         assert!(!back.inbound, "handed-back link keeps its direction");
-        assert!(links.is_empty() && links.stats(&peer).is_none());
+        assert_eq!(back.id, id, "an id belongs to a connection, not a slot");
+        assert!(links.is_empty() && links.stats(id).is_none());
         assert!(links.add(back).is_none(), "fresh slot displaces nothing");
         assert_eq!(links.len(), 1);
-        assert!(!links.stats(&peer).unwrap().inbound);
+        assert!(!links.stats(id).unwrap().inbound);
         assert!(
             links.idle_for(&peer) >= idle_before,
             "re-adding must not reset the send clock"
         );
         assert!(server.await.unwrap(), "erased inbound link reports inbound");
+    }
+
+    #[tokio::test]
+    async fn link_identity_stops_matching_when_displaced() {
+        // The one-link-per-node-key slot is the reason a `getPeers` row may not
+        // ask "is any link to this key up": when an accepted link replaces the
+        // dial to the same node, the dial's row must read as down, not borrow
+        // the newcomer's counters and direction.
+        let a_sk = SigningKey::from_bytes(&[51; 32]);
+        let b_sk = SigningKey::from_bytes(&[52; 32]);
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let first = accept(&listener, &b_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            let second = accept(&listener, &b_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            (first.remote_key, second.remote_key)
+        });
+        let dial_one = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let peer = dial_one.remote_key;
+        let mut links = LinkSet::single(AnyConn::new(dial_one));
+        // A second connection to the same node key takes the slot.
+        let dial_two = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let newcomer = AnyConn::new(dial_two);
+        let new_id = newcomer.id;
+        let displaced = links.add(newcomer).expect("the first link is displaced");
+        let old_id = displaced.id;
+        assert_eq!(links.len(), 1, "one slot per node key");
+        assert_eq!(links.peers(), vec![peer]);
+        assert!(
+            links.stats(old_id).is_none(),
+            "the displaced link's id must stop matching"
+        );
+        assert!(
+            links.stats(new_id).is_some(),
+            "the link in the slot is the one that reports"
+        );
+        drop(displaced);
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn rates_are_the_bytes_since_the_last_sample() {
+        // Go differences the counters on one 1 s timer shared by every link
+        // (`link.go:106-129`): a rate is the bytes since that tick, so a link
+        // that came up mid-window reports everything it has moved so far, and a
+        // quiet link reports exactly zero rather than a small average.
+        let a_sk = SigningKey::from_bytes(&[61; 32]);
+        let b_sk = SigningKey::from_bytes(&[62; 32]);
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let reader = tokio::spawn(async move {
+            let conn = accept(&listener, &b_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            let peer = conn.remote_key;
+            let any = AnyConn::new(conn);
+            let id = any.id;
+            let mut links = LinkSet::single(any);
+            for _ in 0..4 {
+                links.read_frame(&peer).await.unwrap();
+            }
+            links.update_rates();
+            links.stats(id).unwrap().rx_rate
+        });
+        let conn = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let peer = conn.remote_key;
+        let any = AnyConn::new(conn);
+        let id = any.id;
+        let mut links = LinkSet::single(any);
+        // Four frames of three bytes: five wire bytes each, twenty in total.
+        for _ in 0..4 {
+            links.write(peer, FrameType::SigReq, &[0; 3]).await.unwrap();
+        }
+        links.update_rates();
+        let first = links.stats(id).unwrap();
+        assert_eq!(
+            (first.tx_bytes, first.tx_rate),
+            (20, 20),
+            "the first sample reports the whole life of the link, as Go's does"
+        );
+        links.update_rates();
+        assert_eq!(
+            links.stats(id).unwrap().tx_rate,
+            20,
+            "a second call inside the window is not a new sample"
+        );
+        tokio::time::sleep(RATE_WINDOW + Duration::from_millis(100)).await;
+        links.update_rates();
+        let idle = links.stats(id).unwrap();
+        assert_eq!(idle.tx_rate, 0, "an idle link reports zero, not an average");
+        assert_eq!(idle.tx_bytes, 20, "the totals are untouched by sampling");
+        drop(links);
+        // The far end saw the same twenty bytes in its own first window.
+        assert_eq!(reader.await.unwrap(), 20);
     }
 
     #[tokio::test]
@@ -1069,20 +1292,24 @@ mod tests {
                 .await
                 .unwrap();
             let peer = conn.remote_key;
-            let mut links = LinkSet::single(AnyConn::new(conn));
+            let any = AnyConn::new(conn);
+            let id = any.id;
+            let mut links = LinkSet::single(any);
             let (ftype, _payload) = links.read_frame(&peer).await.unwrap();
-            (ftype, links.stats(&peer).unwrap().rx_bytes)
+            (ftype, links.stats(id).unwrap().rx_bytes)
         });
         let conn = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer = conn.remote_key;
-        let mut links = LinkSet::single(AnyConn::new(conn));
+        let any = AnyConn::new(conn);
+        let id = any.id;
+        let mut links = LinkSet::single(any);
         links
             .write(peer, FrameType::SigReq, &[1, 2, 3])
             .await
             .unwrap();
-        let sent = links.stats(&peer).unwrap().tx_bytes;
+        let sent = links.stats(id).unwrap().tx_bytes;
         assert_eq!(sent, 5, "1 prefix + 1 type byte + 3 payload bytes");
         let (ftype, got) = server.await.unwrap();
         assert_eq!(ftype, FrameType::SigReq);
@@ -1106,6 +1333,7 @@ mod tests {
                 priority: 0,
                 kind: crate::peer::PeerKind::Go,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let (ftype, payload) = tmp.read_frame().await.unwrap();
@@ -1153,6 +1381,7 @@ mod tests {
             priority: 0,
             kind: crate::peer::PeerKind::Go,
             inbound: false,
+            remote_addr: None,
             stream: mine,
         }));
         let err = links

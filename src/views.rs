@@ -1,6 +1,8 @@
 //! Read-only router views: snapshot queries for diagnostics and the admin adapter.
 //! Pure borrows over the composed tables; the lib never prints (see `dump`).
 
+use std::time::{Duration, Instant};
+
 use crate::address::KEY_LEN;
 use crate::router::Router;
 use crate::traits::Snapshot;
@@ -111,19 +113,28 @@ impl Router {
         out
     }
 
-    /// Direct link peers as `(key, port, priority, up, lag_ms)`, sorted by
-    /// key: `up` tracks the last SigReq round-trip, `lag_ms` is Go's EWMA in
-    /// whole milliseconds — 4 for a link that has not answered one yet,
-    /// because `UNKNOWN_LATENCY` is Go's 4294967295 *nanosecond* sentinel
-    /// (for diagnostics / admin adapter).
-    pub fn link_peers(&self) -> Vec<([u8; KEY_LEN], u64, u8, bool, u128)> {
-        let mut out: Vec<_> = self
+    /// Direct link peers, sorted by key: the router's half of a `getPeers`
+    /// row — Go's `DebugPeerInfo` (`ironwood/network/debug.go:71-91`), which
+    /// `Core.GetPeers` joins to the link's own counters by connection identity
+    /// (`core/api.go:71-103`). `responded` tracks the last `SigReq` round trip,
+    /// `lag_ms` is Go's EWMA in whole milliseconds — 4 for a link that has not
+    /// answered one yet, because `UNKNOWN_LATENCY` is Go's 4294967295 *nanosecond*
+    /// sentinel (`router.go:39`).
+    pub fn link_peers(&self) -> Vec<LinkPeer> {
+        let mut out: Vec<LinkPeer> = self
             .tree
             .peers
             .iter()
-            .map(|(k, p)| (*k, p.port, p.prio, p.responded, p.lag.as_millis()))
+            .map(|(k, p)| LinkPeer {
+                key: *k,
+                port: p.port,
+                priority: p.prio,
+                responded: p.responded,
+                lag_ms: p.lag.as_millis(),
+                latency: go_latency(p.srrt, p.sent_at),
+            })
             .collect();
-        out.sort_by_key(|(k, _, _, _, _)| *k);
+        out.sort_by_key(|p| p.key);
         out
     }
 
@@ -146,6 +157,35 @@ impl Router {
         out.sort_by_key(|(k, _, _)| *k);
         out
     }
+}
+
+/// What the router knows about one link peer: Go's `DebugPeerInfo`
+/// (`ironwood/network/debug.go:24-35`), the half of a `getPeers` row that comes
+/// from the tree rather than from the socket.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkPeer {
+    pub key: [u8; KEY_LEN],
+    pub port: u64,
+    pub priority: u8,
+    /// True once the peer has answered one of our `SigReq`s.
+    pub responded: bool,
+    /// Go's `_getCost` input: the lag EWMA in whole milliseconds
+    /// (`ironwood/network/router.go:221-227`).
+    pub lag_ms: u128,
+    /// Go's `latency`: the last `SigReq` round trip, re-read at query time
+    /// (`debug.go:84-86`).
+    pub latency: Option<Duration>,
+}
+
+/// Go's `peer.srrt.Sub(peer.srst).Round(time.Millisecond / 100)`, kept only if
+/// the result is positive (`debug.go:84`). Two behaviours hide in that one line:
+/// the pair is *stored* timestamps, so the number grows until the next `SigReq`
+/// resets it, and a `SigReq` sent after the last `SigRes` makes it negative,
+/// which reports as no latency at all rather than a small one.
+fn go_latency(srrt: Option<Instant>, srst: Option<Instant>) -> Option<Duration> {
+    let delta = srrt?.checked_duration_since(srst?)?;
+    let hundredths = (delta.as_nanos() as u64 + 5_000) / 10_000;
+    (hundredths > 0).then(|| Duration::from_nanos(hundredths * 10_000))
 }
 
 impl Snapshot for Router {
@@ -173,7 +213,7 @@ impl Snapshot for Router {
     fn get_sessions(&self) -> Vec<[u8; KEY_LEN]> {
         self.get_sessions()
     }
-    fn link_peers(&self) -> Vec<([u8; KEY_LEN], u64, u8, bool, u128)> {
+    fn link_peers(&self) -> Vec<LinkPeer> {
         self.link_peers()
     }
     fn tree_entries(&self) -> Vec<([u8; KEY_LEN], [u8; KEY_LEN], u64)> {

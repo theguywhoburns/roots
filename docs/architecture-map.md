@@ -63,7 +63,7 @@ Go-origin column is taken from each module's own port header and checked against
 | `traffic.rs` | `Traffic` header codec (path + from + source + dest + watermark + payload) and inbound forwarding decision | `ironwood/network/traffic.go` |
 | `peer.rs` | `PeerKind` (Go vs roots via vendor TLV), `feat` constants, `PeerState` | `meta` vendor fields |
 | `supervisor.rs` | persistent redial policy data: `SupervisedPeer` (`due`/`record_success`/`record_failure`), `backoff_cap` | `core` peer monitor |
-| `link.rs` | `Transport`/`Link` traits, `AnyConn`, the **owning** `LinkSet` (`write` hard / `write_via` soft / `stats` / `idle_for`, retirement on write failure), `complete_dial`/`complete_accept`/`dial_any`, URI parsing, backoff, `meta` handshake drive | `src/core` |
+| `link.rs` | `Transport`/`Link` traits, `AnyConn` (each with a `LinkId`), the **owning** `LinkSet` (`write` hard / `write_via` soft / `stats(id)` / `idle_for` / `update_rates` on Go's one-second window, retirement on write failure, and `add` handing back the link it displaced), `complete_dial`/`complete_accept`/`dial_any`, URI parsing, backoff, `meta` handshake drive | `src/core` |
 | `tls.rs` | `Tls` transport (`tls://`), rustls/ring NoVerify, rcgen listener cert | `src/core/link_tls.go` |
 | `ws.rs` | `Ws`/`Wss` transports, `ygg-ws` subprotocol, message-per-flush | `src/core/link_ws.go` |
 | `quic.rs` | `Quic` transport (quinn), one bidi stream per link | `src/core/link_quic.go` |
@@ -75,7 +75,7 @@ Go-origin column is taken from each module's own port header and checked against
 | `client/src/node.rs` | *(the other package)* `Cmd` + `Node`: the single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, drains commands between `DEFAULT_TICK` serve slices, is the only non-test `Router` builder; `Cmd::Report` answers with the `Snapshot` (plus `PeerRow`) the admin socket renders | `core` `links` actor + `switch.go` |
 | `client/src/links.rs` | *(the other package)* `Links`: one `Entry` per `(link_id, sintf)` — Go's dedup, `LinkKind::{Persistent,Ephemeral}`, `SupervisedPeer` backoff, last error, dial tasks in/out over `LinkEvent` | `core/link.go` `links.add`/`remove` |
 | `client/src/listen.rs` | *(the other package, Slice 7)* `spawn_listeners`: bind every `Listen` URI in all five schemes and run one accept loop each, reporting handshaked links as `Cmd::Accept`; binding fails the startup, a failed handshake does not | `core/link.go` `StartupListeners` + `link.go:503-540` |
-| `client/src/admin.rs` | *(the other package, Slice 7)* Go's admin framing: `bind_admin` (`""`/`none` off, `unix://` probe + rebind + `0660`, `tcp://` and bare `host:port`), `serve_admin`/`admin_conn` (a JSON value stream, one reply per request, `keepalive` decides whether the loop runs again, the request echoed back), Go's four protocol error strings and eight commands, every body a `struct` behind `enum Body` so field order survives | `src/admin/admin.go` + `src/admin/*.go` |
+| `client/src/admin.rs` | *(the other package, Slice 7)* Go's admin framing: `bind_admin` (`""`/`none` off, `unix://` probe + rebind + `0660`, `tcp://` and bare `host:port`), `serve_admin`/`admin_conn` (a JSON value stream, one reply per request, `keepalive` decides whether the loop runs again, the request echoed back), Go's four protocol error strings and eight commands, every body a `struct` behind `enum Body` so field order survives; `getPeers` writes Go's full 16-field `PeerEntry` and its three `sort` modes, ordered by a local `sort_stable` because Go's comparator is not a total order | `src/admin/admin.go` + `src/admin/*.go` |
 | `client/src/config.rs` | *(the other package, Slice 6)* `Config` with Go's `NodeConfig` key names **and declaration order**, `defaults()` = the Linux column, `generate`/`load`/`from_json` (strip nulls → deserialize → postprocess), `signing_key`/`address`/`subnet`/`link_options`/`to_json`, plus `Flags`/`ConfigSource`/`USAGE`. JSON only | `src/config/config.go` + `defaults_linux.go` |
 
 ## State ownership
@@ -251,8 +251,10 @@ is the configured-peer list: one `Entry` per `(link_id, sintf)` carrying kind,
   so `note_liveness` diffs each entry's `live` key against `LinkSet::peers()`
   once per tick: gone means `record_failure` (and, for an `Ephemeral` entry,
   deletion — Go's goroutine-exit `delete(l._links, info)`).
-- **`Drop` ≠ disconnect.** `Links::remove` forgets the entry, which cancels the
-  redial and leaves the link serving (`api.go:207-211`). A duplicate `Dial`
+- **`Drop` ≠ disconnect, and that is a divergence.** `Links::remove` forgets the
+  entry, which cancels the redial and leaves the link serving. Go's `remove`
+  closes the connection too (`link.go:433-438`), whatever its comment claims, so
+  Go's row disappears with it — Slice 9 owns the comparison. A duplicate `Dial`
   kicks the entry's backoff and answers `AlreadyConfigured` (`link.go:236-245`);
   the kick reschedules for the next tick rather than interrupting a sleep.
 - **A `serve` error is not fatal unless `Error::is_link()` says so** — the loop
@@ -390,14 +392,32 @@ Client-side (the single-task rule):
   message shapes are built from a table of the field each command reads, and the
   gate sits before `dispatch` rather than inside the handlers. `null` args are a
   no-op success and unknown keys are ignored, both exactly as Go's decoder does.
-- **Our `getPeers` rows come from the configured dials, so an accepted link has
-  no row** and a link that was replaced by an inbound one reports `inbound:
-  true` under the dial URI (Slice 7, pinned by `proof/7-admin-inbound.sh`).
-  Go's rows come from `links._links`, which holds inbound links too and rewrites
-  their `remote` to the peer's socket address (`api.go:79-106`,
-  `link.go:519-525`). Fixing this means giving the link manager the inbound
-  half of its table, which is Slice 8's row set — not something `admin.rs` can
-  paper over from the snapshot it is handed.
+- **A `getPeers` row is a peering, and it is joined to a link by `LinkId`.**
+  Rows come from the link manager's table — configured dials *and* accepted
+  links, which is why the inbound direction has a row of its own now (Slice 8) —
+  and each carries the id of the link it last saw. Every field the link set and
+  the router could supply is gated on that one `links.stats(id)` lookup, which
+  mirrors Go joining `links._links` to ironwood's peers by `net.Conn` identity
+  (`api.go:79-106`): a row whose link is gone prints zeroed counters and no key.
+  An accepted row is named by the socket it came from, because Go rewrites the
+  host to it (`link.go:514-524`), and a dead accepted row leaves the table while
+  a dead dial row stays — the two `defer`s in `link.go` differ, not the admin
+  layer.
+- **One node key is one link slot, so a crossed peering flaps.** `LinkSet::add`
+  displaces the incumbent and the node drops what comes back, closing that
+  socket; both directions then re-form and displace each other again. Measured
+  2026-09-25 (`proof/8-getpeers.sh` phase C, and two of our own nodes dialling
+  each other): exactly one row is live at any instant and it alternates. Go keys
+  by URI and ironwood keeps several links per key, so it can hold both. Treat a
+  `LinkId` as volatile and `stats(id) == None` as "lost the slot", not "peer
+  gone". The fix is link-keying work — TODO, not a parity slice.
+- **The `getPeers` order is Go's, including the bug that makes it unsortable by
+  Rust's sort.** Go's comparators `return int(a.Uptime - b.Uptime)` for a
+  difference it already tested nonzero as a float, so two uptimes within a second
+  compare equal *and short-circuit* the keys below them — a relation that is not
+  transitive. `slice::sort_by` verifies comparators and panics on that (measured:
+  never at 200 rows, always at 300), so `admin.rs` has `sort_stable`, an
+  insertion sort that is stable, adjacent-only and never asks the question.
 - **`link_id` is URI-minus-query, and the dedup key is `(link_id, sintf)`**
   (`link.go:54-57`, `766-769`). Two URIs that differ only in options are the same
   peer; two URIs on different source interfaces are not.

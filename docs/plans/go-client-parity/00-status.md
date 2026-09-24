@@ -31,7 +31,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 5 — one-task node loop + `link_id` dedup command queue — DONE 2026-09-24, `client/src/links.rs` + `client/src/node.rs` (`Cmd`/`Node::run`), `client/tests/node_loop.rs`; `run_peer` deleted, `reconnect.rs` moved onto `Node`; mutation table in `04-slices.md`
 - [x] Slice 6 — Go-shaped config (proven by Go's own binary parsing it) — DONE 2026-09-24, `client/src/config.rs` + `client/src/main.rs` flags + `client/tests/allowlist.rs` + `tests/go_vectors.rs` address/subnet string vectors; `src/address.rs` `Display` fixed to Go's text form
 - [x] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings — DONE 2026-09-24, `client/src/admin.rs` + `client/src/listen.rs` + `boot()` in `client/src/main.rs` + `client/tests/admin_loopback.rs` (6 tests) + `docs/protocol/21-admin.md` + `proof/7-admin.sh`/`7-admin-raw.sh`/`7-admin-inbound.sh`; `examples/admin.rs` deleted; proven against a live Go 0.5.14 node and stock `yggdrasilctl` over tcp **and** unix, mutation table in `04-slices.md`
-- [ ] Slice 8 — `getPeers` content parity: three sort modes + full field set
+- [x] Slice 8 — `getPeers` content parity: three sort modes + full field set — DONE 2026-09-25, `LinkId` + `stats(id)` + `update_rates` + `AnyConn::remote_addr` in `src/link.rs`, SigReq/SigRes latency stamps in `src/tree.rs`, `LinkKind::Incoming` rows in `client/src/links.rs`, the 16-field body and Go's three `sort` modes in `client/src/admin.rs`; `client/tests/peer_rows.rs` (3 tests) + `proof/8-getpeers.sh` (five phases, `7-admin-inbound.sh` superseded); mutation tables and the crossed-peering flap in `04-slices.md`
 - [ ] Slice 9 — remote queries via `next_hop`; `removePeer` stops lying
 - [ ] Slice 10 — multicast codec + state machine in the library (no sockets)
 - [ ] Slice 11 — multicast sockets in the client + captured Go beacon
@@ -141,7 +141,10 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     `keepalive` is never read so the connection dies after one reply, remote
     queries go to `links.peers().next()` instead of resolving the target key, and
     `removePeer` drops the live link (Go: "The peer is not disconnected
-    immediately" — `core/api.go:207-211`). Go's `DisallowUnknownFields` call is
+    immediately" — `core/api.go:207-211`). *Corrected by Slice 8: that comment is
+    wrong about Go — `links.remove` closes the connection too
+    (`link.go:433-438`), measured — so keeping the link is our divergence, not
+    Go's behaviour.* Go's `DisallowUnknownFields` call is
     inert, so our leniency about unknown fields already matches.
   - Two library seams are required before TUN or a multi-listener client can
     work: a message-driven single-task command queue in front of `LinkSet`, and a
@@ -347,3 +350,30 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     file carries 6 of them, and `mesh_ping` stays `#[ignore]`d).
     `examples/admin.rs` (643 lines) and the root `serde_json` dev-dependency are
     gone with it; `client/` is the only place a config-driven node runs.
+- **Slice 8 findings — a row is a peering, and it names a connection.** Full
+  detail and all three mutation tables are in the Slice 8 Done block of
+  `04-slices.md`; these are the things a fresh session must not re-derive.
+  - **The seam is `roots::LinkId`** — a per-connection counter, minted where the
+    connection is built, impossible to fabricate. A `getPeers` row holds one and
+    asks `links.stats(id)` with it, which is Go's `conns[conn]` join
+    (`core/api.go:73-103`) with the pointer replaced. Two rules follow and both
+    are load-bearing: `stats(id) == None` means *this row lost the slot*, not
+    "the peer is gone"; and nothing a caller holds may assume its id outlives a
+    displacement.
+  - **Reading Go instead of trusting its comments changed three conclusions.**
+    `removePeer` **does** close the live link (`link.go:433-438`, measured on a
+    Go pair) — our keep-the-link `Cmd::Drop` is a divergence we own, and Slice 9
+    now carries it as a decision rather than a parity fix; passing an inbound
+    row's URI to `removePeer` **panics** Go (nil `cancel`, `link.go:434`), which
+    is not worth reproducing; and a crossed peering **flaps on Go too** — the
+    first draft of phase C asserted "Go holds both directions up", which the
+    measurement disproved.
+  - **`cost` and `latency` are filled and cited, not claimed.** One loopback pair
+    disagreed by ~100×, and the reason is that neither is an RTT. Open question
+    recorded in `TODO.md`.
+  - **A Go comparator that truncates a float is not a total order**, so
+    `sort_by` — which verifies comparators and panics — cannot implement it: 300
+    rows of the fixture panic, 200 never do. `sort_stable` in
+    `client/src/admin.rs` is Go's `slices.SortStableFunc`, not a workaround for
+    slowness.
+  - CI trio green at **111 unit + 20 integration tests** (~35 s wall).

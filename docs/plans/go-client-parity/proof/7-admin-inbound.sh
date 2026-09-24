@@ -7,16 +7,20 @@
 # cannot connect, so no row is ever `up`. This script makes one link in each
 # direction, separately, and shows what each side reports.
 #
-# Expected, as captured 2026-09-24 — these are the two deviations
-# docs/protocol/21-admin.md records, and Slice 8 owns fixing them:
-#   A: our dial's row matches Go's inbound row apart from the rate/latency
-#      fields we do not fill (and Go names the row by the rewritten socket
+# What it showed when it was written (2026-09-24) — the two deviations
+# docs/protocol/21-admin.md recorded and Slice 8 then fixed:
+#   A: our dial's row matched Go's inbound row apart from the rate/latency
+#      fields we did not fill (and Go named the row by the rewritten socket
 #      address, `link.go:519-525`).
-#   B: Go lists the link it dialled; we list nothing for a link we accepted,
-#      because our rows come from the configured peer list. With both
-#      directions up at once our row additionally reports the *accepted*
-#      link's direction against the dial's URI, because `LinkSet` keys by node
-#      public key and the second link replaces the first.
+#   B: Go listed the link it dialled; we listed nothing for a link we accepted,
+#      because our rows came from the configured peer list. With both directions
+#      up at once our row additionally reported the *accepted* link's direction
+#      against the dial's URI, because `LinkSet` keys by node public key and the
+#      second link replaces the first.
+# Run it again and A is a field-by-field match; B is a row of our own, named by
+# its socket, with the direction that belongs to it. The one-live-row half of B
+# is still true and still churns — that part now has a check, in
+# 8-getpeers.sh phase C, which supersedes this script.
 # Needs the installed yggdrasil/yggdrasilctl 0.5.14; never a Go compiler, and
 # never in CI.
 set -e

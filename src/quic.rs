@@ -209,7 +209,10 @@ pub async fn quic_accept(
         .map_err(|_| Error::Timeout)?
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     let stream = QuicStream::new(endpoint.clone(), conn.clone(), send, recv);
-    crate::link::complete_accept(stream, local, opts).await
+    // Go's QUIC row names the peer by its UDP address (`net.UDPAddr.String()`,
+    // which brackets IPv6 exactly as Rust's `SocketAddr` Display does).
+    let addr = conn.remote_address().to_string();
+    crate::link::complete_accept(stream, local, opts, Some(addr)).await
 }
 
 #[cfg(test)]

@@ -272,6 +272,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             });
             let mut router = Router::new(b_sk);

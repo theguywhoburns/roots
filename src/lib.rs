@@ -33,7 +33,7 @@ pub use error::Error;
 pub use frame::FrameType;
 pub use handshake::Meta;
 pub use link::{
-    AnyConn, Link, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport,
+    AnyConn, Link, LinkId, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport,
     complete_accept, complete_dial, dial_any, parse_link_uri,
 };
 pub use peer::{PeerKind, feat};

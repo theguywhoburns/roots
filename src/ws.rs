@@ -264,9 +264,9 @@ pub async fn ws_accept(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Ws>, Error> {
-    let (sock, _) = listener.accept().await.map_err(Error::Io)?;
+    let (sock, addr) = listener.accept().await.map_err(Error::Io)?;
     let stream = ws_server_handshake(sock).await?;
-    crate::link::complete_accept(stream, local, opts).await
+    crate::link::complete_accept(stream, local, opts, Some(addr.to_string())).await
 }
 
 /// WS server handshake over an established byte stream (plain TCP for
@@ -373,7 +373,7 @@ pub async fn wss_accept(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Wss>, Error> {
-    let (sock, _) = listener.accept().await.map_err(Error::Io)?;
+    let (sock, addr) = listener.accept().await.map_err(Error::Io)?;
     let tls: tokio_rustls::TlsStream<TcpStream> =
         tokio::time::timeout(crate::link::TLS_HANDSHAKE_TIMEOUT, acceptor.accept(sock))
             .await
@@ -381,7 +381,7 @@ pub async fn wss_accept(
             .map_err(|e| Error::Io(std::io::Error::other(e)))?
             .into();
     let stream = ws_server_handshake(tls).await?;
-    crate::link::complete_accept(stream, local, opts).await
+    crate::link::complete_accept(stream, local, opts, Some(addr.to_string())).await
 }
 
 #[cfg(test)]

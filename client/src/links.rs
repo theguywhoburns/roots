@@ -45,16 +45,21 @@ impl Info {
     }
 }
 
-/// Whether a dialled link outlives its failures (`linkType`, `link.go:26-29`).
-/// Go's third kind, `linkTypeIncoming`, never enters the map at all: an accepted
-/// link belongs to its listener, not to a configured peer. So inbound links
-/// arrive at the node as `Cmd::Accept` with no entry behind them.
+/// Which of Go's three link kinds a row is (`linkType`, `link.go:26-29`).
+///
+/// Go keeps all three in the one `_links` map (`link.go:54-57`), and so do we:
+/// `addPeer` looks a row up by URI alone, so a listener's row can answer it just
+/// as Go's does — which is why an inbound link is an [`Entry`], not a separate
+/// table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkKind {
     /// Statically configured: redial forever, backing off.
     Persistent,
     /// Multicast-discovered: one attempt, then forgotten.
     Ephemeral,
+    /// The peer dialled us. Nobody redials it, and the row goes away with the
+    /// link (Go's `defer delete(l._links, info)`, `link.go:567-571`).
+    Incoming,
 }
 
 /// Why `add`/`remove` refused. The first two strings are Go's verbatim
@@ -105,14 +110,22 @@ pub struct Entry {
     pub sintf: String,
     pub kind: LinkKind,
     /// Redial policy data — the library's, so the backoff arithmetic has one
-    /// home (`src/supervisor.rs`).
+    /// home (`src/supervisor.rs`). Empty and unused on an [`LinkKind::Incoming`]
+    /// row, which nobody ever redials.
     pub redial: SupervisedPeer,
     /// `?maxbackoff=` or Go's default (`1s << 12`).
     pub max_backoff: Duration,
-    /// Node key of the link this URI produced, while the node still holds it.
-    pub live: Option<[u8; 32]>,
+    /// The link this row produced: node key *and* the identity of the socket
+    /// that reaches it, while the node still holds that socket. The key alone
+    /// cannot answer "is my link up" — the set keeps one slot per node key, so
+    /// a peer that both dialled us and we dialled has two links and one slot,
+    /// and only the id says which of the two a row is describing.
+    pub live: Option<(roots::LinkId, [u8; 32])>,
     /// Last connection error, for `getPeers`/`getSelf` (Go's `link._err`).
     pub last_error: Option<String>,
+    /// When `last_error` happened. `getPeers` reports the *age* of the error,
+    /// not its time (Go's `time.Since(p.LastErrorTime)`, `getpeers.go:62`).
+    pub err_at: Option<Instant>,
     /// Token of the in-flight dial, if any. A result whose token matches no
     /// entry is stale — the peer was removed while we were dialling.
     dialing: Option<u64>,
@@ -169,15 +182,58 @@ impl Links {
             max_backoff: backoff_cap(uri),
             live: None,
             last_error: None,
+            err_at: None,
             dialing: None,
         });
         Ok(())
     }
 
-    /// Go `links.remove`: cancel the redial loop. The live link is left alone —
-    /// Go's `RemovePeer` says so out loud ("The peer is not disconnected
-    /// immediately", `core/api.go:207-211`) and `getPeers` keeps listing it until
-    /// it dies on its own.
+    /// True when an inbound link may not claim this URI's row: somebody already
+    /// holds a live connection there. Go checks the same thing before it stores
+    /// the link and drops the newcomer silently — "If there's an existing link
+    /// state for this link, get it. If this node is already connected to us,
+    /// just drop the connection" (`link.go:529-541`).
+    pub fn busy(&self, uri: &str) -> bool {
+        self.find(uri, "").is_some_and(|at| {
+            let e = &self.entries[at];
+            e.live.is_some()
+        })
+    }
+
+    /// Claim the row for a link a listener accepted (Go's inbound half of the
+    /// listener goroutine).
+    ///
+    /// `uri` is built from the *accepted socket's* peer address, not from the
+    /// listener's own, which is what makes it look like `tcp://192.0.2.7:51830`.
+    /// Ask [`Links::busy`] first: a row that already has a link keeps it.
+    pub fn accept(&mut self, uri: &str, conn: &AnyConn) {
+        let live = (conn.id, conn.remote_key);
+        if let Some(at) = self.find(uri, "") {
+            let e = &mut self.entries[at];
+            e.live = Some(live);
+            e.last_error = None;
+            e.err_at = None;
+            return;
+        }
+        self.entries.push(Entry {
+            uri: uri.to_string(),
+            sintf: String::new(),
+            kind: LinkKind::Incoming,
+            redial: SupervisedPeer::new(uri.to_string()),
+            max_backoff: backoff_cap(uri),
+            live: Some(live),
+            last_error: None,
+            err_at: None,
+            dialing: None,
+        });
+    }
+
+    /// Cancel the redial loop for a configured peer, and **keep** the live link:
+    /// a divergence from Go, whose `links.remove` cancels the context *and*
+    /// closes the connection (`link.go:433-438`) whatever its doc comment claims
+    /// ("The peer is not disconnected immediately", `core/api.go:203`). Go's row
+    /// therefore disappears with the link; ours stays, `up: true`, until the link
+    /// dies by itself. Slice 5 chose this; Slice 9 owns the comparison.
     pub fn remove(&mut self, uri: &str, sintf: &str) -> Result<(), LinkError> {
         let at = self.find(uri, sintf).ok_or(LinkError::NotConfigured)?;
         self.entries.remove(at);
@@ -190,7 +246,8 @@ impl Links {
     /// a caller that tracks liveness somewhere other than the peer record.
     pub fn start_due(&mut self, now: Instant) {
         for at in 0..self.entries.len() {
-            if self.entries[at].live.is_some()
+            if self.entries[at].kind == LinkKind::Incoming
+                || self.entries[at].live.is_some()
                 || self.entries[at].dialing.is_some()
                 || !self.entries[at].redial.due(now, &[])
             {
@@ -220,19 +277,21 @@ impl Links {
     /// gone, in which case the caller must drop the connection — which is what
     /// Go does when a peering has already come up on that entry
     /// (`link.go:366-373`).
-    pub fn mark_live(&mut self, token: u64, peer: [u8; 32]) -> bool {
+    pub fn mark_live(&mut self, token: u64, conn: &AnyConn) -> bool {
         let Some(e) = self.entry_mut(token) else {
             return false;
         };
         e.dialing = None;
-        e.live = Some(peer);
+        e.live = Some((conn.id, conn.remote_key));
         e.last_error = None;
+        e.err_at = None;
         e.redial.record_success();
         true
     }
 
-    /// Record a failed dial: back off, keep the error for the report, and forget
-    /// an ephemeral entry the way Go's goroutine exit deletes its map entry.
+    /// Record a failed dial: back off, keep the error — and the moment it
+    /// happened, because `getPeers` reports the error's *age* — and forget an
+    /// ephemeral entry the way Go's goroutine exit deletes its map entry.
     pub fn mark_failed(&mut self, token: u64, err: &str) {
         let Some(at) = self.entries.iter().position(|e| e.dialing == Some(token)) else {
             return;
@@ -245,26 +304,31 @@ impl Links {
         e.dialing = None;
         e.live = None;
         e.last_error = Some(err.to_string());
+        e.err_at = Some(Instant::now());
         let cap = e.max_backoff;
         e.redial.record_failure(cap);
     }
 
     /// Reconcile against the links the set still holds. `serve` evicts a dead
     /// link silently, so this diff is how a vanished link becomes a redial again
-    /// — and how a dead ephemeral link stops being remembered at all.
+    /// — and how a dead ephemeral or inbound link stops being remembered at all.
+    ///
+    /// Asked by [`roots::LinkId`], never by node key: the set keeps one slot per
+    /// key, so a key still present does not mean *this* row's link still is.
+    /// Reporting a dial as up because the same peer then dialled us is the bug
+    /// this replaces.
     pub fn note_liveness(&mut self, links: &LinkSet) {
-        let held = links.peers();
         let mut drop: Vec<usize> = Vec::new();
         for at in 0..self.entries.len() {
             let e = &mut self.entries[at];
-            let Some(key) = e.live else { continue };
-            if held.contains(&key) {
+            let Some((id, _)) = e.live else { continue };
+            if links.stats(id).is_some() {
                 continue;
             }
             e.live = None;
             let cap = e.max_backoff;
             e.redial.record_failure(cap);
-            if e.kind == LinkKind::Ephemeral {
+            if e.kind != LinkKind::Persistent {
                 drop.push(at);
             }
         }
@@ -294,6 +358,106 @@ mod tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
         (Links::new(Client::new(key), tx), rx)
+    }
+
+    /// One real, handshaked link — both test links share a peer key, which is
+    /// the case that matters. A [`roots::LinkId`] cannot be minted by hand, and
+    /// that is the whole point of it, so a test that needs one makes a
+    /// connection.
+    async fn live_link() -> AnyConn {
+        use roots::link::{accept, dial, listen};
+        let ours = ed25519_dalek::SigningKey::from_bytes(&[2; 32]);
+        let theirs = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+        let opts = roots::LinkOptions::default();
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_opts = opts.clone();
+        let server = tokio::spawn(async move {
+            let conn = accept(&listener, &theirs, &server_opts).await.unwrap();
+            drop(conn);
+        });
+        let conn = dial(&format!("tcp://{addr}"), &ours, &opts).await.unwrap();
+        let _ = server.await;
+        AnyConn::new(conn)
+    }
+
+    #[tokio::test]
+    async fn an_inbound_link_gets_a_row_of_its_own() {
+        // Go's `_links` map holds inbound rows beside configured ones, keyed by
+        // a URI built from the accepted socket's peer address (`link.go:514-524`),
+        // and `links.add` looks that map up by URI alone — so a peer that dialled
+        // us is listed, and dialling it back says "already configured".
+        let (mut m, _rx) = manager();
+        let conn = live_link().await;
+        let (key, id) = (conn.remote_key, conn.id);
+        m.accept("tcp://127.0.0.1:51830", &conn);
+        assert_eq!(m.len(), 1, "an accepted link is a row");
+        assert_eq!(m.entries[0].kind, LinkKind::Incoming);
+        assert_eq!(m.entries[0].live, Some((id, key)));
+        assert!(
+            m.busy("tcp://127.0.0.1:51830"),
+            "the row holds a live link, so a second connection to that address is dropped"
+        );
+        assert!(
+            !m.busy("tcp://127.0.0.1:51831"),
+            "a different peer address is a different row"
+        );
+        assert_eq!(
+            m.add("tcp://127.0.0.1:51830", "", LinkKind::Persistent),
+            Err(LinkError::AlreadyConfigured),
+            "Go's dedup key does not care which way the link came up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dead_inbound_row_disappears_and_a_dead_dial_row_stays() {
+        // Go's inbound handler ends with `defer delete(l._links, info)`
+        // (`link.go:567-571`), so an accepted link leaves `getPeers` when it
+        // dies; a configured row stays behind and reports `up: false` plus its
+        // last error until the operator removes it.
+        let (mut m, _rx) = manager();
+        let conn = live_link().await;
+        let (id, key) = (conn.id, conn.remote_key);
+        m.accept("tcp://127.0.0.1:51830", &conn);
+        m.add("tcp://127.0.0.1:9001", "", LinkKind::Persistent)
+            .unwrap();
+        m.entries[1].live = Some((id, key));
+        let mut links = LinkSet::single(conn);
+        m.note_liveness(&links);
+        assert_eq!(m.len(), 2, "both rows hold the link, so both stay");
+        drop(links.remove(&key));
+        m.note_liveness(&links);
+        assert_eq!(m.len(), 1, "the inbound row is deleted with its link");
+        assert_eq!(m.entries[0].uri, "tcp://127.0.0.1:9001");
+        assert_eq!(
+            m.entries[0].live, None,
+            "the dial row stays, reported down, and is due to redial"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_is_asked_of_the_link_a_row_holds() {
+        // The set keeps one slot per node key, so "is any link to this key up"
+        // is the wrong question — asked that way, a dial whose link an accepted
+        // link displaced keeps reporting itself up.
+        let (mut m, _rx) = manager();
+        let held = live_link().await;
+        let lost = live_link().await;
+        assert_eq!(
+            held.remote_key, lost.remote_key,
+            "two links to the same peer is the case under test"
+        );
+        m.add("tcp://127.0.0.1:9001", "", LinkKind::Persistent)
+            .unwrap();
+        m.entries[0].live = Some((lost.id, held.remote_key));
+        let links = LinkSet::single(held);
+        assert!(
+            links.stats(lost.id).is_none(),
+            "the set holds a different connection to that key"
+        );
+        m.note_liveness(&links);
+        assert_eq!(m.entries[0].live, None, "so the row is down");
+        assert_eq!(m.len(), 1, "and a persistent row is not forgotten");
     }
 
     #[test]
@@ -381,6 +545,10 @@ mod tests {
             m.entries[0].last_error.as_deref(),
             Some("connection refused")
         );
+        assert!(
+            m.entries[0].err_at.is_some(),
+            "`getPeers` prints how long ago the error was, so the moment is kept"
+        );
         assert_eq!(m.entries[0].sintf, "");
         assert_eq!(m.entries[0].live, None, "reported down");
         assert_eq!(
@@ -411,8 +579,9 @@ mod tests {
         m.start_due(Instant::now());
         let LinkEvent::Dialed { token, .. } = rx.recv().await.expect("event");
         m.remove("tcp://127.0.0.1:9001", "").unwrap();
+        let conn = live_link().await;
         assert!(
-            !m.mark_live(token, [7; 32]),
+            !m.mark_live(token, &conn),
             "the peer was removed mid-dial, so the caller must drop the link"
         );
     }

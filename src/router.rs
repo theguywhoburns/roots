@@ -149,6 +149,7 @@ mod tests {
                 responded: true,
                 lag: Duration::from_millis(12),
                 sent_at: None,
+                srrt: None,
                 prio: 0,
                 order: 0,
                 kind: PeerKind::Go,
@@ -166,9 +167,9 @@ mod tests {
         );
         let peers = router.link_peers();
         assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].0, kb);
-        assert_eq!(peers[0].1, 3);
-        assert!(peers[0].3);
+        assert_eq!(peers[0].key, kb);
+        assert_eq!(peers[0].port, 3);
+        assert!(peers[0].responded);
         let paths = router.get_paths();
         assert_eq!(paths.len(), 1);
         assert_eq!(paths[0], (ka, vec![4, 2], 9));
@@ -223,6 +224,7 @@ mod tests {
             priority: 0,
             kind: PeerKind::Go,
             inbound: false,
+            remote_addr: None,
             stream: sock,
         }));
         let io = crate::error::Error::Io(std::io::Error::from_raw_os_error(104));
@@ -271,6 +273,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(s1_sk);
@@ -368,6 +371,7 @@ mod tests {
             priority: 0,
             kind,
             inbound: true,
+            remote_addr: None,
             stream: sock,
         };
         let mut router = Router::new(sk);
@@ -616,6 +620,7 @@ mod tests {
             priority: 0,
             kind: PeerKind::Go,
             inbound: false,
+            remote_addr: None,
             stream: sock,
         }));
         for pk in [l_pub, d_pub] {
@@ -627,6 +632,7 @@ mod tests {
                     responded: true,
                     lag: Duration::from_millis(10),
                     sent_at: None,
+                    srrt: None,
                     prio: 0,
                     order: 0,
                     kind: PeerKind::Go,
@@ -674,6 +680,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
@@ -731,6 +738,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
@@ -791,6 +799,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
@@ -863,6 +872,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
@@ -935,6 +945,7 @@ mod tests {
                 priority: 0,
                 kind,
                 inbound: true,
+                remote_addr: None,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);

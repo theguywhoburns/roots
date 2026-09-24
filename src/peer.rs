@@ -77,6 +77,13 @@ pub(crate) struct PeerState {
     pub(crate) order: u64,
     /// Which implementation the peer runs (for gating behavior fixes).
     pub(crate) kind: PeerKind,
+    /// When the last `SigRes` that passed its signature check arrived, still in
+    /// Go's own words (`ironwood/network/peers.go:112-113`): `srst` is the send
+    /// time [`Self::sent_at`], `srrt` the receive time. `getPeers`' `latency` is
+    /// `srrt - srst` **re-read at query time** (`debug.go:85`), so it is the last
+    /// round trip as of now, not as of the reply — and grows until the next
+    /// `SigReq` resets the pair.
+    pub(crate) srrt: Option<std::time::Instant>,
 }
 
 #[cfg(test)]

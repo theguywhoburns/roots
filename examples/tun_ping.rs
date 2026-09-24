@@ -86,6 +86,7 @@ async fn main() {
         priority: 0,
         kind: b_kind,
         inbound: true,
+        remote_addr: None,
         stream: b_sock,
     };
     let mut rb = Router::new(cb.key);

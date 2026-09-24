@@ -22,9 +22,10 @@ use crate::links::{LinkError, LinkEvent, LinkKind, Links, link_id};
 /// enough for a peer's keepalive to land.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(50);
 
-/// One configured peer, joined with the link it produced. This is Go's
-/// `PeerInfo` (`core/api.go:22-40`) minus the fields the router cannot name
-/// yet: rates.
+/// One row of Go's `_links` map, joined with what the router and the socket
+/// say about it — Go's `PeerInfo` (`core/api.go:22-40`), which `GetPeers`
+/// builds the same way: iterate the link table, then look the connection up in
+/// the router's own peer list by identity.
 #[derive(Debug)]
 pub struct PeerRow {
     pub uri: String,
@@ -37,13 +38,20 @@ pub struct PeerRow {
     pub priority: u8,
     /// Go's `_getCost` (`ironwood/network/router.go:221-228`): the lag estimate
     /// in whole milliseconds, floored at 1 because the routing maths divides by
-    /// it. Go's `latency` is a separate number — the raw last SigReq round trip,
-    /// which the library does not keep — so it stays Slice 8's.
+    /// it.
     pub cost: u64,
+    /// Go's `latency`: the last `SigReq` round trip as of this instant
+    /// (`debug.go:84-86`), which is a different number from `cost`.
+    pub latency: Option<Duration>,
     pub up_for: Duration,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// Bytes in the last whole sample window, on Go's own 1 s tick.
+    pub rx_rate: u64,
+    pub tx_rate: u64,
     pub last_error: Option<String>,
+    /// When `last_error` happened; `getPeers` prints its age.
+    pub err_at: Option<Instant>,
 }
 
 /// Everything the admin socket may ask the node about, gathered by the node
@@ -77,16 +85,22 @@ pub enum Cmd {
         persistent: bool,
         respond: Option<oneshot::Sender<Result<(), LinkError>>>,
     },
-    /// Stop redialling a configured peer. The live link is left alone, exactly
-    /// as in Go (`core/api.go:207-211`).
+    /// Stop redialling a configured peer, and — unlike Go, which also closes
+    /// the connection (`links.remove`, `link.go:433-438`) — leave the live link
+    /// alone. Slice 5's decision; `node_loop` pins it and Slice 9 owns revisiting
+    /// it.
     Drop {
         uri: String,
         sintf: String,
         respond: Option<oneshot::Sender<Result<(), LinkError>>>,
     },
-    /// A listener finished handshaking an inbound link. No entry behind it:
-    /// inbound links belong to their listener, not to the peer list.
-    Accept { conn: AnyConn },
+    /// A listener finished handshaking an inbound link. `uri` names it the way
+    /// Go's `getPeers` does — the accepted socket's own peer address, in the
+    /// listener's scheme — because an inbound row is a row like any other and
+    /// needs a key of its own. `None` means the transport could not name the
+    /// peer at all, which leaves the link served but unlisted, exactly as a link
+    /// that never entered Go's `_links` map does.
+    Accept { conn: AnyConn, uri: Option<String> },
     /// Queue a session payload for `dest`. (Slice 12 adds the IPv6-keyed
     /// resolve-and-hold form that a TUN needs; this is the one an app that
     /// already knows a node key wants.)
@@ -157,29 +171,33 @@ impl Node {
     /// Read the router and the link set from inside the node task, which is the
     /// only place either may be read while the node runs.
     fn snapshot(&self) -> Snapshot {
-        let known: Vec<([u8; 32], u64, u8, u128)> = self
-            .router
-            .link_peers()
-            .into_iter()
-            .map(|(key, port, priority, _, lag_ms)| (key, port, priority, lag_ms))
-            .collect();
+        let known = self.router.link_peers();
         let peers = self
             .peers
             .entries()
             .iter()
             .map(|e| {
-                let stats = e.live.as_ref().and_then(|k| self.links.stats(k));
-                let known = e
+                // The row's own link, asked by identity: a [`roots::LinkId`] and
+                // a node key cannot be joined any other way, because the set keeps
+                // one slot per *key* — so a peer that both dialled us and we
+                // dialled has two links in play and one slot, and only the id says
+                // which of the two a row is describing.
+                //
+                // Everything the set and the router have to say about the row is
+                // gated on that one answer, so a row never reports the key, the
+                // direction or the counters of a link it no longer holds
+                // (`core/api.go:85-103` reads the same way: the `up` half comes
+                // from the row's own connection, and the router half is joined
+                // through it).
+                let live = e
                     .live
+                    .and_then(|(id, key)| self.links.stats(id).map(|s| (s, key)));
+                let router = live
                     .as_ref()
-                    .and_then(|k| known.iter().find(|(key, ..)| key == k));
-                let (port, priority, cost) = known
-                    // `LinkSet::stats` and `tree.peers` are both keyed by node
-                    // key, so a link the router has not adopted yet has no port,
-                    // no priority and no cost to report — Go's `conns[conn]`
-                    // lookup misses the same way (`core/api.go:96-103`).
-                    .map(|(_, port, priority, lag)| (*port, *priority, (*lag).max(1) as u64))
-                    .unwrap_or((0, 0, 0));
+                    .and_then(|(_, key)| known.iter().find(|p| p.key == *key));
+                let (port, priority, cost, latency) = router
+                    .map(|p| (p.port, p.priority, p.lag_ms.max(1) as u64, p.latency))
+                    .unwrap_or((0, 0, 0, None));
                 PeerRow {
                     // Go reports the *link* URI, not the operator's: `PeerInfo.URI
                     // = info.uri` (`core/api.go:83`) and that map key went through
@@ -188,16 +206,22 @@ impl Node {
                     // which matters, because it is a secret.
                     uri: link_id(&e.uri),
                     sintf: e.sintf.clone(),
-                    key: e.live,
-                    up: stats.is_some(),
-                    inbound: stats.as_ref().is_some_and(|s| s.inbound),
+                    key: live.as_ref().map(|(_, k)| *k),
+                    up: live.is_some(),
+                    // Go's is the row's link type, not the connection's
+                    // (`api.go:87`), and only while the row has a connection.
+                    inbound: live.is_some() && e.kind == LinkKind::Incoming,
                     port,
                     priority,
                     cost,
-                    up_for: stats.as_ref().map(|s| s.up).unwrap_or_default(),
-                    rx_bytes: stats.as_ref().map(|s| s.rx_bytes).unwrap_or(0),
-                    tx_bytes: stats.as_ref().map(|s| s.tx_bytes).unwrap_or(0),
+                    latency,
+                    up_for: live.as_ref().map(|(s, _)| s.up).unwrap_or_default(),
+                    rx_bytes: live.as_ref().map(|(s, _)| s.rx_bytes).unwrap_or(0),
+                    tx_bytes: live.as_ref().map(|(s, _)| s.tx_bytes).unwrap_or(0),
+                    rx_rate: live.as_ref().map(|(s, _)| s.rx_rate).unwrap_or(0),
+                    tx_rate: live.as_ref().map(|(s, _)| s.tx_rate).unwrap_or(0),
                     last_error: e.last_error.clone(),
+                    err_at: e.err_at,
                 }
             })
             .collect();
@@ -222,6 +246,10 @@ impl Node {
                 self.on_dial(ev).await;
             }
             self.peers.note_liveness(&self.links);
+            // Byte rates are differenced on Go's own 1 s tick (`link.go:106-129`).
+            // The set keeps the phase, so calling this every pass is how a 50 ms
+            // node loop still reports a 1 s measurement.
+            self.links.update_rates();
             self.peers.start_due(Instant::now());
             // A dead link is not a dead node: we keep serving whoever is left.
             // `is_link` is the whole fatality gate (`router::fatal_link_error`).
@@ -279,11 +307,21 @@ impl Node {
                     (None, Ok(())) => {}
                 }
             }
-            Cmd::Accept { mut conn } => {
+            Cmd::Accept { conn, uri } => {
+                let mut conn = conn;
+                // Go's listener goroutine checks the row before it does anything
+                // else with the link, and drops the connection when the row is
+                // busy (`link.go:529-541`).
+                if uri.as_deref().is_some_and(|uri| self.peers.busy(uri)) {
+                    return;
+                }
                 let peer = conn.remote_key;
                 if let Err(e) = self.router.register(&mut conn, peer).await {
                     eprintln!("inbound link dropped: {e}");
                     return;
+                }
+                if let Some(uri) = uri {
+                    self.peers.accept(&uri, &conn);
                 }
                 self.links.add(conn);
             }
@@ -317,7 +355,7 @@ impl Node {
             self.peers.mark_failed(token, &e.to_string());
             return;
         }
-        if self.peers.mark_live(token, peer) {
+        if self.peers.mark_live(token, &conn) {
             self.links.add(conn);
         }
         // Otherwise the peer was dropped while we were dialling, and dropping the

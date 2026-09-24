@@ -198,14 +198,14 @@ pub async fn tls_accept(
     local: &SigningKey,
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tls>, Error> {
-    let (sock, _) = listener.accept().await.map_err(Error::Io)?;
+    let (sock, addr) = listener.accept().await.map_err(Error::Io)?;
     let stream: tokio_rustls::TlsStream<TcpStream> =
         tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(sock))
             .await
             .map_err(|_| Error::Timeout)?
             .map_err(|e| Error::Io(std::io::Error::other(e)))?
             .into();
-    crate::link::complete_accept(stream, local, opts).await
+    crate::link::complete_accept(stream, local, opts, Some(addr.to_string())).await
 }
 
 #[cfg(test)]
