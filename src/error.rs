@@ -30,3 +30,13 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }
+
+impl Error {
+    /// True for the two errors that mean "this link is gone" rather than
+    /// "this node is broken". A node loop keeps running on these and redials;
+    /// Go's per-peer reader just returns and lets `removePeer` clean up
+    /// (`peers.go:228`), which is why one dead link never stops its siblings.
+    pub fn is_link(&self) -> bool {
+        matches!(self, Error::Io(_) | Error::NoLink)
+    }
+}

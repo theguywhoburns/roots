@@ -14,7 +14,7 @@ counts — read this file for the module graph, not that one.
 ## Stack
 
 ```
-  app / demo          client/src/{main,node}.rs · examples/* · tests/*
+  app / demo          client/src/{main,node,links}.rs · examples/* · tests/*
         |             drains Router::inbox / proto_inbox, feeds the outbox Vec,
         |             owns the LinkSet (which owns its own conns), smoltcp
         |             bridges, admin socket, TUN
@@ -71,7 +71,8 @@ Go-origin column is taken from each module's own port header and checked against
 | `address.rs` | key -> IPv6 (`02…` node, `03…` subnet), `lookup_key_for_addr`, prefix scan | `src/address/address.go` |
 | `error.rs` | `Error` enum (thiserror) | — |
 | `main.rs` | *(moved, Slice 3)* now `client/src/main.rs` — demo probe: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil` subset |
-| `client/src/node.rs` | *(the other package)* `run_peer`: dial → register → serve → `?maxbackoff=`-capped redial, the only non-test `Router` builder | `core/links.go` `add` loop |
+| `client/src/node.rs` | *(the other package)* `Cmd` + `Node`: the single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, drains commands between `DEFAULT_TICK` serve slices, is the only non-test `Router` builder | `core` `links` actor + `switch.go` |
+| `client/src/links.rs` | *(the other package)* `Links`: one `Entry` per `(link_id, sintf)` — Go's dedup, `LinkKind::{Persistent,Ephemeral}`, `SupervisedPeer` backoff, last error, dial tasks in/out over `LinkEvent`, `report()` | `core/link.go` `links.add`/`remove` |
 
 ## State ownership
 
@@ -79,7 +80,9 @@ One `Router` per task. There is no `Mutex`, no `RwLock`, no channel and no
 `spawn` in library code (`tokio::spawn` appears only inside `#[cfg(test)]`
 servers; the only `Arc` is the required rustls config handle in
 `tls.rs:80,93`). Concurrency lives entirely in the caller (`client/src/node.rs`,
-`examples/`, the smoltcp bridges).
+`examples/`, the smoltcp bridges) — and since Slice 5 the client keeps its own
+router state the same way: `Node` is one task, so the production client code has
+no lock either, only channels.
 
 - Every table field is `pub(crate)`; `Router` is the only public handle.
   External code cannot reach `TreeState`/`PathState`/… directly.
@@ -188,8 +191,9 @@ better peer; else `dest == our key` → `handle_session_bytes`, where payload by
 
 `src/` talks wire and owns state. It never prints, never opens TUN, never serves
 admin, and never builds a `Router` for a caller. Everything that decides *what to
-do* lives in the `client/` package (`roots-client`: `main.rs`, `node.rs`, and the
-config/admin/TUN/multicast slices to come) or in root `examples/` / `tests/`.
+do* lives in the `client/` package (`roots-client`: `main.rs`, `node.rs`,
+`links.rs`, and the config/admin/TUN/multicast slices to come) or in root
+`examples/` / `tests/`.
 
 Two things enforce it. Crate visibility: `smoltcp`, `serde_json` and `tun` are
 dev-dependencies of the root package only, so the lib target cannot see them.
@@ -203,6 +207,45 @@ The admin adapter (`examples/admin.rs`, yggdrasilctl-compatible) and the TUN
 bridge (`examples/tun_ping.rs`) are demos riding the public query surface; both
 move into `client/src/` in Slices 7 and 14, and only then can their
 dev-dependencies leave the root manifest.
+
+## The client's node loop (Slice 5)
+
+Go runs a `links` actor and a `core` actor behind channels (`yggdrasil-go
+src/core/link.go`, `switch.go`). We collapse that into one task, which is only
+possible because `LinkSet` owns its connections (Slice 4) — a set that borrowed
+`&mut dyn Link` could not be a struct field, and a struct field is what lets one
+task own it.
+
+```
+listener ─┐                                   ┌─ spawn: connect_any(uri) ─┐
+admin    ─┼─ mpsc::UnboundedSender<Cmd> ─→ Node::run ─┤  (touches no router state) │
+multicast─┘        Dial/Drop/Accept/Send/Quit   │                        │
+                                               ← ┴── LinkEvent::Dialed ──┘
+```
+
+`run` is five steps per tick: drain `rx` → drain `events` →
+`peers.note_liveness(&links)` → `peers.start_due(now)` →
+`router.serve(&mut links, Some(tick), &mut outbox)`. `Links` (`client/src/links.rs`)
+is the configured-peer list: one `Entry` per `(link_id, sintf)` carrying kind,
+`SupervisedPeer` backoff, `live` key, `last_error` and the in-flight dial token.
+
+- **Off-task work is dialling only**, and it is safe because connecting plus the
+  `meta` handshake read no router state. The dial task is handed a token and
+  returns a `LinkEvent`; `mark_live` answers false when the entry is gone, and
+  the caller drops the connection — Go's "if a peering has come up in this time,
+  abort this one" (`link.go:366-373`).
+- **Liveness is reconciled, not notified.** `serve` evicts a dead link silently,
+  so `note_liveness` diffs each entry's `live` key against `LinkSet::peers()`
+  once per tick: gone means `record_failure` (and, for an `Ephemeral` entry,
+  deletion — Go's goroutine-exit `delete(l._links, info)`).
+- **`Drop` ≠ disconnect.** `Links::remove` forgets the entry, which cancels the
+  redial and leaves the link serving (`api.go:207-211`). A duplicate `Dial`
+  kicks the entry's backoff and answers `AlreadyConfigured` (`link.go:236-245`);
+  the kick reschedules for the next tick rather than interrupting a sleep.
+- **A `serve` error is not fatal unless `Error::is_link()` says so** — the loop
+  keeps running on a dead link and returns the error for anything else.
+- Command latency is bounded by `tick` (50 ms, `DEFAULT_TICK`), which is the
+  price of the lock-free invariant (Gate 3, least-confident decision 3).
 
 ## Invariants — things that break silently
 
@@ -278,8 +321,24 @@ Lifetime / sequencing:
 - Dead code mirrors Go: `BloomState::dirty` is written and never read; `fix`
   ignores its `peer_key` yet is called per link per tick. Leave both.
 
+Client-side (the single-task rule):
+- **Only `Node::run` touches `Router`/`LinkSet`.** That is what keeps `src/`
+  lock-free, so a listener, admin handler, multicast task or TUN bridge that
+  wants router state must send a `Cmd`, not take a `Mutex`. Dialling is the one
+  exemption, and it earns it by touching no router state.
+- **Redial has exactly one owner.** `Links::start_due` + the loop; `run_peer` and
+  `Client::drive` are deleted, and Gate 3's `serve_until_closed` was deliberately
+  never built because it would be a second policy home.
+  `examples/admin.rs` still runs its own `PeerCfg` loop until Slice 7 moves it
+  onto `Node`.
+- **`link_id` is URI-minus-query, and the dedup key is `(link_id, sintf)`**
+  (`link.go:54-57`, `766-769`). Two URIs that differ only in options are the same
+  peer; two URIs on different source interfaces are not.
+
 ## Resume point
 
-Slices 1–19 are `DONE` in `docs/plans/rust-client/00-status.md`. The only open
-item is the Slice 20+ public-mesh TUN run (needs a TUN host plus a second live
-node; loopback-verified so far) — see `TODO.md`.
+The live plan is `docs/plans/go-client-parity/` — Slices 1–5 DONE 2026-09-24,
+resume from its `00-status.md` (checklist, findings) and `04-slices.md` (proof per
+slice). The earlier `docs/plans/rust-client/` plan is closed: its Slices 1–19 are
+`DONE`, and the only open item there is the Slice 20+ public-mesh TUN run (needs a
+TUN host plus a second live node; loopback-verified so far) — see `TODO.md`.

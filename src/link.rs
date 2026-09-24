@@ -167,6 +167,18 @@ impl AnyConn {
     }
 }
 
+/// The stream box has nothing to print, so this reports what the link *is*:
+/// enough to tell one peer's link from another's in a test failure.
+impl std::fmt::Debug for AnyConn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnyConn")
+            .field("remote_key", &hex::encode(self.remote_key))
+            .field("priority", &self.priority)
+            .field("inbound", &self.inbound)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Link for AnyConn {
     fn priority(&self) -> u8 {
         self.priority

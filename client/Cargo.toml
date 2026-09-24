@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 roots = { path = ".." }
-tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util", "sync"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex = "0.4"

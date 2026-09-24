@@ -1,12 +1,17 @@
 //! Reconnect test (loopback, no internet): the server drops the first link
-//! mid-run; the client must redial with backoff, re-establish the session,
-//! and still deliver its queued payload on the second link.
+//! mid-run; the node must redial with backoff and deliver a payload queued
+//! after the drop on the second link. Driven through `Node` + `Cmd`, which is
+//! the only redial path the client has since Slice 5.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use roots::{Client, Router};
-use roots_client::node::run_peer;
+use roots::{AnyConn, Client, LinkSet, Router};
+use roots_client::node::{Cmd, Node};
 
 #[tokio::test]
 async fn reconnect_delivers_after_drop() {
@@ -18,36 +23,69 @@ async fn reconnect_delivers_after_drop() {
     let addr = listener.local_addr().unwrap();
     let uri = format!("tcp://{addr}?maxbackoff=5s");
 
-    // Server: serve a short first link (forces a client-side drop), then a
-    // long second link, and report what arrived on each.
+    // Server: a short first link (the drop), then a long second one. `served`
+    // tells the test when the first is over, so the payload is only queued while
+    // no link exists at all.
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = served.clone();
+    let server_sk = s_sk.clone();
     let server = tokio::spawn(async move {
         let mut inboxes = Vec::new();
         for hold in [Duration::from_secs(1), Duration::from_secs(10)] {
-            let mut conn = Client::new(s_sk.clone())
+            let mut conn = Client::new(server_sk.clone())
                 .accept(&listener)
                 .await
                 .expect("accept");
             let peer = conn.remote_key;
             assert_eq!(peer, c_pub);
-            let mut router = Router::new(s_sk.clone());
+            let mut router = Router::new(server_sk.clone());
             router.register(&mut conn, peer).await.expect("register");
-            let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+            let mut links = LinkSet::single(AnyConn::new(conn));
             let mut no_out = Vec::new();
             let _ = router.serve(&mut links, Some(hold), &mut no_out).await;
+            counter.fetch_add(1, Ordering::SeqCst);
             inboxes.push(router.inbox);
         }
         inboxes
     });
 
-    let client = Client::new(c_sk);
-    let mut outgoing = vec![(s_pub, b"survives-drop".to_vec())];
-    run_peer(&client, &uri, &mut outgoing, Some(2))
+    let (mut node, tx) = Node::new(c_sk);
+    let handle = tokio::spawn(async move { node.run().await });
+    tx.send(Cmd::Dial {
+        uri,
+        sintf: String::new(),
+        persistent: true,
+    })
+    .unwrap();
+
+    let end = std::time::Instant::now() + Duration::from_secs(15);
+    while served.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < end {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        served.load(Ordering::SeqCst) > 0,
+        "the first link came up and was dropped"
+    );
+    tx.send(Cmd::Send {
+        dest: s_pub,
+        bytes: b"survives-drop".to_vec(),
+    })
+    .unwrap();
+
+    let inboxes = tokio::time::timeout(Duration::from_secs(25), server)
         .await
-        .expect("two served links");
-    let inboxes = server.await.unwrap();
+        .expect("the server finishes both links")
+        .expect("no panic in the server task");
     assert_eq!(inboxes.len(), 2);
     let got_second = inboxes[1]
         .iter()
         .any(|(from, msg)| *from == c_pub && msg == b"survives-drop");
     assert!(got_second, "payload delivered after reconnect");
+
+    tx.send(Cmd::Quit).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the node loop exits on Quit")
+        .expect("no panic in the node task")
+        .expect("the node loop ends cleanly");
 }

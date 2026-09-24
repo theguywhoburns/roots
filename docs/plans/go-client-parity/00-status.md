@@ -28,7 +28,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 2 — capture harness + first Go `meta` bytes (12/22 → 14/22) — DONE 2026-09-24, `examples/go_capture.rs` + `tests/go_vectors.rs` (3 tests), `docs/protocol/10-envelope.md` + `20-handshake.md`
 - [x] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client` — DONE 2026-09-24, `client/` member (`roots-client`, bin `roots`), `client/src/node.rs`, `client/tests/reconnect.rs`; the lib builds no `Router` outside `#[cfg(test)]`
 - [x] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert — DONE 2026-09-24, see the "Done 2026-09-24" block under Slice 4 in `04-slices.md` for the mutation-attribution table
-- [ ] Slice 5 — one-task node loop + `link_id` dedup command queue
+- [x] Slice 5 — one-task node loop + `link_id` dedup command queue — DONE 2026-09-24, `client/src/links.rs` + `client/src/node.rs` (`Cmd`/`Node::run`), `client/tests/node_loop.rs`; `run_peer` deleted, `reconnect.rs` moved onto `Node`; mutation table in `04-slices.md`
 - [ ] Slice 6 — Go-shaped config (proven by Go's own binary parsing it)
 - [ ] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings
 - [ ] Slice 8 — `getPeers` content parity: three sort modes + full field set
@@ -207,4 +207,22 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     `Transport::Stream: 'static` is required so `AnyConn` can own it.
   - CI trio green at 81 unit + 6 integration tests (~14 s): `cargo fmt --check`,
     `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+    `cargo test --workspace --locked`.
+- **Slice 5 findings — the loop is the only policy home now, and later slices
+  must use it.**
+  - `client/src/node.rs` owns `Router` + `LinkSet` + the mailbox; `client/src/links.rs`
+    owns peer configuration, dedup, backoff and the last error. **Slice 7's admin
+    socket must not touch either directly** — it sends `Cmd`s and reads
+    `Node::peers().report()`. That is what "no `Mutex` in `src/`" buys, and it is
+    the shape the mutation table above pins.
+  - Dialling is the one piece of node work that runs off-task, and it is safe
+    precisely because `connect_any` + the `meta` handshake touch no router state.
+    Anything new that must touch router state goes through `Cmd`, not a task.
+  - Liveness is reconciled by diffing entry `live` keys against
+    `LinkSet::peers()` once per tick. `serve` evicting silently (Slice 4) is what
+    makes a dead link become a redial, so the two slices are load-bearing for
+    each other: do not add a link-death callback to the library to "make this
+    explicit".
+  - CI trio green at 88 unit + 7 integration tests (~31 s wall): `cargo fmt
+    --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
     `cargo test --workspace --locked`.

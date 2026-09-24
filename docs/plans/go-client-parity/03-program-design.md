@@ -319,6 +319,38 @@ enum SortBy { Default, Uptime, Cost }              // getpeers.go:68-76
 fn sort_peers(entries: &mut Vec<PeerEntry>, by: SortBy);   // stable, Go's three comparators
 ```
 
+### Slice 5 corrections (recorded at implementation, 2026-09-24)
+
+- **`Cmd::Accept` carries the link**: `Accept { conn: AnyConn }`. The sketched
+  `Accept { }` has no way to hand a handshake'd connection to the loop, and
+  there is nothing to look it up from — the listener is not the node's.
+- **`Cmd::Packet { dest: Ipv6Addr }` deferred to Slice 12** (it is the TUN
+  command, and `send_or_resolve` is its dependency). In its place the loop gained
+  `Cmd::Send { dest: [u8; KEY_LEN], bytes }`, because the slice's own proof needs
+  a node that can put a payload on a session and no keyed form existed. Slice 12
+  adds the address-keyed variant alongside it, not instead.
+- **`Cmd::Dial` gained `sintf`** (`Dial { uri, sintf, persistent }`). The dedup
+  key Go validates on is `(link_id, sintf)` (`link.go:54-57`); a URI-only dial
+  cannot express the interface-peer case multicast dials into, and `Drop` already
+  had `sintf`.
+- **No `serve_until_closed`.** The sketch kept it as the redial driver inherited
+  from `Client::run_peer`; `Links::start_due` + the node loop now own redial
+  outright, so the helper would be a second policy home. `run_peer` and `drive`
+  stay deleted, and `tests/reconnect.rs` was rewritten onto `Node` — there is
+  exactly one redial path in the tree.
+- **`Node` fields beyond the sketch**: `peers: Links`, `events` (the dial-task
+  callback receiver), `quit`. `Node::with_tick` added so a test can shrink the
+  slice; `new`/`sender` unchanged.
+- **`link_id` lives in `client/src/links.rs`, not `src/multicast.rs`.** The
+  library file table listed it there, but the same section says multicast's
+  `receive` deliberately does not dedup and "the client reproduces that:
+  `links.rs` holds `HashMap<(link_id, sintf), …>`". Dedup is link-manager
+  bookkeeping, so its key function sits with it. Slice 10 constructs dial URIs
+  and never needs to strip a query.
+- **`Error::is_link()`** is a library addition the file table did not list. The
+  loop needs Go's "link gone" vs "node broken" split (`peers.go:228`) without
+  matching on `Error`'s variants from outside the crate.
+
 ## Call stack
 
 **Startup** (`client/src/main.rs`): `config::load` → `Node::new` → spawn listeners

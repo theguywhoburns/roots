@@ -91,7 +91,7 @@ Three ordering rules that are not obvious from the list:
       on clippy and test (from a non-virtual root cargo otherwise skips the
       client), and `cargo run` needs `-p roots-client`.
 
-- [ ] **Slice 4 — `LinkSet` owns its links; sends say whether they landed.**
+- [x] **Slice 4 — `LinkSet` owns its links; sends say whether they landed.**
       The lifetime parameter goes away (entries hold `AnyConn`), `inbound` moves
       onto `AnyConn` from `complete_dial`/`complete_accept`, per-link `up`/`rx`/
       `tx` appear, every set-level read goes through `LinkSet::read_frame`, and
@@ -140,7 +140,7 @@ Three ordering rules that are not obvious from the list:
         `pub(crate)` so a fixture can drive them; counters are wire bytes
         (`frame::wire_len`) in both directions.
 
-- [ ] **Slice 5 — one task, one `Router`, a command queue.** `client/src/links.rs`
+- [x] **Slice 5 — one task, one `Router`, a command queue.** `client/src/links.rs`
       (`link_id` dedup exactly as Go's `links.add` — duplicate returns
       `AlreadyConfigured` after kicking the live link) and `Node::run` draining
       `Cmd::{Dial,Drop,Accept,Packet,Quit}` between 50 ms serve slices. Listeners,
@@ -150,6 +150,38 @@ Three ordering rules that are not obvious from the list:
       peers over `Cmd`, waits for convergence, then `Drop`s one and asserts the
       other survived — the shape every later client feature needs, without a
       single `Mutex` in `src/`.
+      **Done 2026-09-24:** `client/tests/node_loop.rs` (5.5 s, loopback) holds all
+      four claims; `client/src/links.rs` adds 7 unit tests for the parts a live
+      loop cannot reach (bad URI, stale dial token, ephemeral forget, kick).
+      `run_peer` is gone and `tests/reconnect.rs` now drives the same `Node`, so
+      there is exactly one redial path in the tree. The CI trio is green
+      (88 unit + 7 integration, ~31 s). Each behaviour was reverted one at a time
+      to name what fails:
+
+      | Reverted behaviour | Killed by (all in `node_loop`) |
+      |---|---|
+      | `link_id` dedup — a duplicate stacks a second dial (`link.go:236-245`) | `assertion failed: the duplicate dial never connected` (`accepted` 2 ≠ 1) |
+      | `Drop` keeps the link that is already up (`api.go:207-211`) | `timed out after 15s waiting for the dropped peer's live link still carries traffic` |
+      | `Drop` cancels the redial loop | `assertion failed: a dropped peer must not be dialled again` (`accepted` 2 ≠ 1) |
+      | a dead link is survivable, not fatal | `the node loop ends cleanly: Io(UnexpectedEof)` |
+
+      - **The single-task invariant is kept by moving only the dial off-task.**
+        `Links::start_due` spawns `client.connect_any(&uri)` — connecting and the
+        `meta` handshake touch no router state — and the task reports back over a
+        package-private `LinkEvent` channel with the token it was given. A result
+        whose token matches no entry is dropped, which is Go's "if a peering has
+        come up in this time, abort this one" (`link.go:366-373`).
+      - **Liveness is a diff, not a callback.** `serve` evicts a dead link
+        silently (Slice 4), so `note_liveness` compares each entry's `live` key
+        against `LinkSet::peers()` once per tick: a vanished link becomes a
+        backoff bump and, for an ephemeral entry, deletion — Go's goroutine-exit
+        `delete(l._links, info)`.
+      - **Kick timing is a deviation, recorded in Gate 3:** a duplicate dials
+        again on the next tick instead of interrupting a backoff sleep, which
+        saves one channel per entry and costs at most 50 ms.
+      - `Error::is_link()` (library) is the one API addition: the node loop needs
+        Go's "link gone" vs "node broken" split without reaching into the
+        `Error` enum's variants.
 
 - [ ] **Slice 6 — config that Go accepts.** `client/src/config.rs`: the
       Go-shaped `Config` struct with Go's JSON key names, `defaults()`
