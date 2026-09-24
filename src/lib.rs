@@ -39,7 +39,7 @@ pub use link::{
 pub use peer::{PeerKind, feat};
 pub use quic::Quic;
 pub use router::Router;
-pub use supervisor::{SupervisedPeer, backoff_cap, due_indices};
+pub use supervisor::{SupervisedPeer, backoff_cap};
 pub use tls::Tls;
 pub use traits::Snapshot;
 pub use ws::{Ws, Wss};

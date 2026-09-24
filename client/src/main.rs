@@ -1,18 +1,23 @@
 //! The `roots` binary. Config mode first — Go's document flags, in Go's
-//! precedence order — then the demo probe: dial one peer, converge, optionally
-//! resolve an address and fetch its nodeinfo, hold the link, report status.
+//! precedence order — and a loaded config runs a node, as Go's does. Without a
+//! config it is the demo probe: dial one peer, converge, optionally resolve an
+//! address and fetch its nodeinfo, hold the link, report status.
 //!
 //! Node policy lives in this package (`roots_client::node`); the `roots`
 //! library only talks wires and owns state.
 //!
-//! Run: `roots -genconf` / `roots -useconf -address` for the config face, and
+//! Run: `roots -genconf` / `roots -useconf -address` for the config face,
+//! `roots -useconffile /etc/yggdrasil.conf` for a node, and
 //! `cargo run -q -p roots-client -- [peer-uri] [hold_secs] [resolve-ipv6]` for
 //! the probe.
 
 use std::time::Duration;
 
-use roots::{Client, Router, addr_for_key};
+use roots::{Client, Router, addr_for_key, subnet_for_key};
+use roots_client::admin::{bind_admin, serve_admin};
 use roots_client::config::{Config, ConfigError, Flags, USAGE};
+use roots_client::listen::spawn_listeners;
+use roots_client::node::{Cmd, DEFAULT_TICK, Node};
 
 fn show(tag: &str, key: &[u8; 32]) {
     println!("{tag:<8} {} {}", hex::encode(key), addr_for_key(key));
@@ -87,6 +92,75 @@ fn config_stage(flags: &Flags) -> Option<Config> {
         }
     }
     Some(cfg)
+}
+
+/// Go's `node.Start` order, as far as this build has the parts: identity, admin
+/// socket, listeners, persistent dials, then the one task that owns the router.
+/// Multicast and the TUN arrive with their own slices, so a config that asks for
+/// them gets a node that simply does not do those things yet.
+async fn boot(cfg: Config) {
+    let (key, opts) = match (cfg.signing_key(), cfg.link_options()) {
+        (Ok(key), Ok(opts)) => (key, opts),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let (mut node, tx) = Node::from_client(
+        roots::Client::with_options(key.clone(), opts.clone()),
+        DEFAULT_TICK,
+    );
+    // Go's three startup lines, on stderr like its logger (`main.go:228-231`).
+    let pubkey = key.verifying_key().to_bytes();
+    eprintln!("Your public key is {}", hex::encode(pubkey));
+    eprintln!("Your IPv6 address is {}", addr_for_key(&pubkey));
+    eprintln!("Your IPv6 subnet is {}", subnet_for_key(&pubkey));
+
+    match bind_admin(&cfg.admin_listen).await {
+        Ok(Some(bound)) => {
+            eprintln!(
+                "{} admin socket listening on {}",
+                bound.network(),
+                bound.addr()
+            );
+            tokio::spawn(serve_admin(bound, tx.clone()));
+        }
+        Ok(None) => {}
+        // Go's `os.Exit(1)` from here (`admin.go:134-136`).
+        Err(e) => {
+            eprintln!("Admin socket failed to listen: {e}");
+            std::process::exit(1);
+        }
+    }
+
+    if let Err(e) = spawn_listeners(&key, &opts, &cfg.listen, &tx).await {
+        eprintln!("listener: {e}");
+        std::process::exit(1);
+    }
+
+    for uri in &cfg.peers {
+        let _ = tx.send(Cmd::Dial {
+            uri: uri.clone(),
+            sintf: String::new(),
+            persistent: true,
+            respond: None,
+        });
+    }
+    for (sintf, uris) in &cfg.interface_peers {
+        for uri in uris {
+            let _ = tx.send(Cmd::Dial {
+                uri: uri.clone(),
+                sintf: sintf.clone(),
+                persistent: true,
+                respond: None,
+            });
+        }
+    }
+
+    if let Err(e) = node.run().await {
+        eprintln!("node: {e}");
+        std::process::exit(1);
+    }
 }
 
 async fn run(
@@ -179,23 +253,8 @@ async fn main() {
         return;
     }
     if let Some(cfg) = config_stage(&flags) {
-        // Go runs a node from here. We do not yet — that is Slice 7 — and
-        // falling through to the probe would dial out with an identity the
-        // operator only asked us to read. Report what the config says instead.
-        let allowed = match cfg.link_options() {
-            Ok(opts) if opts.allowed_keys.is_empty() => "no inbound allowlist".to_string(),
-            Ok(opts) => format!("{} inbound key(s) allowed", opts.allowed_keys.len()),
-            Err(e) => format!("unusable AllowedPublicKeys: {e}"),
-        };
-        let address = match cfg.address() {
-            Ok(addr) => addr.to_string(),
-            Err(e) => format!("<{e}>"),
-        };
-        eprintln!(
-            "config loaded for address {address} ({allowed}); running a node from a config \
-             is not implemented yet"
-        );
-        std::process::exit(2);
+        boot(cfg).await;
+        return;
     }
 
     let mut positional = flags.positionals.iter();

@@ -18,8 +18,12 @@ use crate::tree::TreeState;
 
 /// Router maintenance tick (Go: 1s).
 pub const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
-/// Unknown-link latency sentinel (Go: `routerUnknownLatency`).
-pub const UNKNOWN_LATENCY: Duration = Duration::from_millis(u32::MAX as u64);
+/// Unknown-link latency sentinel. Go's is `time.Duration(^uint32(0))`
+/// (`router.go:39`) — that is 4294967295 **nanoseconds**, about 4.29 ms, which
+/// `_getCost` turns into a cost of 4: a mild penalty that keeps a brand-new link
+/// from winning a tie, not a wall. Reading it as milliseconds instead made the
+/// penalty 10⁶ times too large.
+pub const UNKNOWN_LATENCY: Duration = Duration::from_nanos(u32::MAX as u64);
 
 /// Spanning-tree router: composes per-algorithm tables (tree, paths, blooms,
 /// sessions, proto) and drives them link by link through a [`LinkSet`]

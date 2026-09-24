@@ -186,8 +186,8 @@ impl Links {
 
     /// Start every dial that is due: not live, not already in flight, past its
     /// backoff. `SupervisedPeer::due`'s own live-URI gate is asked with an empty
-    /// list because the entry carries that state here — the URI-list form is what
-    /// `examples/admin.rs`, which has no per-entry liveness, needs.
+    /// list because the entry carries that state here — the URI-list form is for
+    /// a caller that tracks liveness somewhere other than the peer record.
     pub fn start_due(&mut self, now: Instant) {
         for at in 0..self.entries.len() {
             if self.entries[at].live.is_some()
@@ -283,22 +283,6 @@ impl Links {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    /// One row per configured peer — `uri`, `sintf`, up-or-down, last error —
-    /// which is what Go's `getPeers` puts in `peers[]` and `getSelf` in `lists`.
-    pub fn report(&self) -> Vec<(String, String, bool, Option<String>)> {
-        self.entries
-            .iter()
-            .map(|e| {
-                (
-                    e.uri.clone(),
-                    e.sintf.clone(),
-                    e.live.is_some(),
-                    e.last_error.clone(),
-                )
-            })
-            .collect()
     }
 }
 
@@ -397,8 +381,8 @@ mod tests {
             m.entries[0].last_error.as_deref(),
             Some("connection refused")
         );
-        assert_eq!(m.report()[0].1, "");
-        assert!(!m.report()[0].2, "reported down");
+        assert_eq!(m.entries[0].sintf, "");
+        assert_eq!(m.entries[0].live, None, "reported down");
         assert_eq!(
             m.entries[0].dialing, None,
             "the attempt is over, so the next one is gated only by the backoff"

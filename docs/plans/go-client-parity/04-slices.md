@@ -229,7 +229,7 @@ Three ordering rules that are not obvious from the list:
       | `PrivateKeyPath` overrides the inline key (`config.go:130-135`) | `private_key_path_overrides_the_inline_key:666` |
       | `-useconf` beats `-useconffile` (`main.go:105-118`) | `config_flags_parse_like_gos_flag_package:695` |
 
-- [ ] **Slice 7 — admin framing parity (tcp + unix, keepalive, error text).**
+- [x] **Slice 7 — admin framing parity (tcp + unix, keepalive, error text).**
       `serve_admin` dispatches on scheme like Go (`unix:///…` is Go's Linux
       default, which is how we were wrong to be TCP-only), decodes a stream of
       JSON values, honours `keepalive`, echoes the whole request struct back
@@ -238,12 +238,172 @@ Three ordering rules that are not obvious from the list:
       socket answers `list` and `getSelf` over both transports; plus
       `admin_keepalive_honours_second_request` and
       `admin_unix_socket_matches_tcp`.
+      **Done 2026-09-24:** `client/src/admin.rs` (the socket),
+      `client/src/listen.rs` (Go's `StartupListeners`), `client/src/main.rs`
+      `boot()` (a node started from a config, so the socket answers about a real
+      running node rather than about an example), `client/tests/admin_loopback.rs`
+      (6 tests, 0.31 s), and `examples/admin.rs` deleted — 643 lines of
+      hand-rolled adapter replaced by the node's own socket. The CI trio is
+      green (98 unit + 16 integration, ~40 s).
+
+      **The proof bar, run for real.** The script is in the repo, so the claim is
+      re-runnable and not a screenshot:
+      `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/7-admin.sh`.
+      Two Go 0.5.14 nodes and two of ours share one private netns (the namespace
+      is not decoration — a Go node panics unless it may create a TUN, and `lo`
+      starts *down* in a fresh netns, so the script raises it), all four holding
+      the *same* `PrivateKey` — the throwaway fixture already committed in
+      `client/src/config.rs`, whose address is `201:c6de:e01b:c88a:…` — so
+      `getSelf` is comparable byte for byte. Note the flag:
+      `yggdrasilctl -endpoint=tcp://…` — there is no `-admin_socket`, and with no
+      `-endpoint` it silently reads the platform default config file and talks to
+      the host's service node instead.
+      `list getSelf getPeers getTree getPaths getSessions` in `-json` mode
+      against `tcp://127.0.0.1:19001` (Go) vs `tcp://127.0.0.1:19101` (ours) and
+      `unix:///…/go.sock` vs `unix:///…/ours.sock`, every request following one
+      `addPeer uri=tcp://127.0.0.1:1234` that cannot possibly connect:
+
+      | Command | Go vs ours, tcp | ours, tcp vs ours, unix |
+      |---|---|---|
+      | `getPaths` | **byte-identical** | identical |
+      | `getSessions` | **byte-identical** | identical |
+      | `getTree` | `[]` vs Go's one self-entry (`sequence: 1`) | identical |
+      | `getSelf` | only `build_name`/`build_version` and `routing_entries` 1 vs 0 | identical |
+      | `getPeers` | row order and every value agree; we omit `last_error_time` and our `last_error` text is ours | identical |
+      | `list` | 8 commands vs Go's 14 — the 6 absent ones are Slice 9/11/14's | identical |
+
+      Then the script's last section runs `yggdrasilctl` in its **default table
+      mode** against our node
+      — the stronger test, because it decodes the reply into
+      Go's own structs and prints an empty cell rather than an error when a field
+      name is wrong. `getSelf` fills all six rows, `getPeers` renders
+      `State=Down Dir=Out Cost=0` and `Last Error=0s ago: io: Connection refused
+      (os error 111)` (the `0s ago` is our missing `last_error_time`, visible),
+      `list` shows the `Arguments` column (`uri=…, interface=…`, `sort=…`), and
+      `addPeer uri=…` through the real client configures the peer.
+
+      Each behaviour was reverted one at a time to name what fails (18 reverts,
+      all in `admin_loopback` unless noted):
+
+      | Reverted behaviour | Killed by |
+      |---|---|
+      | unix socket mode `0660` (`admin.go:117-120`, `os.Chmod`) | `admin_unix_socket_matches_tcp` |
+      | compact instead of `SetIndent("", "  ")` writer | `admin_error_strings_match_go` |
+      | a body routed through `serde_json::Value` | `admin_body_field_order_matches_go` |
+      | `break` unconditionally after one reply | `admin_keepalive_honours_second_request` |
+      | never `break` (the other direction) | `admin_keepalive_honours_second_request` |
+      | drop the `arguments: {}` preset on decode | `admin_error_strings_match_go` |
+      | echo the action name lowercased | `admin_error_strings_match_go` |
+      | reword `failed to find request` | `admin_error_strings_match_go` |
+      | `#[serde(skip)] response` (drop the field) | 5 of the 6 tests |
+      | `Body::Null` serialising as `0` | `admin_error_strings_match_go` |
+      | `links.add` skipping `parse_link_uri` | `admin_error_strings_match_go` |
+      | `AlreadyConfigured` returning `Ok(())` | `admin_error_strings_match_go` |
+      | `getPeers` reporting the operator's URI instead of `link_id(uri)` | `admin_getpeers_reports_the_link_uri_not_the_operators` — `left: String("tcp://127.0.0.1:43102?password=s3cr3t")` |
+      | `decode_args` matching on a name no command has (validates nothing) | `admin_argument_types_match_go` |
+      | …refusing `"arguments": null` | the same test, at the null-echo assertion |
+      | …skipping the per-field string check | the same test, at `GetPeersRequest.sort` |
+      | …validating `list`'s arguments too | the same test, at the `list`-with-junk case |
+      | …dispatching *before* validating (same messages, wrong order) | the same test, at `a request refused for its argument types still added a peer` |
+
+      - **Field order was the bug this slice existed to catch, and the unit
+        tests missed it.** `serde_json::Map` is a `BTreeMap` (the
+        `preserve_order` feature is off on purpose), so every body built with
+        `json!` came out alphabetically sorted — `address` before `build_name`.
+        Go's `json.RawMessage` keeps struct order, so the only shape that works
+        here is a `struct` per body. The live byte diff found it; the
+        mutation-proof test (`admin_body_field_order_matches_go`) keeps it fixed.
+      - **`Box<dyn Serialize>` — the Gate 3 sketch — does not compile.**
+        `Serialize::serialize` is generic over the serializer, so the trait is
+        not object-safe (E0038, 31 times). `erased_serde` is not a dependency and
+        `serde_json::RawValue` is the wrong tool twice over: `raw_value` is an
+        opt-in feature, and `Formatter::write_raw_fragment`
+        (`serde_json-1.0.151/src/ser.rs:1929`) has only a default impl that
+        writes bytes verbatim, so a raw body inside `to_vec_pretty` is never
+        re-indented while Go's `json.Indent` re-indents nested raw JSON. The
+        erasure is a closed `enum Body` with a hand-written `Serialize` that
+        delegates each arm, which keeps Go's order and needs no new dependency.
+      - **There is deliberately no Go *admin* vector file.** A captured Go
+        `meta` frame is a byte string that must be reproduced exactly; an admin
+        reply is text whose whole content is *this node's* state — its key, its
+        tree, its peers — so a golden transcript would pin the state, not the
+        framing. The framing is instead pinned by (a) the six tests above,
+        (b) `docs/protocol/21-admin.md`, written from the transcript this slice
+        captured, and (c) the diff command in the table above, which any session
+        with the installed binaries can re-run.
+      - **Arguments are decoded before the command runs, and we were skipping
+        that step.** Go's handler wrapper unmarshals `arguments` into the
+        command's own request struct and returns the failure verbatim
+        (`admin.go:162-169`), so `{"request":"getSelf","arguments":"notanobject"}`
+        is `json: cannot unmarshal string into Go value of type
+        admin.GetSelfRequest` and `{"uri":123}` on `addPeer` is refused *before*
+        the link layer is reached. We handed `arguments` to each command and let
+        each one ignore what it did not read, so all five of those requests
+        succeeded. `decode_args` is now the gate, with Go's two message shapes
+        (the `admin.` prefix on one, its absence on the other, the **JSON tag**
+        naming the field on the second) and three accepted shapes: `null`
+        (a no-op in Go, echoed as `null` rather than the `{}` preset), unknown
+        keys, and anything at all for `list`, whose handler discards its input.
+        Found by the raw byte diff; pinned by `admin_argument_types_match_go`.
+      - **Our `getPeers` cannot show an accepted link, and the reason is
+        structural.** `docs/plans/go-client-parity/proof/7-admin-inbound.sh`
+        dials one way, then the other, and prints both sides:
+        Go lists a link it accepted (`remote` rewritten to the peer's socket
+        address, `link.go:519-525`, so `tcp://127.0.0.1:37336`) while ours is
+        `{"peers": []}` — our rows come from the configured peer list, and a link
+        that arrived was never in it. Worse, when *both* directions are up our one
+        row reports the accepted link's `inbound: true` against the dial's URI,
+        because `LinkSet` keys by node public key and the second link replaces the
+        first. Both are recorded for Slice 8 with this script as the tripwire.
+      - **Keepalive survives errors.** Go's loop breaks on `!req.KeepAlive` and
+        nothing else (`admin.go:354`), so a failed request on a keepalive
+        connection gets its error reply and the connection stays open. Ours
+        matches, which is why `admin_error_strings_match_go` runs five kept-alive
+        requests — four of them errors — down one connection after checking six
+        one-request connections.
+      - `Cmd::Report` + `Node::snapshot()` replaced `Links::report()`: the socket
+        asks the node task for a `Snapshot` (key, routing-entry count, tree,
+        paths, sessions, one `PeerRow` per link) instead of the library keeping a
+        second view of the same state.
+      - **`getTree`/`getSelf`'s self-entry is a router gap, not a framing gap.**
+        Go seeds its tree with its own key (`parent` = self, `sequence` 1), so
+        `routing_entries` is 1 before any peer arrives; ours is empty until
+        somebody announces. Recorded for Slice 8, whose subject is exactly what
+        these bodies say. Once a link *is* up the two agree: in the inbound
+        experiment both nodes answer `routing_entries: 2` and the same two
+        `getTree` rows in the same key order, so the gap is only the
+        no-peer-at-all case.
+      - Known gaps, none of them framing: `getPeers` omits `latency` (raw SigReq
+        round trip — Slice 8), `rate_recvd`/`rate_sent`, `last_error_time`, and
+        lists only configured dials (the accepted-link bullet above);
+        `getSessions` omits `bytes_recvd`/`bytes_sent`/`uptime`; `getPeers`'
+        `sort` value is read but ignored, though its *type* is now checked
+        (Slice 8); the echoed `arguments` is re-sorted where Go's `RawMessage`
+        preserves the wire order; our `last_error` text and startup logging are
+        worded differently from Go's.
+      - **Every `admin.go` line cite in the slice's code, tests and docs was
+        re-checked against the submodule** (`reference/yggdrasil-go` at
+        `422836e`) and four had drifted or pointed at the wrong statement: the
+        `os.Chmod` guard is `:117-120` (was `:212`), the unknown-action lookup is
+        `:334-336` (was `:341-348`), the `keepalive` break is `:354` (was `:357`),
+        and the bind-failure `os.Exit(1)` is `:130-132` (was `:132-134`, which is
+        the *log line*). Worth the ten minutes: a wrong cite in a doc whose whole
+        job is citing bytes is worse than no cite.
 
 - [ ] **Slice 8 — `getPeers` says what Go says.** `sort` argument with Go's
       three stable orderings, and the full `PeerEntry` field set fed by Slice 4:
       `up`, `inbound`, `cost` (via `peer_cost`, Go's floor-at-1 millisecond
       number), `uptime`, `bytes_recvd`/`bytes_sent`, `rate_recvd`/`rate_sent`,
-      `latency`, `last_error`/`last_error_time`.
+      `latency`, `last_error`/`last_error_time`. Plus the **row set**, which
+      Slice 7 pinned and could not fix: a link we *accept* gets no row today
+      because our rows come from the configured peer list, while Go inserts
+      accepted links into `_links` and names the row by the peer's socket
+      address (`link.go:519-525`, `536-565`) — and with both directions to one
+      node up, our single row reports the accepted link's `inbound` against the
+      dial's URI, because `LinkSet` keys by public key. The fix has a library
+      half (a set that holds two links to one key, or per-link direction) and a
+      client half (rows from links, not from config).
+      Tripwire: `proof/7-admin-inbound.sh`.
       *Proves:* the three sort modes each order a crafted 3-link fixture
       differently, and a live `yggdrasilctl getPeers` against a real node lists
       fields side by side with Go's output on the same page of docs.

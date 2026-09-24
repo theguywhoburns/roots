@@ -3,8 +3,9 @@
 Current-state map of the whole crate: all 21 files in `src/` (the `roots`
 library), how they own state, how a packet crosses them, and which invariants
 break interop if edited loose. Node policy — the binary, the redial loop, and
-from Slice 5 on the config/admin/TUN/multicast halves — lives in the sibling
-`client/` package (`roots-client`), which this map covers only at its seam.
+since Slices 5–7 the node loop, config, listeners and admin socket — lives in the
+sibling `client/` package (`roots-client`), which this map covers at its seam:
+what may cross the `Cmd` boundary and what may not.
 
 Relationship to gate docs: `01`–`04` are frozen approval records. `00-status.md`
 is the slice checklist and resume point. `02-architecture.md` describes Slice 1–2
@@ -14,7 +15,7 @@ counts — read this file for the module graph, not that one.
 ## Stack
 
 ```
-  app / demo          client/src/{main,node,links}.rs · examples/* · tests/*
+  app / demo          client/src/{main,node,links,listen,admin}.rs · examples/* · tests/*
         |             drains Router::inbox / proto_inbox, feeds the outbox Vec,
         |             owns the LinkSet (which owns its own conns), smoltcp
         |             bridges, admin socket, TUN
@@ -61,7 +62,7 @@ Go-origin column is taken from each module's own port header and checked against
 | `proto.rs` | `ProtoState`: nodeinfo advertisement, proto channel over `typeSessionProto` | admin/debug subset |
 | `traffic.rs` | `Traffic` header codec (path + from + source + dest + watermark + payload) and inbound forwarding decision | `ironwood/network/traffic.go` |
 | `peer.rs` | `PeerKind` (Go vs roots via vendor TLV), `feat` constants, `PeerState` | `meta` vendor fields |
-| `supervisor.rs` | persistent redial: `SupervisedPeer`, `due_indices`, `backoff_cap` | `core` peer monitor |
+| `supervisor.rs` | persistent redial policy data: `SupervisedPeer` (`due`/`record_success`/`record_failure`), `backoff_cap` | `core` peer monitor |
 | `link.rs` | `Transport`/`Link` traits, `AnyConn`, the **owning** `LinkSet` (`write` hard / `write_via` soft / `stats` / `idle_for`, retirement on write failure), `complete_dial`/`complete_accept`/`dial_any`, URI parsing, backoff, `meta` handshake drive | `src/core` |
 | `tls.rs` | `Tls` transport (`tls://`), rustls/ring NoVerify, rcgen listener cert | `src/core/link_tls.go` |
 | `ws.rs` | `Ws`/`Wss` transports, `ygg-ws` subprotocol, message-per-flush | `src/core/link_ws.go` |
@@ -70,9 +71,11 @@ Go-origin column is taken from each module's own port header and checked against
 | `handshake.rs` | `meta` TLV codec + signature, `Meta` struct, version gate | `src/core/version.go` |
 | `address.rs` | key -> IPv6 (`02…` node, `03…` subnet), `lookup_key_for_addr`, prefix scan | `src/address/address.go` |
 | `error.rs` | `Error` enum (thiserror) | — |
-| `main.rs` | *(moved, Slice 3)* now `client/src/main.rs` — Go-shaped flag front end (`-genconf`/`-useconf`/`-useconffile` + `-address`/`-subnet`/`-publickey`, Go's `flag` rejection wording), then the demo probe: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil/main.go` |
-| `client/src/node.rs` | *(the other package)* `Cmd` + `Node`: the single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, drains commands between `DEFAULT_TICK` serve slices, is the only non-test `Router` builder | `core` `links` actor + `switch.go` |
-| `client/src/links.rs` | *(the other package)* `Links`: one `Entry` per `(link_id, sintf)` — Go's dedup, `LinkKind::{Persistent,Ephemeral}`, `SupervisedPeer` backoff, last error, dial tasks in/out over `LinkEvent`, `report()` | `core/link.go` `links.add`/`remove` |
+| `client/src/main.rs` | *(the other package)* Go-shaped flag front end (`-genconf`/`-useconf`/`-useconffile` + `-address`/`-subnet`/`-publickey`, Go's `flag` rejection wording, undefined flag = exit 2), the demo probe (dial by scheme, hold, `ROOTS_DBG_DUMP`), and `boot()`: identity lines → admin socket → listeners → persistent dials → `Node::run` | `cmd/yggdrasil/main.go` |
+| `client/src/node.rs` | *(the other package)* `Cmd` + `Node`: the single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, drains commands between `DEFAULT_TICK` serve slices, is the only non-test `Router` builder; `Cmd::Report` answers with the `Snapshot` (plus `PeerRow`) the admin socket renders | `core` `links` actor + `switch.go` |
+| `client/src/links.rs` | *(the other package)* `Links`: one `Entry` per `(link_id, sintf)` — Go's dedup, `LinkKind::{Persistent,Ephemeral}`, `SupervisedPeer` backoff, last error, dial tasks in/out over `LinkEvent` | `core/link.go` `links.add`/`remove` |
+| `client/src/listen.rs` | *(the other package, Slice 7)* `spawn_listeners`: bind every `Listen` URI in all five schemes and run one accept loop each, reporting handshaked links as `Cmd::Accept`; binding fails the startup, a failed handshake does not | `core/link.go` `StartupListeners` + `link.go:503-540` |
+| `client/src/admin.rs` | *(the other package, Slice 7)* Go's admin framing: `bind_admin` (`""`/`none` off, `unix://` probe + rebind + `0660`, `tcp://` and bare `host:port`), `serve_admin`/`admin_conn` (a JSON value stream, one reply per request, `keepalive` decides whether the loop runs again, the request echoed back), Go's four protocol error strings and eight commands, every body a `struct` behind `enum Body` so field order survives | `src/admin/admin.go` + `src/admin/*.go` |
 | `client/src/config.rs` | *(the other package, Slice 6)* `Config` with Go's `NodeConfig` key names **and declaration order**, `defaults()` = the Linux column, `generate`/`load`/`from_json` (strip nulls → deserialize → postprocess), `signing_key`/`address`/`subnet`/`link_options`/`to_json`, plus `Flags`/`ConfigSource`/`USAGE`. JSON only | `src/config/config.go` + `defaults_linux.go` |
 
 ## State ownership
@@ -193,23 +196,26 @@ better peer; else `dest == our key` → `handle_session_bytes`, where payload by
 `src/` talks wire and owns state. It never prints, never opens TUN, never serves
 admin, and never builds a `Router` for a caller. Everything that decides *what to
 do* lives in the `client/` package (`roots-client`: `main.rs`, `node.rs`,
-`links.rs`, `config.rs`, and the admin/TUN/multicast slices to come) or in root
-`examples/` / `tests/`.
+`links.rs`, `listen.rs`, `admin.rs`, `config.rs`, and the TUN/multicast slices to
+come) or in root `examples/` / `tests/`.
 
-Two things enforce it. Crate visibility: `smoltcp`, `serde_json` and `tun` are
-dev-dependencies of the root package only, so the lib target cannot see them.
-And a package boundary: a redial loop, a listener task or an admin handler added
-to `src/` has to construct a `Router`, which is the one thing Slice 3 made hard to
+Two things enforce it. Crate visibility: `smoltcp` and `tun` are
+dev-dependencies of the root package only, so the lib target cannot see them, and
+`serde_json` is a dependency of `client/` alone — the lib has never needed a JSON
+tree, only bytes. And a package boundary: a redial loop, a listener task or an
+admin handler added to `src/` has to construct a `Router`, which is the one thing
+Slice 3 made hard to
 do by accident. Check both mechanically with `grep -n "mod tests" src/*.rs`
 (every `Router::new` must sit below its file's test module) and `cargo tree -p
 roots -e normal` (15 crates, no client-only dependency).
 
-The admin adapter (`examples/admin.rs`, yggdrasilctl-compatible) and the TUN
-bridge (`examples/tun_ping.rs`) are demos riding the public query surface; both
-move into `client/src/` in Slices 7 and 14, and only then can their
-dev-dependencies leave the root manifest.
+`examples/admin.rs` is gone (Slice 7): the node's own `client/src/admin.rs`
+replaced it, so the yggdrasilctl-compatible surface now sits next to the state it
+reports. `examples/tun_ping.rs` is the remaining demo riding the public query
+surface that still has to move, in Slice 14, and only then can `tun` leave the
+root manifest.
 
-## The client's node loop (Slice 5)
+## The client's node loop (Slices 5 and 7)
 
 Go runs a `links` actor and a `core` actor behind channels (`yggdrasil-go
 src/core/link.go`, `switch.go`). We collapse that into one task, which is only
@@ -220,9 +226,15 @@ task own it.
 ```
 listener ─┐                                   ┌─ spawn: connect_any(uri) ─┐
 admin    ─┼─ mpsc::UnboundedSender<Cmd> ─→ Node::run ─┤  (touches no router state) │
-multicast─┘        Dial/Drop/Accept/Send/Quit   │                        │
-                                               ← ┴── LinkEvent::Dialed ──┘
+multicast─┘   Dial/Drop/Accept/Send/Report/Quit │                        │
+ (Slice 11)      ← ┴── LinkEvent::Dialed ────────┘   └── oneshot<Snapshot>
 ```
+
+The socket side of that diagram is `client/src/admin.rs`: it holds no state,
+answers a request by sending `Cmd::Report` and waiting for the `Snapshot` the
+node task builds, and its replies are `struct`s so Go's field order survives.
+Nothing off the node task reads `Router` or `LinkSet` — `admin.rs` could not if it
+tried, which is the point.
 
 `run` is five steps per tick: drain `rx` → drain `events` →
 `peers.note_liveness(&links)` → `peers.start_due(now)` →
@@ -362,15 +374,37 @@ Client-side (the single-task rule):
 - **Redial has exactly one owner.** `Links::start_due` + the loop; `run_peer` and
   `Client::drive` are deleted, and Gate 3's `serve_until_closed` was deliberately
   never built because it would be a second policy home.
-  `examples/admin.rs` still runs its own `PeerCfg` loop until Slice 7 moves it
-  onto `Node`.
+  `examples/admin.rs` and its `PeerCfg` loop are deleted (Slice 7): the node's own
+  socket owns `addPeer`/`removePeer` and the redial behind `Cmd`.
+- **An admin reply is a `struct`, never a `json!` map.** `serde_json::Map` is a
+  `BTreeMap` here (no `preserve_order`), so a body that round-trips through
+  `Value` arrives alphabetically sorted where Go writes declaration order. Erase
+  the concrete types with the closed `enum Body`, not with `Box<dyn Serialize>` —
+  `Serialize::serialize` is generic over the serializer, so the trait is not
+  object-safe.
+- **`arguments` is validated before the command runs** (`decode_args`,
+  `admin.go:162-169`). Go decodes the arguments into the command's own request
+  struct, so a non-object or a wrongly-typed field answers with
+  `encoding/json`'s own message and the handler — for `addPeer` the whole link
+  layer — never sees the request. Our request types are `Value`s, so the two
+  message shapes are built from a table of the field each command reads, and the
+  gate sits before `dispatch` rather than inside the handlers. `null` args are a
+  no-op success and unknown keys are ignored, both exactly as Go's decoder does.
+- **Our `getPeers` rows come from the configured dials, so an accepted link has
+  no row** and a link that was replaced by an inbound one reports `inbound:
+  true` under the dial URI (Slice 7, pinned by `proof/7-admin-inbound.sh`).
+  Go's rows come from `links._links`, which holds inbound links too and rewrites
+  their `remote` to the peer's socket address (`api.go:79-106`,
+  `link.go:519-525`). Fixing this means giving the link manager the inbound
+  half of its table, which is Slice 8's row set — not something `admin.rs` can
+  paper over from the snapshot it is handed.
 - **`link_id` is URI-minus-query, and the dedup key is `(link_id, sintf)`**
   (`link.go:54-57`, `766-769`). Two URIs that differ only in options are the same
   peer; two URIs on different source interfaces are not.
 
 ## Resume point
 
-The live plan is `docs/plans/go-client-parity/` — Slices 1–5 DONE 2026-09-24,
+The live plan is `docs/plans/go-client-parity/` — Slices 1–7 DONE 2026-09-24,
 resume from its `00-status.md` (checklist, findings) and `04-slices.md` (proof per
 slice). The earlier `docs/plans/rust-client/` plan is closed: its Slices 1–19 are
 `DONE`, and the only open item there is the Slice 20+ public-mesh TUN run (needs a

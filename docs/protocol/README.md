@@ -22,6 +22,7 @@ Rules for these pages:
 |------|--------|--------|-----------|
 | [10-envelope.md](10-envelope.md) | link frame envelope: uvarint size, packet type, all 10 types | captured from Go 0.5.14 | `go_link_frame_envelope_matches_captured` |
 | [20-handshake.md](20-handshake.md) | `meta` handshake: TLVs, keyed-hash signature, version check, flow | captured from Go 0.5.14, both password branches | `go_meta_handshake_bytes_match_captured`, `go_meta_password_binds_the_signature` |
+| [21-admin.md](21-admin.md) | admin socket: JSON value stream, `request`/`response` envelope, `keepalive`, the eight commands | captured from Go 0.5.14 over TCP and `unix://`, 22 raw edge cases | `admin_unix_socket_matches_tcp`, `admin_body_field_order_matches_go`, `admin_keepalive_honours_second_request`, `admin_error_strings_match_go`, `admin_getpeers_reports_the_link_uri_not_the_operators`, `admin_argument_types_match_go` |
 | — | address derivation (`src/address.rs`) | proven by vectors, undocumented | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured` (the *text* Go prints for `-address`/`-subnet`) |
 | — | `SigReq` / `SigRes` / `Announce` payloads | undocumented | `announce_chain_verifies`; envelope only so far |
 | — | bloom filter (`BloomFilter`) | undocumented | `bloom_vector_matches_go` |
@@ -32,7 +33,9 @@ Rules for these pages:
 
 Of the 22 wire formats in the Gate 2 inventory, 14 are now guarded by captured
 Go bytes; `02-architecture.md` in the plan folder holds the table and
-`00-status.md` the current count.
+`00-status.md` the current count. The admin socket is not one of the 22 — it
+never crosses a link — but `21-admin.md` is written to the same rules because
+`yggdrasilctl` interoperability is a claim just as testable as a frame layout.
 
 The blank pages are the work list: each gets written when a slice captures real
 Go bytes for it. `docs/plans/go-client-parity/04-slices.md` tracks which slice

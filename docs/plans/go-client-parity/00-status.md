@@ -30,7 +30,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert — DONE 2026-09-24, see the "Done 2026-09-24" block under Slice 4 in `04-slices.md` for the mutation-attribution table
 - [x] Slice 5 — one-task node loop + `link_id` dedup command queue — DONE 2026-09-24, `client/src/links.rs` + `client/src/node.rs` (`Cmd`/`Node::run`), `client/tests/node_loop.rs`; `run_peer` deleted, `reconnect.rs` moved onto `Node`; mutation table in `04-slices.md`
 - [x] Slice 6 — Go-shaped config (proven by Go's own binary parsing it) — DONE 2026-09-24, `client/src/config.rs` + `client/src/main.rs` flags + `client/tests/allowlist.rs` + `tests/go_vectors.rs` address/subnet string vectors; `src/address.rs` `Display` fixed to Go's text form
-- [ ] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings
+- [x] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings — DONE 2026-09-24, `client/src/admin.rs` + `client/src/listen.rs` + `boot()` in `client/src/main.rs` + `client/tests/admin_loopback.rs` (6 tests) + `docs/protocol/21-admin.md` + `proof/7-admin.sh`/`7-admin-raw.sh`/`7-admin-inbound.sh`; `examples/admin.rs` deleted; proven against a live Go 0.5.14 node and stock `yggdrasilctl` over tcp **and** unix, mutation table in `04-slices.md`
 - [ ] Slice 8 — `getPeers` content parity: three sort modes + full field set
 - [ ] Slice 9 — remote queries via `next_hop`; `removePeer` stops lying
 - [ ] Slice 10 — multicast codec + state machine in the library (no sockets)
@@ -214,7 +214,10 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     owns peer configuration, dedup, backoff and the last error. **Slice 7's admin
     socket must not touch either directly** — it sends `Cmd`s and reads
     `Node::peers().report()`. That is what "no `Mutex` in `src/`" buys, and it is
-    the shape the mutation table above pins.
+    the shape the mutation table above pins. *Superseded by Slice 7: the socket
+    sends `Cmd::Report` and gets a `Node::snapshot()`; `Links::report()` never
+    shipped, because a second view of the same state in the library was the wrong
+    half of the split.*
   - Dialling is the one piece of node work that runs off-task, and it is safe
     precisely because `connect_any` + the `meta` handshake touch no router state.
     Anything new that must touch router state goes through `Cmd`, not a task.
@@ -263,9 +266,9 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     `flag` wording because a silently ignored `-suseconf` typo is the worst
     failure mode an operator can have; `KeyMismatch` (seed ≠ public half) is an
     error where Go takes `PrivateKey[32:]` unchecked; running a node from a
-    config is Slice 7's, and until then that path prints the address it read and
-    `exit(2)` rather than falling through to the demo probe and dialling out with
-    an identity the operator only asked us to read.
+    config was Slice 7's follow-up and landed there — `boot()` runs the node
+    where Go does, and `exit(2)` is now reserved for what Go's `flag` package
+    reserves it for: an undefined flag.
   - **`AllowedPublicKeys` was already enforced and never exercised.** The gate at
     `src/link.rs:580-585` predates the plan (whose citation `:450-453` has
     drifted); `client/tests/allowlist.rs` is its first test, and it pins both
@@ -285,3 +288,62 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     inbound, and `IfName: "auto"` is carried but unused because `client/` has no
     TUN code at all yet (the field exists so the key set matches Go's).
   - CI trio green at **97 unit + 10 integration tests** (~35 s wall).
+- **Slice 7 findings — the framing was right and the *field order* was wrong.**
+  - **A `serde_json::Value` body is an alphabetically-sorted body.** `Map` is a
+    `BTreeMap` while the `preserve_order` feature stays off, so every reply built
+    with `json!` printed `address` before `build_name` where Go's
+    `encoding/json` prints struct order. The unit tests could not see it (they
+    parsed the reply and checked the values); only the byte diff against a live Go
+    node did. Rule for every later admin body: a `struct`, never a map.
+  - **`Box<dyn Serialize>` is not implementable.** `Serialize::serialize` is
+    generic over the serializer, so the trait is not object-safe; `RawValue`
+    would keep order but not indentation (`write_raw_fragment` has only a default
+    impl), and `preserve_order`/`erased_serde` are both new dependencies for one
+    field. The closed `enum Body` with a hand-written delegating `Serialize` is
+    what `03-program-design.md` now shows.
+  - **The proof shape changed: run the *other implementation*, not just our own
+    tests.** `docs/plans/go-client-parity/proof/7-admin.sh` starts two Go nodes
+    and two of ours in one netns with the same key and diffs six commands across
+    both transports, then asks stock `yggdrasilctl` in table mode — which decodes
+    into Go's structs and would print empty cells for a wrong field name. Two
+    gotchas it encodes: the flag is `-endpoint` (with none set, yggdrasilctl reads
+    the *platform default config file* and talks to the host's service node), and
+    `kill`ing the nodes needs their PIDs because an orphaned Go child inherits the
+    script's stdout.
+  - **`getTree` and `getSelf.routing_entries` differ because Go seeds its tree
+    with itself** (own key as parent, `sequence: 1`), so a Go node reports 1
+    routing entry before any peer exists and ours reports 0. Both count
+    `len(router.infos)`, and once a link is up the two answers match row for row,
+    so this is one missing self-entry rather than a different measure. That is
+    router-state work, not framing — recorded for Slice 8, which owns what these
+    bodies say.
+  - **One deviation found in the library while pinning URI errors:** Go collects
+    repeated `?key=` into a set (`link.go:179-191`); we keep a single
+    `pinned_key` and the last value wins. Harmless for a dial with one peer, and
+    now stated in AGENTS.md rather than discovered by an operator.
+  - **Go decodes a command's arguments before the command runs; we did not.** The
+    raw byte diff (`proof/7-admin-raw.sh`, now 22 cases) showed
+    `{"request":"getSelf","arguments":"notanobject"}` succeeding on our socket
+    where Go answers `json: cannot unmarshal string into Go value of type
+    admin.GetSelfRequest`. `decode_args` is now the gate, and it runs *before*
+    `dispatch`, so a request refused for its argument types never reaches the
+    link layer — the assertion that pins the ordering is "a request refused for
+    its argument types still added a peer". `list` is exempt because its handler
+    discards its input, and `"arguments": null` is a no-op in Go rather than an
+    error.
+  - **A link we accept is invisible, and the *reason* is structural.**
+    `proof/7-admin-inbound.sh` dials one way then the other: Go lists a link it
+    accepted (its `remote` is rewritten to the peer's socket address,
+    `link.go:519-525`) while our `getPeers` answers `{"peers": []}`. With both
+    directions up, our one row reports the accepted link's `inbound: true` against
+    the *dial's* URI, because `LinkSet` keys by node public key and the second
+    link replaces the first. Recorded in Slice 8's scope, with that script as the
+    tripwire; it needs a library decision, not just a client one.
+  - **Proof scripts must rebuild, always.** The first re-run of the raw diff after
+    fixing the password leak still showed the leak, because the script only built
+    `target/debug/roots` when the binary was missing. All three Slice 7 scripts now
+    run `cargo build -q -p roots-client` unconditionally.
+  - CI trio green at **98 unit + 16 integration tests** (~40 s wall; the admin
+    file carries 6 of them, and `mesh_ping` stays `#[ignore]`d).
+    `examples/admin.rs` (643 lines) and the root `serde_json` dev-dependency are
+    gone with it; `client/` is the only place a config-driven node runs.

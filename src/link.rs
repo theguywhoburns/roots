@@ -461,6 +461,11 @@ pub enum Scheme {
 }
 
 /// Parse a `tcp://`, `tls://`, `ws://`, `wss://` or `quic://` peer URI.
+///
+/// The option refusals are Go's, in Go's order (`links.add`, `link.go:175-218`):
+/// an unknown scheme, a bad `?key=`, a bad `?priority=`, an oversize
+/// `?password=` (over `blake2b.Size`) and a bad `?maxbackoff=`. Each carries
+/// Go's verbatim message because the admin socket quotes it back.
 pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     let (scheme, rest) = if let Some(r) = uri.strip_prefix("tcp://") {
         (Scheme::Tcp, r)
@@ -473,7 +478,7 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     } else if let Some(r) = uri.strip_prefix("quic://") {
         (Scheme::Quic, r)
     } else {
-        return Err(Error::BadUri(uri.to_string()));
+        return Err(Error::UnrecognisedSchema);
     };
     let (authority, query) = match rest.split_once('?') {
         Some((a, q)) => (a, q),
@@ -493,16 +498,19 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     for pair in query.split('&').filter(|s| !s.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
-            "password" => out.password = v.as_bytes().to_vec(),
+            "password" => {
+                if v.len() > crate::handshake::MAX_PASSWORD_LEN {
+                    return Err(Error::PasswordInvalid);
+                }
+                out.password = v.as_bytes().to_vec();
+            }
             "priority" => {
-                out.priority = v
-                    .parse::<u8>()
-                    .map_err(|_| Error::BadUri(uri.to_string()))?;
+                out.priority = v.parse::<u8>().map_err(|_| Error::PriorityInvalid)?;
             }
             "key" => {
-                let raw = hex::decode(v).map_err(|_| Error::BadUri(uri.to_string()))?;
+                let raw = hex::decode(v).map_err(|_| Error::PinnedKeyInvalid)?;
                 if raw.len() != KEY_LEN {
-                    return Err(Error::BadUri(uri.to_string()));
+                    return Err(Error::PinnedKeyInvalid);
                 }
                 let mut key = [0u8; KEY_LEN];
                 key.copy_from_slice(&raw);
@@ -510,9 +518,9 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
             }
             "sni" => out.sni = Some(v.to_string()),
             "maxbackoff" => {
-                let d = parse_go_duration(v)?;
+                let d = parse_go_duration(v).map_err(|_| Error::MaxBackoffInvalid)?;
                 if d < MIN_MAX_BACKOFF {
-                    return Err(Error::BadUri(uri.to_string()));
+                    return Err(Error::MaxBackoffInvalid);
                 }
                 out.max_backoff = Some(d);
             }
@@ -777,8 +785,7 @@ pub async fn complete_accept<T: Transport>(
 }
 
 /// Dial any scheme and type-erase to [`AnyConn`]: one `match` on [`Scheme`]
-/// instead of per-callsite `if starts_with` chains (`main.rs`, `admin.rs`,
-/// `proto_probe.rs`).
+/// instead of the per-callsite `if starts_with` chains this replaces.
 pub async fn dial_any(uri: &str, local: &SigningKey, opts: &LinkOptions) -> Result<AnyConn, Error> {
     let (scheme, _) = parse_link_uri(uri)?;
     match scheme {
@@ -811,6 +818,41 @@ mod tests {
         assert_eq!(u.pinned_key, Some([0xaa; KEY_LEN]));
         assert!(parse_peer_uri("tls://h:1").is_err());
         assert!(parse_peer_uri("tcp://").is_err());
+    }
+
+    #[test]
+    fn uri_option_errors_quote_go_verbatim() {
+        // Go's `linkError` constants (`core/link.go:149-157`), checked in
+        // `links.add` (`:175-218`), which `addPeer` hands straight to the admin
+        // socket's `error` field — so the text is wire-visible, not a log line.
+        let refused = |uri: &str| parse_link_uri(uri).unwrap_err().to_string();
+        assert_eq!(refused("carrier://h:1"), "link schema unknown");
+        assert_eq!(
+            refused("tcp://h:1?key=not-hex"),
+            "pinned public key is invalid"
+        );
+        assert_eq!(
+            refused(&format!("tcp://h:1?key={}", "aa".repeat(31))),
+            "pinned public key is invalid"
+        );
+        assert_eq!(
+            refused("tcp://h:1?priority=256"),
+            "priority value is invalid"
+        );
+        assert_eq!(
+            refused(&format!("tcp://h:1?password={}", "x".repeat(65))),
+            "invalid password supplied"
+        );
+        assert_eq!(
+            refused("tcp://h:1?maxbackoff=bogus"),
+            "max backoff duration invalid"
+        );
+        assert_eq!(
+            refused("tcp://h:1?maxbackoff=1s"),
+            "max backoff duration invalid"
+        );
+        // A 64-byte password is the last one Go accepts (`blake2b.Size`).
+        assert!(parse_link_uri(&format!("tcp://h:1?password={}", "x".repeat(64))).is_ok());
     }
 
     #[test]

@@ -405,24 +405,106 @@ fn sort_peers(entries: &mut Vec<PeerEntry>, by: SortBy);   // stable, Go's three
   loop needs Go's "link gone" vs "node broken" split (`peers.go:228`) without
   matching on `Error`'s variants from outside the crate.
 
+### Slice 7 corrections (recorded at implementation, 2026-09-24)
+
+The `client/src/admin.rs` sketch above was two functions and an assumption. What
+shipped is the same shape with three substitutions, one of which was forced by
+the compiler rather than chosen:
+
+```rust
+// client/src/admin.rs
+/// Go's `AdminListen` dispatch (`admin.go:83-130`): `""`/`none` disables,
+/// `unix://` stats + probes and rebinds, `tcp://` and a bare `host:port` are
+/// TCP. `Ok(None)` means "admin is off", which is why the error type is
+/// `io::Error` and not `roots::Error` — nothing here touches the mesh.
+pub async fn bind_admin(uri: &str) -> Result<Option<Bound>, io::Error>;
+pub enum Bound { Tcp(TcpListener), Unix(UnixListener) }
+impl Bound { pub fn network(&self) -> &'static str; pub fn addr(&self) -> String; }
+
+/// A stream the socket can serve, boxed because a trait object is the only way
+/// to name `TcpStream` and `UnixStream` together. `AsyncRead`/`AsyncWrite` *are*
+/// object-safe, unlike `Serialize` below.
+pub trait AdminStream: AsyncRead + AsyncWrite + Send + Unpin {}
+
+/// Accept loop and per-connection loop: neither returns, neither is `Result`.
+/// A listener that outlives its node is not an error, and one bad connection
+/// must not close the socket, so the old sketch's `Result<(), roots::Error>`
+/// on both was the wrong contract.
+pub async fn serve_admin(bound: Bound, tx: mpsc::UnboundedSender<Cmd>);
+async fn admin_conn(mut sock: Box<dyn AdminStream>, tx: mpsc::UnboundedSender<Cmd>);
+
+/// Every reply body in one type. `Box<dyn Serialize>` — what this document
+/// sketched — does not compile: `Serialize::serialize` is generic over the
+/// serializer, so the trait is not object-safe (E0038). A closed enum with a
+/// hand-written delegating `Serialize` keeps Go's struct field order, needs no
+/// new dependency, and is what `docs/protocol/21-admin.md` documents.
+enum Body {
+    Null, Empty,
+    List(ListResponse),
+    Self_(GetSelfResponse<'static>),
+    Peers(GetPeersResponse),
+    Tree(GetTreeResponse),
+    Paths(GetPathsResponse),
+    Sessions(GetSessionsResponse),
+}
+
+/// The gate the sketch above had no room for: Go decodes `arguments` into the
+/// command's own request struct (`admin.go:162-169`) before the handler runs,
+/// so a wrongly-typed argument answers in `encoding/json`'s words and the
+/// command never executes. Our request "structs" are `serde_json::Value`s, so
+/// the two message shapes are built by hand from a table of the field each
+/// command reads.
+fn decode_args(name: &str, args: &Value) -> Result<(), String>;
+fn go_kind(value: &Value) -> &'static str;   // null|bool|number|string|array|object
+```
+
+- **Bodies are `struct`s, never `json!` maps**, because `serde_json::Map` is a
+  `BTreeMap` while `preserve_order` stays off and Go writes struct field order.
+  The same rule already governed `client/src/config.rs`'s sorted maps; here it
+  governs the reply bytes. `serde_json::RawValue` was rejected twice over — the
+  feature is opt-in, and `write_raw_fragment` has only a default impl, so a raw
+  body inside `to_vec_pretty` is never re-indented where Go's `json.Indent`
+  re-indents nested raw JSON.
+- **`Links::report()` never shipped.** The socket asks the node for a
+  `Snapshot` through `Cmd::Report`, so there is one view of node state and the
+  node task is the only thing that builds it. `PeerRow` (key, uri, up, inbound,
+  cost, uptime, rx, tx, last_error) is the admin-visible link view Slice 4's
+  `LinkStats` feeds.
+- **`enum SortBy`/`sort_peers` are still unbuilt** — deliberately left to Slice 8
+  with the rest of what `getPeers` *says*, once this slice had pinned what
+  `getPeers` *looks like*.
+- **A node now runs from a config.** `boot()` in `client/src/main.rs` is Go's
+  startup order (identity lines → admin socket → listeners → persistent dials →
+  the node task); `client/src/listen.rs` is the missing listener half Gate 3
+  placed in `main.rs` itself, because an accept loop that hands links to `Cmd`
+  wants its own file and its own "binding is fatal, a failed handshake is not"
+  rule (`link.go:503-540`).
+
 ## Call stack
 
-**Startup** (`client/src/main.rs`): `Flags::parse` → `rejected`/`-h` → config →
-`Node::new` → spawn listeners (`tls_listen`/`ws_listen`/`quic_listen`/`listen`)
-each sending `Cmd::Accept` → spawn persistent dials
-(`Cmd::Dial{persistent:true}` behind `SupervisedPeer`) →
-spawn `admin::serve_admin` → spawn `multicast::run` (socket + timers +
-`Multicast::announce`/`receive`, commands into `Node`) → spawn `tun::bridge` if
-`IfName`/`IfMTU` ask for one → `Node::run`. Every task talks to the node only
-through `Cmd`; only `run` touches `Router`/`LinkSet`.
+**Startup** (`client/src/main.rs` `boot()`): `Node::from_client` → the three
+identity lines on stderr → `bind_admin` + spawn `admin::serve_admin` → spawn
+listeners (`client/src/listen.rs`, all five schemes)
+each sending `Cmd::Accept` → `Cmd::Dial{persistent:true}` per `Peers` /
+`InterfacePeers` entry → `Node::run`. Then, when their slices land,
+`multicast::run` (socket + timers + `Multicast::announce`/`receive`, commands
+into `Node`) and `tun::bridge` if `IfName`/`IfMTU` ask for one. Go's own order
+differs in one respect — its listeners and dials start inside `core.New`, before
+the admin socket exists — and ours cannot be worse for it: nothing is *driven*
+until `run`, so everything before that only fills the mailbox. Every task talks
+to the node only through `Cmd`; only `run` touches `Router`/`LinkSet`.
 
-**As shipped by Slice 6, the chain stops after config.** `config_stage` handles
-`-genconf` (print and exit) and the load path, then prints `-address`/`-subnet`/
-`-publickey` in Go's order and exits; a loaded config with nothing to print is
-reported (`config loaded for address …`) and `exit(2)`, because wiring a whole
-node to a config is Slice 7's admin work and dialling out with an identity the
-operator only asked us to *read* would be worse. `TunnelLocalTraffic` is gone from
-the sketch above: it is not a 0.5.14 `NodeConfig` field.
+**As shipped by Slice 7, the chain is whole up to the router.** `config_stage`
+handles `-genconf` (print and exit) and the identity prints
+(`-address`/`-subnet`/`-publickey`, in Go's order); a config with something to run
+goes to `boot()`: `Node::from_client` → the three identity lines on stderr →
+`bind_admin` + `spawn serve_admin` → `spawn_listeners` (all five schemes,
+`Cmd::Accept` per handshake) → one `Cmd::Dial{persistent: true}` per `Peers` and
+per `InterfacePeers` entry → `Node::run`. Multicast and TUN are the two remaining
+gaps in that list, and a config that asks for them gets a node that simply does
+not do those things yet. Slice 6's record here said the load path stopped after
+the identity print, which was true for exactly one slice. `TunnelLocalTraffic` is
+gone from the sketch above: it is not a 0.5.14 `NodeConfig` field.
 
 **Multicast beacon in** — client `recv_from` → `Multicast::receive(zone, from,
 buf)` → decode → version/self checks → iface lookup → `membership_hash` compare →
@@ -536,6 +618,39 @@ Loopback only. No test in this plan needs internet, a TUN device, or a Go
 compiler; the capture examples need the installed Go **binary** and are dev
 tools, not tests — the vectors they produce are committed, so CI stays
 hermetic.
+
+### What Slice 7 actually delivered here (2026-09-24)
+
+Three of the six planned `admin_*` names shipped as written —
+`admin_keepalive_honours_second_request`, `admin_unix_socket_matches_tcp`,
+`admin_error_strings_match_go` — and all six now live in
+`client/tests/admin_loopback.rs` against a real `Node` and a real socket. The
+other three are ones this table did not predict:
+**`admin_body_field_order_matches_go`**, which is the test for the bug the first
+three could not see (keys sorted alphabetically where Go writes struct order);
+**`admin_getpeers_reports_the_link_uri_not_the_operators`**, which pins that a
+peer is named by its link URI, so a `?password=` is never echoed back out; and **`admin_argument_types_match_go`**, added after
+the raw-byte diff found that Go decodes `arguments` into the command's own
+request struct *before* the handler runs, so a wrongly-typed argument is
+refused in `encoding/json`'s words and never reaches the link layer. That last
+one is `decode_args` + `go_kind` in `client/src/admin.rs` — a gate the types in
+the sketch above could not express, because our request structs are `Value`s.
+The `getPeers` sort/field tests and the two remote-query tests are Slice 8's and
+9's, unchanged in intent.
+
+Three additions to the bar beyond the table, all because unit tests of our own
+bytes prove only self-agreement: the six-command Go-vs-ours diff and the stock
+`yggdrasilctl` table-mode check in
+`docs/plans/go-client-parity/proof/7-admin.sh`, the 22-case protocol-error and
+argument-message diff in `proof/7-admin-raw.sh`, and
+`proof/7-admin-inbound.sh`, which shows what our `getPeers` *cannot* say — an
+accepted link has no row, because the row set comes from the configured dials.
+All three rebuild the binary first; two of them found real bugs by answering
+from a stale `target/debug/roots`.
+
+One accepted cost of the `enum Body` shape: adding a command means adding an
+arm, so the compiler is the reminder. That is preferable to the alternative that
+was available, which was no reminder at all and a silently re-sorted reply.
 
 ## Least confident decisions
 

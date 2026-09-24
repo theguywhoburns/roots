@@ -135,18 +135,21 @@ async fn node_loop_two_peers_dedup_drop_and_survival() {
         uri: uri_b.clone(),
         sintf: String::new(),
         persistent: true,
+        respond: None,
     })
     .unwrap();
     tx.send(Cmd::Dial {
         uri: uri_c.clone(),
         sintf: String::new(),
         persistent: true,
+        respond: None,
     })
     .unwrap();
     tx.send(Cmd::Dial {
         uri: format!("{uri_b}?priority=1"),
         sintf: String::new(),
         persistent: true,
+        respond: None,
     })
     .unwrap();
 
@@ -194,6 +197,7 @@ async fn node_loop_two_peers_dedup_drop_and_survival() {
     tx.send(Cmd::Drop {
         uri: uri_b.clone(),
         sintf: String::new(),
+        respond: None,
     })
     .unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;

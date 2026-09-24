@@ -55,6 +55,7 @@ async fn reconnect_delivers_after_drop() {
         uri,
         sintf: String::new(),
         persistent: true,
+        respond: None,
     })
     .unwrap();
 

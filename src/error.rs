@@ -11,7 +11,7 @@ pub enum Error {
     BadPassword,
     #[error("incompatible version {0}.{1}, expected 0.5")]
     BadVersion(u16, u16),
-    #[error("refusing to peer with self")]
+    #[error("node cannot connect to self")]
     SelfDial,
     #[error("remote key not in allowlist")]
     KeyNotAllowed,
@@ -21,6 +21,19 @@ pub enum Error {
     PasswordTooLong,
     #[error("bad peer URI: {0}")]
     BadUri(String),
+    // The five URI refusals below are Go's `linkError` constants verbatim
+    // (`core/link.go:149-157`) because `addPeer` puts the string straight into
+    // the admin socket's `error` field, where `yggdrasilctl` shows it.
+    #[error("link schema unknown")]
+    UnrecognisedSchema,
+    #[error("pinned public key is invalid")]
+    PinnedKeyInvalid,
+    #[error("priority value is invalid")]
+    PriorityInvalid,
+    #[error("invalid password supplied")]
+    PasswordInvalid,
+    #[error("max backoff duration invalid")]
+    MaxBackoffInvalid,
     #[error("websocket subprotocol mismatch, expected ygg-ws")]
     BadSubprotocol,
     #[error("handshake timed out")]

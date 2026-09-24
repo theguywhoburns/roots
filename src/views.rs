@@ -112,8 +112,10 @@ impl Router {
     }
 
     /// Direct link peers as `(key, port, priority, up, lag_ms)`, sorted by
-    /// key: `up` tracks the last SigReq round-trip, `lag_ms` saturates at
-    /// `u32::MAX` while unmeasured (for diagnostics / admin adapter).
+    /// key: `up` tracks the last SigReq round-trip, `lag_ms` is Go's EWMA in
+    /// whole milliseconds — 4 for a link that has not answered one yet,
+    /// because `UNKNOWN_LATENCY` is Go's 4294967295 *nanosecond* sentinel
+    /// (for diagnostics / admin adapter).
     pub fn link_peers(&self) -> Vec<([u8; KEY_LEN], u64, u8, bool, u128)> {
         let mut out: Vec<_> = self
             .tree

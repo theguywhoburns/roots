@@ -1,10 +1,9 @@
 //! Persistent peer supervision: Go-style per-URI redial with backoff.
 //!
-//! Extracted from `examples/admin.rs` (`PeerCfg`) and the dead
-//! `Client::drive` in `src/lib.rs`: one entry per configured URI, failures
-//! counted, next retry gated by `backoff_delay(failures, cap)` where `cap`
-//! comes from `?maxbackoff=` or `DEFAULT_MAX_BACKOFF`. Removal forgets the
-//! entry (drops immediately); the driver loop redials the rest.
+//! One entry per configured URI, failures counted, next retry gated by
+//! `backoff_delay(failures, cap)` where `cap` comes from `?maxbackoff=` or
+//! `DEFAULT_MAX_BACKOFF`. Removal forgets the entry (drops immediately); the
+//! driver loop redials the rest.
 
 use std::time::{Duration, Instant};
 
@@ -53,20 +52,6 @@ pub fn backoff_cap(uri: &str) -> Duration {
         .ok()
         .and_then(|(_, p)| p.max_backoff)
         .unwrap_or(crate::link::DEFAULT_MAX_BACKOFF)
-}
-
-/// Indices due for (re)dial, in configuration order.
-pub fn due_indices(
-    configured: &[SupervisedPeer],
-    now: Instant,
-    live_uris: &[String],
-) -> Vec<usize> {
-    configured
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.due(now, live_uris))
-        .map(|(i, _)| i)
-        .collect()
 }
 
 #[cfg(test)]
