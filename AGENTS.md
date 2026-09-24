@@ -1,13 +1,17 @@
 # AGENTS.md
 
-Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go implementation. Single package, no workspace, CI, or release process yet.
+Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go
+implementation. Library first: the client (`src/main.rs`, `examples/`) mirrors
+Go's and is meant to move out to its own binary. Single package, no workspace,
+no release process; CI covers static checks plus loopback tests only.
 
 ## Toolchain
 
 - Nightly Rust pinned in `rust-toolchain.toml` (`channel = "nightly"`, edition 2024). Do not downgrade or add a separate toolchain file.
 - Toolchain is provisioned by devenv (`devenv.nix`: `languages.rust` with `toolchainFile`). Enter it via `direnv allow` / `devenv shell`; plain `cargo` works once inside.
 - Components available: `rustfmt`, `clippy` (`profile = "minimal"` — anything else needs `rustup component add`).
-- No `python3` on PATH; use `perl` for one-off text munging. A Go toolchain lives at `/tmp/opencode/go/bin/go` (1.24.6; 1.25.5 at `/tmp/opencode/go125/go/bin/go`, needed for `yggdrasil-go` HEAD) plus reference clones under `/tmp/opencode/ygg-ref/` — see below.
+- No `python3` on PATH; use `perl` for one-off text munging. Go reference source lives in-repo as submodules under `reference/` (see Reference material) — no `/tmp` clones anymore.
+- **No Go toolchain is installed** (`go` is off PATH and `devenv.nix` provisions none), so building a Go oracle node or regenerating wire vectors requires adding `languages.go` to `devenv.nix` first. `yggdrasil-go` `develop` declares `go 1.25.0`.
 
 ## Layout
 
@@ -15,8 +19,10 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 - `src/address.rs` — key→IPv6 derivation. `src/handshake.rs` — link `meta` codec. `src/link.rs` — `Transport` trait + TCP dial/listen/handshake, backoff + `?maxbackoff=`/`?sni=` URI opts; `Link` trait + type-erased `AnyConn` + `LinkSet` map (one set per link-collection, reused across slices — per-link send clocks live in the set). `src/tls.rs` — `Tls` transport (rustls/ring, NoVerify like Go InsecureSkipVerify, rcgen self-signed listener). `src/ws.rs` — `Ws`/`Wss` transports (`ygg-ws` subprotocol, one binary message per flush, byte-stream reads; WSS layers WS on the TLS connector). `src/frame.rs` — ironwood link framing + uvarint/path helpers. `src/quic.rs` — `Quic` transport (quinn, one bidi stream per link, Go's 60s-idle/20s-keepalive timeouts; stream keeps endpoint+conn handles alive).
 - `src/router.rs` — facade: `Router` struct composing the tables below + `new`/`next_init_seq`/`peer_kind`/`announces_*` accessors. `src/driver.rs` — link I/O orchestration (`register`/`resolve`/`maintain`/`dispatch_frame`/`serve`/`serve_links`, dead-link eviction, empty-set sleep). `src/views.rs` — read-only snapshots (`parent`/`dump`/`get_paths`/…​) + `Snapshot` trait impl (`src/traits.rs`). `src/tree.rs:TreeState`, `src/pathfind.rs:PathState`, `src/bloom.rs:BloomState`, `src/session.rs:SessionState`, `src/proto.rs:ProtoState` — per-algorithm tables owning their own maps. `src/peer.rs` — `PeerKind` (Go vs roots via vendor TLV) + `PeerState`. `src/supervisor.rs` — persistent redial (`SupervisedPeer`/`due_indices`/`backoff_cap`). `src/link.rs` — `Transport`/`Link` (now with `remote_key`)/`AnyConn`/`LinkSet` + `complete_dial`/`complete_accept` templates + `dial_any` (single scheme match).
 - `src/router.rs` API notes: `register()` is once per LINK, `serve()`/`serve_links()` drive slices of it over a caller-owned persistent `LinkSet` map (single link or many, mixed transports via `&mut dyn Link` + type-erased `AnyConn`); `resolve()` maps IPv6 addr→node key over DHT (also over the caller's set); `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `proto_send`/`request_nodeinfo`/`request_debug` frame `typeSessionProto` (replies land in `proto_inbox`); `set_nodeinfo` advertises JSON (≤16384 B); `has_path`/`has_session`/`path_details`/`get_paths`/`get_sessions`/`link_peers`/`tree_entries` + `dump()` (returns `String`, never prints) are diagnostics.
+- `src/traffic.rs` — `Traffic` header codec (`path + from + source + dest + watermark + payload`) and the inbound forward/deliver/PathBroken decision. `src/error.rs` — `Error` enum (thiserror). `src/traits.rs` — `Snapshot` trait, implemented in `views.rs`.
 - `examples/` (dev-deps only, lib never sees them): `common/` (shared smoltcp `MeshPhy` bridge + `new_iface`/`new_tcp_socket`/`smol_now`, used by all TCP examples and `tests/tcp_loopback.rs` via `#[path]`), `http_fetch` (smoltcp TCP GET), `mesh_tcp` (bilateral TCP, both ends ours), `irc_watch` (smoltcp IRC: register/LIST/JOIN #ru, verified live — first user message caught 2026-09-06), `proto_probe` (nodeinfo/debug exchange with a Go node, verified live), `admin` (yggdrasilctl-compatible adapter: local list/getSelf/getPeers/getTree/getPaths/getSessions + remote getNodeInfo/debug_remoteGetSelf/Peers/Tree via mesh round trips + addPeer/removePeer with live multi-link set rebuilds and Go-style persistent redial with per-URI backoff, verified with real yggdrasilctl), `tun_ping` (kernel TUN↔mesh ICMP round trip, needs TUN privs), `ping6`, `listen_ping`, `oracle_probe` (one payload + ticks), `tcp_proxy` (logging MITM proxy), `hs_answer` (cross-impl handshake helper).
-- `tests/`: `mesh_ping.rs` (`#[ignore]`, A↔B ICMPv6 via public peer), `reconnect.rs` (drop→redial delivery), `tcp_loopback.rs` (pure smoltcp driver check, no mesh).
+- `tests/`: `mesh_ping.rs` (`#[ignore]`, A↔B ICMPv6 via public peer), `mesh3.rs` (three-node loopback mesh A—B—C: tree convergence, cross-hop DHT resolve, transit forwarding, dead-link eviction, session surviving the eviction — the refactor safety net, ~2.3s), `reconnect.rs` (drop→redial delivery), `tcp_loopback.rs` (pure smoltcp driver check, no mesh).
+- `reference/` — git submodules holding the Go source of truth (`yggdrasil-go`, `ironwood`); read-only, never edit, see Reference material.
 - Build artifacts in `/target` (gitignored). Do not commit.
 
 ## Boundary: library vs demo client
@@ -39,13 +45,22 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 ## Reference material (executable truth, in order)
 
 - `docs/plans/rust-client/` — gate docs + `00-status.md` (slice checklist, resume here).
-- `/tmp/opencode/ygg-ref/yggdrasil-go` — Go node impl; `/tmp/opencode/ygg-ref/ironwood` — routing/session impl (both depth-1 clones).
-- `/tmp/opencode/ygg-ref/vectors.txt` — golden wire vectors generated from the Go code via `/tmp/opencode/vecgen-ironwood` (`*_test.go` `TestZZVectors`, plus `TestZZReplay`/`TestZZHandshake` harnesses that verify OUR bytes with Go decoders).
-- Local Go oracles (built from HEAD, scratch): test nodes on 127.0.0.1:18233 (admin 19001, meshed via bode), :18234 (19002), :18236 (19004), plus a 0.5.14 node on :18235 (admin 19003). Query with `/tmp/opencode/ygg-go-build/yggdrasilctl -endpoint=tcp://127.0.0.1:1900X <getSelf|getPeers|getTree|getPaths|getSessions>`. The system service node (0.5.14, `Listen: []`) carries live TUN traffic — `curl -g`/`ping` through it cross-checks targets.
+- `docs/architecture-map.md` — current module graph, `Router` state ownership, frame dispatch table, and the invariant list. `02-architecture.md` is a frozen Slice 1–2 record and is stale; read the map.
+- `reference/yggdrasil-go` (submodule, HEAD `422836e` = tag `v0.5.14`, branch `develop`) — Go node impl: `src/core/` link transports (`link_tcp.go`, `link_tls.go`, `link_ws.go`, `link_quic.go`), `src/core/version.go` (`meta` handshake TLVs + signature), `src/address/address.go` (key→IPv6).
+- `reference/ironwood` (submodule, HEAD `d50055b`) — routing/session impl: `network/router.go` (spanning tree, SigReq/SigRes/Announce), `network/pathfinder.go` (DHT lookup/notify/broken), `network/bloomfilter.go`, `network/traffic.go`, `network/peers.go` + `network/wire.go` (link framing), `encrypted/session.go` + `encrypted/crypto.go`. Its commit is exactly what `yggdrasil-go` pins in `go.mod`, so the two always agree — trust the pair over any doc.
+- Both are shallow (`--depth 1`) clones. Fresh checkout: `git submodule update --init --depth 1`. Never edit or commit inside them; bump a gitlink instead.
+- Golden wire vectors live **in the Rust tests** as hex constants: `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `bloom_vector_matches_go`, `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go`, `traffic_vector_matches_go`. The old `vectors.txt` and the `/tmp/opencode/vecgen-ironwood` harness are gone; `TestZZVectors`/`TestZZReplay`/`TestZZHandshake` were local patches, NOT upstream in ironwood (which ships only `TestBloom`/`TestSign`/`TestVerify`/`TestEdX`/`TestTwoNodes`/`TestLineNetwork`/`TestRandomTreeNetwork`/`TestSessionInitPasswordAuth`). Regenerating or adding vectors needs a Go toolchain plus re-adding that harness.
+- Scratch Go oracle nodes are gone: the 127.0.0.1:18233/18234/18235/18236 pair (admin 19001–19004) and its `yggdrasilctl` died with the `/tmp` clones. Rebuild from `reference/yggdrasil-go/cmd/{yggdrasil,yggdrasilctl}` once `devenv.nix` gains `languages.go`.
+- The host's own Yggdrasil **service** node is live (NixOS service, 0.5.14, `Listen: []`, no admin socket — a traffic carrier, not a queryable peer). `tun0` is up and owns the `200::/7` route; its address this session (2026-09-24) was `200:a319:38e3:5833:d91e:70da:4c0c:71f0` — re-read it with `ip -6 addr show dev tun0`, never hardcode. It carries `curl -g`/`ping6` cross-checks, and it means any `tun_ping` run must claim its own interface name rather than `tun0`.
 - Protocol rule: docs never override wire code. When porting, mirror the Go function (including its quirks) and cite `file:line` in a comment.
 
 ## Gotchas
 
+- Announces carry **ancestry only** (Go `network/router.go:321`, mirrored at
+  `tree.rs:524`): a node learns its own line to the root and nothing else. In a
+  line A—B—C the two ends never learn each other from the tree — so
+  `known_nodes()` is not network size, and a query that must reach a
+  non-relative goes through the DHT/blooms (`tests/mesh3.rs` pins this).
 - `register()` once per link, `serve()` per slice over ONE caller-owned `LinkSet` reused across slices. Rebuilding the set per slice resets per-link send clocks → lazy keepalives never fire → the peer read-times-out the link at ~4s (caught live; the set must outlive slices, like the conn does). Registering per slice re-sends SigReq + replays announces every 250ms (~800 dupes/run) and the peer answers each one — looks exactly like a protocol storm in frame counters.
 - `serve()` answers keepalive lazily (Go `peerMonitor` semantics: only after a full idle tick with no sends, plus a top-up on quiet read slices); the link drops in ~4s without it. (Old code replied eagerly to every frame — pure chatter.)
 - `serve_links` slices reads (100ms) ONLY when multiplexing 2+ links; a single link blocks for the whole budget (exact old `serve` timing). Slicing a single link flaked `resolve_loopback` to ~50/50 (convergence starved — mechanism unclear, rule stands).
@@ -71,3 +86,4 @@ Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go imp
 - `cargo test --test reconnect -- --nocapture` (~13s, loopback)
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo fmt` before finishing (`cargo fmt --check` must pass)
+- CI (`.github/workflows/ci.yml`, added 2026-09-24) runs exactly `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` on `ubuntu-latest` with the pinned nightly. No Go, no network peers, no submodule checkout — so anything a slice needs verified must be reproducible by those three. Locally as of writing: all green, 71 unit + 3 loopback integration tests (`mesh3`, `reconnect`, `tcp_loopback`), ~25 s.

@@ -1,0 +1,8 @@
+[submodule "reference/yggdrasil-go"]
+	path = reference/yggdrasil-go
+	url = https://github.com/yggdrasil-network/yggdrasil-go
+	shallow = true
+[submodule "reference/ironwood"]
+	path = reference/ironwood
+	url = https://github.com/Arceliar/ironwood
+	shallow = true
