@@ -1,7 +1,10 @@
 # Architecture Map: roots
 
-Current-state map of the whole crate: all 22 files in `src/`, how they own state,
-how a packet crosses them, and which invariants break interop if edited loose.
+Current-state map of the whole crate: all 21 files in `src/` (the `roots`
+library), how they own state, how a packet crosses them, and which invariants
+break interop if edited loose. Node policy — the binary, the redial loop, and
+from Slice 5 on the config/admin/TUN/multicast halves — lives in the sibling
+`client/` package (`roots-client`), which this map covers only at its seam.
 
 Relationship to gate docs: `01`–`04` are frozen approval records. `00-status.md`
 is the slice checklist and resume point. `02-architecture.md` describes Slice 1–2
@@ -11,7 +14,7 @@ counts — read this file for the module graph, not that one.
 ## Stack
 
 ```
-  app / demo          src/main.rs · examples/* · tests/*
+  app / demo          client/src/{main,node}.rs · examples/* · tests/*
         |             drains Router::inbox / proto_inbox, feeds the outbox Vec,
         |             owns LinkSet lifetime, smoltcp bridges, admin socket, TUN
         v
@@ -45,7 +48,7 @@ Go-origin column is taken from each module's own port header and checked against
 
 | File | Job | Go origin |
 |---|---|---|
-| `lib.rs` | crate root, `Client` sugar (`new`, `run_peer`), re-exports | — |
+| `lib.rs` | crate root, `Client` sugar (`new`, per-scheme dial, listen/accept), re-exports — no node loop (Slice 3) | — |
 | `router.rs` | `Router` struct composing the five tables; `new`, `pubkey`, `next_init_seq`, `announces_*`, `peer_kind`, `is_roots_peer`; `MAINTENANCE_INTERVAL`, `UNKNOWN_LATENCY` | — (facade) |
 | `driver.rs` | link I/O orchestration: `register` `resolve` `maintain` `dispatch_frame` `serve` `serve_links`, keepalive, dead-link eviction | `network/router.go` peer upkeep |
 | `views.rs` | read-only snapshots: `parent` `root_and_depth` `known_nodes` `dump` `has_path` `has_session` `path_details` `get_paths` `get_sessions` `link_peers` `tree_entries` + `Snapshot` impl | diagnostic funcs |
@@ -66,14 +69,15 @@ Go-origin column is taken from each module's own port header and checked against
 | `handshake.rs` | `meta` TLV codec + signature, `Meta` struct, version gate | `src/core/version.go` |
 | `address.rs` | key -> IPv6 (`02…` node, `03…` subnet), `lookup_key_for_addr`, prefix scan | `src/address/address.go` |
 | `error.rs` | `Error` enum (thiserror) | — |
-| `main.rs` | demo client: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil` subset |
+| `main.rs` | *(moved, Slice 3)* now `client/src/main.rs` — demo probe: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil` subset |
+| `client/src/node.rs` | *(the other package)* `run_peer`: dial → register → serve → `?maxbackoff=`-capped redial, the only non-test `Router` builder | `core/links.go` `add` loop |
 
 ## State ownership
 
 One `Router` per task. There is no `Mutex`, no `RwLock`, no channel and no
 `spawn` in library code (`tokio::spawn` appears only inside `#[cfg(test)]`
 servers; the only `Arc` is the required rustls config handle in
-`tls.rs:80,93`). Concurrency lives entirely in the caller (`main.rs`,
+`tls.rs:80,93`). Concurrency lives entirely in the caller (`client/src/node.rs`,
 `examples/`, the smoltcp bridges).
 
 - Every table field is `pub(crate)`; `Router` is the only public handle.
@@ -171,17 +175,25 @@ before touching state; trailing garbage means the frame is dropped silently.
 better peer; else `dest == our key` → `handle_session_bytes`, where payload byte
 `1` → `inbox`, `2` → `handle_proto_bytes`; else emit `PathBroken` (`traffic.rs:61-86`).
 
-## Boundary: library vs demo
+## Boundary: library vs node
 
 `src/` talks wire and owns state. It never prints, never opens TUN, never serves
-admin. Everything that decides *what to do* lives in `main.rs` / `examples/` /
-`tests/`, enforced by `smoltcp`, `serde_json` and `tun` being dev-dependencies
-only — the lib target cannot see them. (`tokio` is a real dependency; async I/O
-needs it in the lib.)
+admin, and never builds a `Router` for a caller. Everything that decides *what to
+do* lives in the `client/` package (`roots-client`: `main.rs`, `node.rs`, and the
+config/admin/TUN/multicast slices to come) or in root `examples/` / `tests/`.
+
+Two things enforce it. Crate visibility: `smoltcp`, `serde_json` and `tun` are
+dev-dependencies of the root package only, so the lib target cannot see them.
+And a package boundary: a redial loop, a listener task or an admin handler added
+to `src/` has to construct a `Router`, which is the one thing Slice 3 made hard to
+do by accident. Check both mechanically with `grep -n "mod tests" src/*.rs`
+(every `Router::new` must sit below its file's test module) and `cargo tree -p
+roots -e normal` (15 crates, no client-only dependency).
 
 The admin adapter (`examples/admin.rs`, yggdrasilctl-compatible) and the TUN
-bridge (`examples/tun_ping.rs`) are demos riding the public query surface, not
-part of the library.
+bridge (`examples/tun_ping.rs`) are demos riding the public query surface; both
+move into `client/src/` in Slices 7 and 14, and only then can their
+dev-dependencies leave the root manifest.
 
 ## Invariants — things that break silently
 

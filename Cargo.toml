@@ -1,3 +1,7 @@
+[workspace]
+members = ["client"]
+resolver = "3"
+
 [package]
 name = "roots"
 version = "0.1.0"
@@ -6,10 +10,6 @@ edition = "2024"
 [lib]
 name = "roots"
 path = "src/lib.rs"
-
-[[bin]]
-name = "roots"
-path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }

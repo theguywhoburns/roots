@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use roots::{Client, Router};
+use roots_client::node::run_peer;
 
 #[tokio::test]
 async fn reconnect_delivers_after_drop() {
@@ -40,8 +41,7 @@ async fn reconnect_delivers_after_drop() {
 
     let client = Client::new(c_sk);
     let mut outgoing = vec![(s_pub, b"survives-drop".to_vec())];
-    client
-        .run_peer(&uri, &mut outgoing, Some(2))
+    run_peer(&client, &uri, &mut outgoing, Some(2))
         .await
         .expect("two served links");
     let inboxes = server.await.unwrap();

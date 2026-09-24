@@ -1042,6 +1042,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "roots-client"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.8",
+ "roots",
+ "tokio",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

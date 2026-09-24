@@ -31,6 +31,28 @@ Go citations verified 2026-09-24 against `reference/yggdrasil-go` `422836e`
 `examples/` stays in the `roots` package: they are *specimens of the library*,
 not the client, and keep smoltcp as a dev-dep.
 
+> **Corrections, 2026-09-24 (Slice 3, after the split was built).**
+>
+> 1. `tun` and `serde_json` could **not** leave the root `[dev-dependencies]` in
+>    this slice: `examples/tun_ping.rs`, `examples/admin.rs` and
+>    `examples/proto_probe.rs` still use them and only move to `client/src/` in
+>    Slices 14 and 7. Deleting them here breaks the build the slice is supposed
+>    to prove. The client therefore declares only `roots`, `tokio`,
+>    `ed25519-dalek`, `rand`, `hex`; the dev-dep deletion finishes with those
+>    two moves. The invariant this row existed for is unaffected and measurable
+>    today: `cargo tree -p roots -e normal` has no client-only crate in it.
+> 2. `tests/reconnect.rs` → `client/tests/reconnect.rs` (git mv) too. It is the
+>    only caller of `run_peer`, so the table's `client/src/lib.rs` row ("lets
+>    `client/tests/` exist") is load-bearing earlier than planned: without the
+>    `pub mod node;` there, the test cannot reach the loop it exists to test.
+> 3. CI must pass `--workspace` to clippy and test. From a non-virtual root,
+>    cargo selects the root package only, so without it the client's bin, its
+>    `node.rs` and its reconnect test would ship unlinted and unrun. `cargo fmt
+>    --check` already walks every member from the root and needed no change.
+> 4. `cargo run` from the root fails with "no bin target named `roots` in
+>    default-run packages" — every documented invocation is now
+>    `cargo run -q -p roots-client -- …`.
+
 ### Library changes
 
 | File | Change |

@@ -1,0 +1,16 @@
+[package]
+name = "roots-client"
+version = "0.1.0"
+edition = "2024"
+
+# The binary keeps the crate's name: it is the node the user runs.
+[[bin]]
+name = "roots"
+path = "src/main.rs"
+
+[dependencies]
+roots = { path = ".." }
+tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex = "0.4"

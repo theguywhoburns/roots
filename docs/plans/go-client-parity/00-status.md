@@ -15,7 +15,7 @@ binary so the client is a specimen of the library, not part of it.
 Verification today is attestation: 71 tests exist, none run automatically, and
 every interop claim lives in prose. Agreed scope:
 
-- [x] Static CI — `.github/workflows/ci.yml` written 2026-09-24: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` on `ubuntu-latest` with the pinned nightly. No Go, no submodules, no live peers. All three commands verified green locally (71 unit + 2 loopback integration tests, ~25 s); **not yet observed running on a runner** — first push confirms it.
+- [x] Static CI — `.github/workflows/ci.yml` written 2026-09-24: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` on `ubuntu-latest` with the pinned nightly (clippy and test gained `--workspace` in Slice 3 so the client package is covered too). No Go, no submodules, no live peers. All three commands verified green locally (71 unit + 2 loopback integration tests, ~25 s); **not yet observed running on a runner** — first push confirms it.
 - [x] Three-node local mesh test — done as Slice 1 (`tests/mesh3.rs`, 2026-09-24): Rust↔Rust↔Rust A—B—C over one loopback listener, asserting tree convergence, a DHT resolve across the hop, transit forwarding through a node that cannot consume the traffic, dead-link eviction, and a session that survives it. Runs inside `cargo test --locked`, so CI covers it.
 - [x] Go oracle is available **without a Go toolchain**: `/run/current-system/sw/bin/yggdrasil` (0.5.14, the exact version `reference/yggdrasil-go` pins) takes a JSON config on stdin (`-useconf`, `-genconf -json`). **It does not run unprivileged as written here** — corrected 2026-09-24 during Slice 2: startup ends in `panic: failed to create TUN: operation not permitted` (`cmd/yggdrasil/main.go:282`), so every capture runs inside `unshare -Un --map-root-user`, where TUN creation succeeds in a private net namespace with no real interfaces — and where `lo` starts *down*, which the harness fixes itself. Working command in `docs/protocol/20-handshake.md`. Vectors come from *capturing* it, not from transcribing Go tests. A Go **compiler** is still absent and still only needed for the ironwood `vecgen` harness.
 - [ ] Later: same CI workflow shape with a real Go oracle job, scheduled rather than per-push, on the machine that gets `languages.go`.
@@ -26,7 +26,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 
 - [x] Slice 1 — three-node loopback mesh test (the outstanding prerequisite; the refactor safety net) — DONE 2026-09-24, `tests/mesh3.rs`, 2.3 s, 5/5 clean runs
 - [x] Slice 2 — capture harness + first Go `meta` bytes (12/22 → 14/22) — DONE 2026-09-24, `examples/go_capture.rs` + `tests/go_vectors.rs` (3 tests), `docs/protocol/10-envelope.md` + `20-handshake.md`
-- [ ] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client`
+- [x] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client` — DONE 2026-09-24, `client/` member (`roots-client`, bin `roots`), `client/src/node.rs`, `client/tests/reconnect.rs`; the lib builds no `Router` outside `#[cfg(test)]`
 - [ ] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert
 - [ ] Slice 5 — one-task node loop + `link_id` dedup command queue
 - [ ] Slice 6 — Go-shaped config (proven by Go's own binary parsing it)
@@ -44,10 +44,10 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - **Product identity, settled 2026-09-24:** `roots-rs` is a reimplementation of
   the Go implementation whose second goal is to *document the actual protocol*.
   The library is the product. The client exists to mirror Go's client so the two
-  can be compared; it is currently stitched into this crate (`src/main.rs`,
-  `examples/`) and is meant to move out to its own binary or project once the
-  library can support it. Do not design library APIs around the client's
-  convenience.
+  can be compared; Slice 3 (2026-09-24) moved it out of the library into the
+  `client/` workspace member (`roots-client`), with root `examples/` left as
+  demo scaffolding around the lib. Do not design library APIs around the
+  client's convenience.
 - Multicast autopeering is **in scope**, as a real Gate 2 slice. Go's
   `src/multicast/` has no counterpart here; the "multicast" hits in
   `src/pathfind.rs` / `src/bloom.rs` are ironwood's DHT flooding gate, unrelated.
@@ -122,7 +122,8 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
   numbers whenever `reference/yggdrasil-go` is bumped.
 - **Gate 2 findings, decided in the draft (2026-09-24):**
   - `Client`/`Client::run_peer` (`src/lib.rs:47-155`) is node policy inside the
-    library and is the one real boundary violation. Rule going forward: the
+    library and is the one real boundary violation (evicted to
+    `client/src/node.rs` in Slice 3). Rule going forward: the
     library never constructs a `Router` for the caller.
   - Cargo forbids `[[bin]]` from using `[dev-dependencies]`, and the client needs
     `serde_json`/`tun`/`smoltcp`. That forces A/B/C — the draft recommends **B: a
@@ -151,3 +152,29 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     ephemeral `tls://` links that never back off or redial, dedup by
     (uri-minus-query, source interface), interface set rescanned every beacon
     tick. Darwin AWDL needs cgo; everything else is unprivileged.
+- **Slice 3 findings — the split is real, the dependency half is deferred.**
+  - `cargo run` from the root now **fails**: the root package is lib-only, so the
+    bin lives in the other package (`cargo run -q -p roots-client -- <uri>`;
+    `cargo run --bin roots` from the root also errors and names the package).
+    Anything that scripted the old form — AGENTS.md, `docs/protocol/*`, shell
+    history — must say `-p roots-client`.
+  - From a non-virtual workspace root `cargo test`/`cargo clippy` only select the
+    root package, so CI now runs `--workspace` for both. Without it the client's
+    `run_peer` and the reconnect test would go unlinted and unrun. `cargo fmt
+    --check` needs no change: from the root it already walks every member.
+  - **Deviation from the approved slice text:** the plan moved `tun` +
+    `serde_json` from the root `[dev-dependencies]` into the client's
+    `[dependencies]` in this slice. Not possible yet — root `examples/`
+    (`tun_ping`, `admin`, `proto_probe`) still use them and only leave in Slices
+    7 and 14. The client therefore declares only what it actually uses (`roots`,
+    `tokio`, `ed25519-dalek`, `rand`, `hex`), and the dev-dep deletion completes
+    with those moves. The invariant the slice was for still holds and is
+    measurable now: `cargo tree -p roots -e normal` lists 15 crates, none of them
+    client-only policy deps.
+  - Boundary proof, mechanically: every `Router::new` left in `src/` sits after
+    its file's `#[cfg(test)] mod tests` line (`router.rs` 113, `proto.rs` 238,
+    `tree.rs` 587 — first uses at 125, 276, 681). `client/src/node.rs` is the
+    only non-test site.
+  - `client/src/lib.rs` exists solely so `client/tests/reconnect.rs` can call
+    `roots_client::node::run_peer`; it is one `pub mod node;`. When Slices 5–7
+    add `config`/`links`/`admin` modules they go in that list.

@@ -20,8 +20,10 @@ jobs:
       - name: Format
         run: cargo fmt --check
 
+      # The repo is a workspace (`roots` lib + `client/`); without
+      # `--workspace` cargo only builds the root package.
       - name: Clippy
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --workspace --locked

@@ -67,7 +67,7 @@ Three ordering rules that are not obvious from the list:
       `TcpStream` plus our own `meta` exchange, not `link::dial` + a read loop,
       and no MITM relay turned out to be needed — `go_relay.rs` is not built.
 
-- [ ] **Slice 3 — workspace split; `Client` loses its loop.** `[workspace]
+- [x] **Slice 3 — workspace split; `Client` loses its loop.** `[workspace]
       members = ["client"]` in the root manifest, `[[bin]]` deleted from it,
       `src/main.rs` → `client/src/main.rs`, `run_peer` and `drive` deleted from
       `src/lib.rs`, their redial loop reborn as `client/src/node.rs`. `tun` +
@@ -75,6 +75,21 @@ Three ordering rules that are not obvious from the list:
       *Proves:* `cargo test --workspace` green with Slice 1 still passing, and
       `cargo tree -p roots` shows no client-only dependency. The library no
       longer constructs a `Router` for anyone.
+      **Done 2026-09-24:** `cargo test --workspace` green — 71 lib unit tests,
+      `mesh3` 2.30 s, `tcp_loopback`, `go_vectors` 3, and `reconnect` 11.0 s now
+      running as a client test; `cargo fmt --check`, `cargo clippy --workspace
+      --all-targets --locked -- -D warnings` (re-checked with the client targets
+      forced dirty) and `cargo metadata --locked` all clean. `cargo tree -p roots
+      -e normal` = 15 crates, none client-only. Boundary verified mechanically:
+      every remaining `Router::new` in `src/` is below its file's
+      `#[cfg(test)] mod tests` line; `client/src/node.rs` is the only non-test
+      site. **Deviation:** `tun`/`serde_json` stayed in the root
+      `[dev-dependencies]` — root `examples/tun_ping.rs`, `admin.rs` and
+      `proto_probe.rs` still need them and only move in Slices 7 and 14, so
+      deleting them here would have broken the build; the client declares just
+      `roots`, `tokio`, `ed25519-dalek`, `rand`, `hex`. CI gained `--workspace`
+      on clippy and test (from a non-virtual root cargo otherwise skips the
+      client), and `cargo run` needs `-p roots-client`.
 
 - [ ] **Slice 4 — `LinkSet` owns its links; sends say whether they landed.**
       The lifetime parameter goes away (entries hold `AnyConn`), `inbound` moves
@@ -193,8 +208,9 @@ publication, and running Go in CI.
 
 ## Stop points
 
-Every slice ends with `cargo fmt --check`, `cargo clippy --all-targets --locked
--- -D warnings`, `cargo test --locked` green plus whatever the slice added, and a
-commit shown to you. Slices 3, 4 and 5 are the ones worth re-steering after:
+Every slice ends with `cargo fmt --check`, `cargo clippy --workspace
+--all-targets --locked -- -D warnings`, `cargo test --workspace --locked` green
+(`--workspace` since Slice 3) plus whatever the slice added, and a commit shown
+to you. Slices 3, 4 and 5 are the ones worth re-steering after:
 they are where the workspace and the link-ownership shape become real, and a
 wrong call there costs the most to undo later.

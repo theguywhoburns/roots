@@ -1,7 +1,10 @@
 //! Demo client: connect to one peer, converge, optionally resolve an
 //! address and fetch its nodeinfo, hold the link, report status.
 //!
-//! Run: `cargo run -- [peer-uri] [hold_secs] [resolve-ipv6]`
+//! Node policy lives in this package (`roots_client::node`); the `roots`
+//! library only talks wires and owns state.
+//!
+//! Run: `cargo run -q -p roots-client -- [peer-uri] [hold_secs] [resolve-ipv6]`
 
 use std::time::Duration;
 
