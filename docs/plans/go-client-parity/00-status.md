@@ -274,4 +274,14 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
     dial assert. A refusal is invisible to the peer that caused it (Go's check
     runs after the listener writes its own `meta`), which the test asserts as
     `outbound.is_ok()`.
+  - **A live check found a fall-through bug the tests could not.** The first
+    `config_stage` returned `None` for `-useconffile` with no identity flag, which
+    sent `roots -useconffile /etc/yggdrasil.conf` into the demo probe — and the
+    probe dials a hard-coded default peer, so loading a config would have started
+    dialling out. Go's load cases (`main.go:105-119`) have no `return`, so it runs
+    a node there; ours now reports the identity and exits. Two things that follow
+    for Slice 7: our `defaults()`
+    sets `Listen: []`, so even a running node would be dial-only with nothing
+    inbound, and `IfName: "auto"` is carried but unused because `client/` has no
+    TUN code at all yet (the field exists so the key set matches Go's).
   - CI trio green at **97 unit + 10 integration tests** (~35 s wall).

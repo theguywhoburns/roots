@@ -68,6 +68,23 @@ not the client, and keep smoltcp as a dev-dep.
 >    output are dropped from the config slice. They are print paths around a
 >    running node, and nothing in the parity metric needs them; `-json` is
 >    accepted so a Go-shaped invocation line does not fail, and means nothing.
+> 5. **`-useconffile` alone must not reach the demo probe.** The first draft of
+>    `config_stage` returned `None` for a file source because the original slice
+>    text said "a `-useconffile` with no identity flag falls through to the
+>    probe", and the live check disproved both halves of that: an ordinary
+>    `yggdrasil -useconffile /etc/yggdrasil.conf` **runs a node**, and our probe
+>    dials a hard-coded default peer — so falling through would have made an
+>    operator's config load start dialling out. A config source is now handled by
+>    `ConfigLoaded` (identity printed, or a refusal to run a node we do not have
+>    yet, `AGENTS.md`). `-genconf` stays the one flag whose meaning is a print-and-
+>    exit *before* the identity stage, which is what `main.go:120-131` says; the
+>    load cases at `main.go:105-119` have **no** `return`, and Go can print a key
+>    from `-genconf` at all only because `main.go:93` already called
+>    `config.GenerateConfig()` — which is why our `generate()` owns a fresh
+>    identity instead of requiring a document.
+>    Consequence worth remembering when Slice 7 lands: our config currently sets
+>    `Listen: []`, so a node that did run would be dial-only and the probe would
+>    still be the only thing reaching a peer.
 
 ### Library changes
 
