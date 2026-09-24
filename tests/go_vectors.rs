@@ -16,6 +16,7 @@ use ed25519_dalek::SigningKey;
 use roots::PeerKind;
 use roots::frame::{self, FrameType};
 use roots::handshake::{Meta, PREAMBLE, SIG_LEN};
+use roots::{addr_for_key, subnet_for_key};
 
 /// The seed the capture configured into Go.
 const GO_SEED: [u8; 32] = [0x5c; 32];
@@ -159,5 +160,53 @@ fn go_link_frame_envelope_matches_captured() {
             raw,
             "{want:?}: our encoder must reproduce Go's framing"
         );
+    }
+}
+
+/// Addresses, and how Go renders them.
+///
+/// Captured 2026-09-24 from the installed 0.5.14 binary with
+/// `yggdrasil -useconf -address` / `-subnet` for each `PrivateKey`. Both flags
+/// return before Go touches a TUN (`cmd/yggdrasil/main.go:148-161`), so the
+/// capture needed no namespace and no privileges.
+///
+/// The keys were searched for, not picked: one has a lone zero group in the
+/// middle, the other has its only zero group last. Go prints through
+/// `net.IP.String()`, which collapses the longest run of *two or more* zero
+/// groups to `::` and leaves a single group as `0` even at the end — so the
+/// second vector is what proves a trailing zero is not collapsed, and the two
+/// subnets, which always end in four zero groups, what proves a run is. The
+/// leading `200` in each address is the other half of the point: Go writes a
+/// group without its leading zero.
+const GO_ADDRESS_VECTORS: &[(&str, &str, &str)] = &[
+    (
+        "e226000000000000000000000000000000000000000000000000000000000000\
+         f60f7fffa89be9ee53cf06df5b726dc2c5c01ba6e7e300dbe05ee5bfbe4fe52e",
+        "200:13e1:0:aec8:2c23:5861:f241:491b",
+        "300:13e1:0:aec8::/64",
+    ),
+    (
+        "dd90010000000000000000000000000000000000000000000000000000000000\
+         e1a84349ae7670f729420593ffffdc4a0fb8dfc5801710b001935a196301bc4f",
+        "200:3caf:796c:a313:1e11:ad7b:f4d8:0",
+        "300:3caf:796c:a313::/64",
+    ),
+];
+
+/// Our printing must be Go's character for character: an operator pastes these
+/// into a routing table or a `curl -g`, and `yggdrasilctl` output is compared
+/// against them by eye.
+#[test]
+fn go_address_and_subnet_strings_match_captured() {
+    for (private_hex, want_addr, want_subnet) in GO_ADDRESS_VECTORS {
+        let raw = bytes(private_hex);
+        assert_eq!(raw.len(), 64, "Go's PrivateKey is seed then public key");
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&raw[..32]);
+        let key = SigningKey::from_bytes(&seed);
+        let public = key.verifying_key().to_bytes();
+        assert_eq!(&raw[32..], &public[..], "vector must be one real key pair");
+        assert_eq!(addr_for_key(&public).to_string(), *want_addr);
+        assert_eq!(subnet_for_key(&public).to_string(), *want_subnet);
     }
 }

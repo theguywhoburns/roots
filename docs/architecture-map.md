@@ -70,9 +70,10 @@ Go-origin column is taken from each module's own port header and checked against
 | `handshake.rs` | `meta` TLV codec + signature, `Meta` struct, version gate | `src/core/version.go` |
 | `address.rs` | key -> IPv6 (`02…` node, `03…` subnet), `lookup_key_for_addr`, prefix scan | `src/address/address.go` |
 | `error.rs` | `Error` enum (thiserror) | — |
-| `main.rs` | *(moved, Slice 3)* now `client/src/main.rs` — demo probe: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil` subset |
+| `main.rs` | *(moved, Slice 3)* now `client/src/main.rs` — Go-shaped flag front end (`-genconf`/`-useconf`/`-useconffile` + `-address`/`-subnet`/`-publickey`, Go's `flag` rejection wording), then the demo probe: dial by scheme, hold, `ROOTS_DBG_DUMP` | `cmd/yggdrasil/main.go` |
 | `client/src/node.rs` | *(the other package)* `Cmd` + `Node`: the single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, drains commands between `DEFAULT_TICK` serve slices, is the only non-test `Router` builder | `core` `links` actor + `switch.go` |
 | `client/src/links.rs` | *(the other package)* `Links`: one `Entry` per `(link_id, sintf)` — Go's dedup, `LinkKind::{Persistent,Ephemeral}`, `SupervisedPeer` backoff, last error, dial tasks in/out over `LinkEvent`, `report()` | `core/link.go` `links.add`/`remove` |
+| `client/src/config.rs` | *(the other package, Slice 6)* `Config` with Go's `NodeConfig` key names **and declaration order**, `defaults()` = the Linux column, `generate`/`load`/`from_json` (strip nulls → deserialize → postprocess), `signing_key`/`address`/`subnet`/`link_options`/`to_json`, plus `Flags`/`ConfigSource`/`USAGE`. JSON only | `src/config/config.go` + `defaults_linux.go` |
 
 ## State ownership
 
@@ -192,7 +193,7 @@ better peer; else `dest == our key` → `handle_session_bytes`, where payload by
 `src/` talks wire and owns state. It never prints, never opens TUN, never serves
 admin, and never builds a `Router` for a caller. Everything that decides *what to
 do* lives in the `client/` package (`roots-client`: `main.rs`, `node.rs`,
-`links.rs`, and the config/admin/TUN/multicast slices to come) or in root
+`links.rs`, `config.rs`, and the admin/TUN/multicast slices to come) or in root
 `examples/` / `tests/`.
 
 Two things enforce it. Crate visibility: `smoltcp`, `serde_json` and `tun` are
@@ -246,6 +247,38 @@ is the configured-peer list: one `Entry` per `(link_id, sintf)` carrying kind,
   keeps running on a dead link and returns the error for anything else.
 - Command latency is bounded by `tick` (50 ms, `DEFAULT_TICK`), which is the
   price of the lock-free invariant (Gate 3, least-confident decision 3).
+
+## Config (Slice 6)
+
+`client/src/config.rs` is a **wire format**, not a settings bag: the proof is that
+the installed Go binary reads what we write and vice versa. Four rules carry that,
+each with a test that fails when the rule is broken:
+
+- **Key set and order are Go's.** `NodeConfig`'s declaration order
+  (`config.go:42-58`) is `encoding/json`'s output order, and `omitempty` sits on
+  exactly four fields (`PrivateKey`, `PrivateKeyPath`, `AdminListen`,
+  `LogLookups`) — so `skip_serializing_if` mirrors that list, and `-genconf`
+  blanks `AdminListen` first (`main.go:121`) so the key disappears the way Go's
+  does.
+- **Defaults come from overlaying, not from field attributes.** Go's `ReadFrom`
+  calls `GenerateConfig()` and parses the document *on top of* it
+  (`config.go:114-119`), so the struct carries `#[serde(default = "defaults")]`.
+  Per-field defaults would be wrong in an observable way: a config with no
+  `PrivateKey` must still boot, with a fresh identity each run.
+- **A JSON `null` is an absent key**, at every depth, because Go's decoder leaves
+  the destination untouched. `strip_nulls` runs before deserialising; without it
+  `{"IfMTU":null}` is a type error where Go shrugs.
+- **Address text is Go's text.** `Address`/`Subnet`'s `Display` (`src/address.rs`)
+  formats through `Ipv6Addr`/`net.IPNet` semantics. Byte derivation was always
+  correct; the *string* was zero-padded until Slice 6, which is exactly the class
+  of bug a byte vector cannot catch and a captured `-address` line can.
+
+Deliberate divergences: JSON only (no HJSON writer, no UTF-16 BOM sniff),
+`-json` accepted as a no-op, no `-normaliseconf`/`-exportkey`/`-autoconf`,
+`KeyMismatch` rejected where Go trusts the tail of `PrivateKey`, unknown *flags*
+rejected with Go's own wording while unknown *keys* are ignored like Go ignores
+them. Running a node from a config is Slice 7's; until then that path prints what
+it read and exits 2.
 
 ## Invariants — things that break silently
 

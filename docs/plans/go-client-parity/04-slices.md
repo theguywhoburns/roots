@@ -183,15 +183,51 @@ Three ordering rules that are not obvious from the list:
         Go's "link gone" vs "node broken" split without reaching into the
         `Error` enum's variants.
 
-- [ ] **Slice 6 — config that Go accepts.** `client/src/config.rs`: the
+- [x] **Slice 6 — config that Go accepts.** `client/src/config.rs`: the
       Go-shaped `Config` struct with Go's JSON key names, `defaults()`
       mirroring `src/config/defaults_linux.go`, `load`/`generate`, and the
       `-genconf` / `-useconf` / `-json` flags, and the config-to-`LinkOptions`
-      wiring — `allowed_keys` is already enforced in `src/link.rs:450-453`, so
+      wiring — `allowed_keys` is already enforced in `src/link.rs:580-585`
+      (line drifted from the `:450-453` this slice was planned against), so
       `AllowedPublicKeys` becomes a key in a list rather than a feature.
       *Proves:* `roots -genconf | yggdrasil -useconf -address` prints a real
       Yggdrasil address — the installed Go binary parses what we emit. A
       cross-implementation check with no compiler and no network.
+      **Done 2026-09-24:** the pipe runs green **both directions**, and the
+      reverse direction is stronger than the plan asked for — for one and the
+      same config, `yggdrasil -useconf` and `roots -useconf` print the same
+      `-address`, the same `-subnet` and the same `-publickey`:
+
+      ```sh
+      cargo build -q -p roots-client
+      R=./target/debug/roots; Y=/run/current-system/sw/bin/yggdrasil
+      $R -genconf | $Y -useconf -address        # Go parses what we emit
+      $Y -genconf -json | $R -useconf -address  # we parse what Go emits
+      K=$(grep -o 'cea91b87[0-9a-f]*' client/src/config.rs | head -1)
+      CFG="{\"PrivateKey\":\"$K\"}"             # the committed Go fixture key
+      for f in address subnet publickey; do echo "$($Y -useconf -$f <<<"$CFG")"; done
+      for f in address subnet publickey; do echo "$($R -useconf -$f <<<"$CFG")"; done
+      ```
+
+      Both loops print the same three lines: `201:c6de:e01b:c88a:8ee1:5666:52d7:d1e7`,
+      `301:c6de:e01b:c88a::/64`, `4e4847f90ddd…1bb4ae`.
+      No privileges needed: Go returns from the identity flags at
+      `main.go:147-165`, before it touches a TUN.
+      9 unit tests in `config.rs`, 2 in `client/tests/allowlist.rs`, 1 new
+      vector test in `tests/go_vectors.rs`; the CI trio is green
+      (97 unit + 10 integration, ~35 s). Each behaviour was reverted one at a
+      time to name what fails:
+
+      | Reverted behaviour | Killed by |
+      |---|---|
+      | Address/subnet text is Go's `net.IP.String()` (`src/address.rs`) | `go_address_and_subnet_strings_match_captured` — left `"0200:13e1:0000:aec8:…"`, right `"200:13e1:0:aec8:…"` |
+      | A JSON `null` means *absent*, at every depth (`strip_nulls`) | `absent_and_null_keys_keep_defaults_and_present_ones_replace_them` — `nulls are legal: Json("invalid type: null, expected u64")` |
+      | `AllowedPublicKeys` gates the inbound side only (`is_inbound`, `src/link.rs:580`) | `allowed_public_keys_gate_inbound_links_only:53` — the unlisted peer is not refused |
+      | …and the same guard applied to *both* directions | the same test at `:81` — `an allowlist of my own must not block my dial: KeyNotAllowed` |
+      | `-genconf` blanks `AdminListen` before marshalling (`main.go:121`) | `generated_config_has_go_keys_and_defaults:493` — our output gains a key Go's has omitted |
+      | A `PrivateKey` that is not Go's 64 bytes is refused (`KeyBytes`, `config.go:253`) | `a_key_that_is_not_gos_shape_is_refused:631` |
+      | `PrivateKeyPath` overrides the inline key (`config.go:130-135`) | `private_key_path_overrides_the_inline_key:666` |
+      | `-useconf` beats `-useconffile` (`main.go:105-118`) | `config_flags_parse_like_gos_flag_package:695` |
 
 - [ ] **Slice 7 — admin framing parity (tcp + unix, keepalive, error text).**
       `serve_admin` dispatches on scheme like Go (`unix:///…` is Go's Linux

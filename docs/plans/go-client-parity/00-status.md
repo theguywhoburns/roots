@@ -29,7 +29,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client` — DONE 2026-09-24, `client/` member (`roots-client`, bin `roots`), `client/src/node.rs`, `client/tests/reconnect.rs`; the lib builds no `Router` outside `#[cfg(test)]`
 - [x] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert — DONE 2026-09-24, see the "Done 2026-09-24" block under Slice 4 in `04-slices.md` for the mutation-attribution table
 - [x] Slice 5 — one-task node loop + `link_id` dedup command queue — DONE 2026-09-24, `client/src/links.rs` + `client/src/node.rs` (`Cmd`/`Node::run`), `client/tests/node_loop.rs`; `run_peer` deleted, `reconnect.rs` moved onto `Node`; mutation table in `04-slices.md`
-- [ ] Slice 6 — Go-shaped config (proven by Go's own binary parsing it)
+- [x] Slice 6 — Go-shaped config (proven by Go's own binary parsing it) — DONE 2026-09-24, `client/src/config.rs` + `client/src/main.rs` flags + `client/tests/allowlist.rs` + `tests/go_vectors.rs` address/subnet string vectors; `src/address.rs` `Display` fixed to Go's text form
 - [ ] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings
 - [ ] Slice 8 — `getPeers` content parity: three sort modes + full field set
 - [ ] Slice 9 — remote queries via `next_hop`; `removePeer` stops lying
@@ -226,3 +226,52 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
   - CI trio green at 88 unit + 7 integration tests (~31 s wall): `cargo fmt
     --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
     `cargo test --workspace --locked`.
+- **Slice 6 findings — config is a wire format, and the address text was the bug.**
+  - **The library had a real parity bug, found by a Go fixture rather than by
+    review.** `Address`/`Subnet`'s `Display` emitted zero-padded groups
+    (`0201:…`, `200:13e1:0000:…`); Go prints through `net.IP.String()`, which
+    drops leading zeros and collapses the longest run of ≥2 zero groups to `::`.
+    `src/address.rs` now formats via `std::net::Ipv6Addr`, whose `Display` is the
+    same RFC 5952 rule, and `Subnet`'s appends `/64` like `net.IPNet.String()`.
+    Every `-address`/`-subnet`/`-publickey` output downstream inherits the fix —
+    including the probe's own `local/remote/parent/root` lines
+    (`client/src/main.rs:18`), which printed `0200:…` before this slice.
+    `Router::dump` prints hex keys, not addresses, so it is unaffected.
+    Pinned by two searched Go-captured vectors in `tests/go_vectors.rs` whose
+    text contains a collapsed run *and* a single interior zero group, which is
+    what a naive implementation gets wrong.
+  - **The pipe proof is symmetric and needs no privileges.** Beyond the planned
+    `roots -genconf | yggdrasil -useconf -address`, the same config fed to both
+    `-useconf` implementations yields byte-identical `-address`, `-subnet` and
+    `-publickey`. Go returns from the identity flags at `main.go:147-165`, before
+    the TUN `panic`, so this runs on a bare machine — worth reusing as the shape
+    of proof for later config work.
+  - **Three Go behaviours had to be copied, not invented.** (a) `ReadFrom`
+    generates first and parses *on top* (`config.go:114-119`), so
+    `#[serde(default = "defaults")]` on the struct — not on each field — is what
+    makes an absent key keep its default; (b) encoding/json leaves the
+    destination untouched for a JSON `null`, at every depth, hence the recursive
+    `strip_nulls` before deserialising — without it `{"IfMTU":null}` is a type
+    error where Go shrugs; (c) `-genconf` blanks `AdminListen` before marshalling
+    (`main.go:121`) so the `omitempty` tag drops it — a generated config that
+    *does* carry `AdminListen: "unix:///var/run/yggdrasil.sock"` would be a
+    different key set from Go's and fails the byte-shape test.
+  - **Known divergences, all deliberate and recorded in `03-program-design.md`:**
+    JSON only (no HJSON writer, no BOM/UTF-16 sniff at `config.go:102-110`), so
+    `-json` is accepted and means nothing; no `-normaliseconf`, `-exportkey`,
+    `-autoconf`, `-logto`, `-user`; unknown flags are rejected with Go's own
+    `flag` wording because a silently ignored `-suseconf` typo is the worst
+    failure mode an operator can have; `KeyMismatch` (seed ≠ public half) is an
+    error where Go takes `PrivateKey[32:]` unchecked; running a node from a
+    config is Slice 7's, and until then that path prints the address it read and
+    `exit(2)` rather than falling through to the demo probe and dialling out with
+    an identity the operator only asked us to read.
+  - **`AllowedPublicKeys` was already enforced and never exercised.** The gate at
+    `src/link.rs:580-585` predates the plan (whose citation `:450-453` has
+    drifted); `client/tests/allowlist.rs` is its first test, and it pins both
+    halves of Go's comment "This does not affect outgoing peerings" — dropping
+    `is_inbound` fails the refusal assert, applying the gate both ways fails the
+    dial assert. A refusal is invisible to the peer that caused it (Go's check
+    runs after the listener writes its own `meta`), which the test asserts as
+    `outbound.is_ok()`.
+  - CI trio green at **97 unit + 10 integration tests** (~35 s wall).

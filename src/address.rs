@@ -132,12 +132,22 @@ impl Subnet {
 
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let g: Vec<String> = self
-            .0
-            .chunks(2)
-            .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
-            .collect();
-        write!(f, "{}", g.join(":"))
+        // Go prints an address through `net.IP.String()`: lowercase groups with
+        // no leading zeros, and the longest run of zero groups collapsed to `::`
+        // (leftmost wins a tie). `Ipv6Addr`'s `Display` is the same rule, and an
+        // yggdrasil address never hits its IPv4-in-IPv6 special case because the
+        // first byte is `NODE_PREFIX`.
+        write!(f, "{}", std::net::Ipv6Addr::from(self.0))
+    }
+}
+
+impl std::fmt::Display for Subnet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Go's `-subnet` prints a `net.IPNet`: the prefix in the same
+        // compressed form as an address, then the mask length.
+        let mut octets = [0u8; ADDR_LEN];
+        octets[..SUBNET_LEN].copy_from_slice(&self.0);
+        write!(f, "{}/64", std::net::Ipv6Addr::from(octets))
     }
 }
 

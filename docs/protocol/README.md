@@ -22,7 +22,7 @@ Rules for these pages:
 |------|--------|--------|-----------|
 | [10-envelope.md](10-envelope.md) | link frame envelope: uvarint size, packet type, all 10 types | captured from Go 0.5.14 | `go_link_frame_envelope_matches_captured` |
 | [20-handshake.md](20-handshake.md) | `meta` handshake: TLVs, keyed-hash signature, version check, flow | captured from Go 0.5.14, both password branches | `go_meta_handshake_bytes_match_captured`, `go_meta_password_binds_the_signature` |
-| — | address derivation (`src/address.rs`) | proven by vectors, undocumented | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go` |
+| — | address derivation (`src/address.rs`) | proven by vectors, undocumented | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured` (the *text* Go prints for `-address`/`-subnet`) |
 | — | `SigReq` / `SigRes` / `Announce` payloads | undocumented | `announce_chain_verifies`; envelope only so far |
 | — | bloom filter (`BloomFilter`) | undocumented | `bloom_vector_matches_go` |
 | — | `PathLookup` / `PathNotify` / `PathBroken` | undocumented | `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go` |

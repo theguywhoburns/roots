@@ -20,7 +20,7 @@ Go citations verified 2026-09-24 against `reference/yggdrasil-go` `422836e`
 | `src/main.rs` | **moved** to `client/src/main.rs` (git mv) | The demo probe is client policy. |
 | `client/Cargo.toml` | new: `name = "roots-client"`, `[[bin]] name = "roots"`, deps `roots = { path = ".." }`, tokio, serde_json, hex, ed25519-dalek, rand, tun, regex | `[[bin]]` cannot see `[dev-dependencies]`, which is what forced option B. |
 | `client/src/lib.rs` | new, empty-ish: `mod` declarations only | Lets `client/tests/` exist. |
-| `client/src/config.rs` | new | Go-shaped config: read/generate/normalise. |
+| `client/src/config.rs` | new | Go-shaped config: read/generate/normalise. → landed in Slice 6 as read/generate/**no normalise** (`-normaliseconf` is not implemented; see the Slice 6 corrections below). |
 | `client/src/node.rs` | new | The single-task node loop (`Router` + `LinkSet` + command queue). Absorbs `Client::run_peer` and `drive`. |
 | `client/src/links.rs` | new | Link manager: dial/listen tasks, per-URI backoff, the `link_id` dedup map Go has in `links.add`. |
 | `client/src/admin.rs` | moved from `examples/admin.rs`, rewritten for parity | |
@@ -52,6 +52,22 @@ not the client, and keep smoltcp as a dev-dep.
 > 4. `cargo run` from the root fails with "no bin target named `roots` in
 >    default-run packages" — every documented invocation is now
 >    `cargo run -q -p roots-client -- …`.
+>
+> **Corrections, 2026-09-24 (Slice 6, config).**
+>
+> 1. `client/tests/allowlist.rs` (new, 2 tests) is not in the table above. It is
+>    where `AllowedPublicKeys` gets its first end-to-end exercise, so the config →
+>    `LinkOptions` → `complete_accept` wiring has a test that a socket can fail.
+> 2. `src/address.rs` did **not** arrive "already complete": its `Display` impls
+>    zero-pad (`0200:13e1:0000:…`) where Go's `net.IP.String()` does not
+>    (`200:13e1:0:…`). Slice 6 found this by feeding the real Go binary a
+>    committed config, not by reading the module. See the row below.
+> 3. `tests/go_vectors.rs` gained address/subnet **string** vectors. The byte
+>    vectors that were there could not catch a formatting bug; these can.
+> 4. `-normaliseconf`, `-exportkey`, `-autoconf`, `-logto`, `-user` and HJSON
+>    output are dropped from the config slice. They are print paths around a
+>    running node, and nothing in the parity metric needs them; `-json` is
+>    accepted so a Go-shaped invocation line does not fail, and means nothing.
 
 ### Library changes
 
@@ -64,7 +80,7 @@ not the client, and keep smoltcp as a dev-dep.
 | `src/traffic.rs`, `src/pathfind.rs`, `src/tree.rs`, `src/bloom.rs` | `links.write` → `write`/`write_via` per call site (11 sites). |
 | `src/views.rs` | `peer_cost`, `next_hop`, `link_stats`, `pending_routes`. |
 | `src/router.rs` | `frames: [u64; FRAME_KINDS]` + const assertion; `dropped_no_link` counter. |
-| `src/address.rs` | nothing (already complete). |
+| `src/address.rs` | ~~nothing (already complete)~~ — Slice 6 rewrote `Address`/`Subnet`'s `Display` to Go's `net.IP.String()` / `net.IPNet.String()` text. Byte derivation was always right; the string was not. |
 | `src/peer.rs` | `PeerState` unchanged; `PeerConn`/`AnyConn` gain `inbound`. |
 
 ### Docs
@@ -270,22 +286,43 @@ instead of stacking.
 
 ```rust
 // client/src/config.rs — Go key names, Go defaults, JSON in and out.
-pub struct Config { pub listen: Vec<String>, pub peers: Vec<String>,
-    pub interface_peers: HashMap<String, Vec<String>>, pub admin_listen: String,
-    pub multicast_interfaces: Vec<MulticastIface>, pub node_info: HashMap<String, Value>,
-    pub allowed_public_keys: Vec<String>, pub tunnel_local_traffic: bool,
-    pub password: String, pub port: u16 }
+// Shipped as of Slice 6. The sketch below was written from memory of Go's
+// config and was wrong in three places, all corrected against
+// `src/config/config.go:42-58`: `NodeConfig` has no `TunnelLocalTraffic` and no
+// `Port` (both belong to older releases), `NodeInfo` is `null`-able so it maps
+// to `Option<Map<…>>`, and `priority` is a `uint64` in
+// `MulticastInterfaceConfig` even though it is a `uint8` on the wire
+// (`config.go:60-67`).
+pub struct Config { … }          // Go's field order; #[serde(default = "defaults",
+                                 // rename_all = "PascalCase")], `IfMTU` renamed explicitly
 pub struct MulticastIface { pub regex: String, pub beacon: bool, pub listen: bool,
-    pub port: u16, pub priority: u8, pub password: String }
-/// Go's defaults are per-platform (`src/config/defaults_linux.go:6-28`); we
+    pub port: u16, pub priority: u64, pub password: String }
+/// Go's defaults are per-platform (`src/config/defaults_linux.go:7-25`); we
 /// mirror the Linux column: AdminListen `unix:///var/run/yggdrasil.sock`,
 /// MulticastInterfaces `[{Regex:".*",Beacon:true,Listen:true}]`, IfMTU 65535,
-/// IfName "auto". Consequence: the admin socket has to speak `unix://` too, not
+/// IfName "auto". `MaximumIfMTU` is declared there and never read, so we do not
+/// carry it, and `DefaultConfigFile` belongs to `yggdrasilctl`, not the node.
+/// Consequence: the admin socket has to speak `unix://` too, not
 /// just `tcp://` — Go dispatches on scheme (`admin.go:91,123`) and today's
 /// `examples/admin.rs` only binds TCP.
-pub fn defaults() -> Config;                 // mirrors defaults_linux.go
-pub fn load(path: Option<&str>) -> Result<Config, Error>;   // "-" = stdin, like -useconf
-pub fn generate() -> Result<String, Error>;  // -genconf
+pub fn defaults() -> Config;                         // mirrors defaults_linux.go, fresh key
+impl Config {
+    pub fn generate() -> String;                     // -genconf: defaults, AdminListen blanked
+    pub fn load(source: &ConfigSource) -> Result<Config, ConfigError>;
+    pub fn from_json(text: &str) -> Result<Config, ConfigError>;  // strip nulls, then postprocess
+    pub fn signing_key(&self) -> Result<SigningKey, ConfigError>; // 64 B seed||pub, KeyMismatch checked
+    pub fn address(&self) -> Result<Address, ConfigError>;
+    pub fn subnet(&self) -> Result<Subnet, ConfigError>;
+    pub fn link_options(&self) -> Result<LinkOptions, ConfigError>;  // AllowedPublicKeys -> allowlist
+    pub fn to_json(&self) -> String;
+}
+pub enum ConfigSource { Stdin, File(String) }        // -useconf / -useconffile
+pub struct Flags { genconf, useconf, useconffile, address, subnet, publickey,
+                   json, help, rejected: Option<String>, positionals: Vec<String> }
+impl Flags {
+    pub fn parse(args: &[String]) -> Flags;          // Go's `flag` wording on rejection
+    pub fn source(&self) -> Option<ConfigSource>;    // -useconf beats -useconffile
+}
 
 // client/src/node.rs — owns the Router, the LinkSet and the queue. Nothing else may.
 pub enum Cmd {
@@ -353,13 +390,22 @@ fn sort_peers(entries: &mut Vec<PeerEntry>, by: SortBy);   // stable, Go's three
 
 ## Call stack
 
-**Startup** (`client/src/main.rs`): `config::load` → `Node::new` → spawn listeners
-(`tls_listen`/`ws_listen`/`quic_listen`/`listen`) each sending `Cmd::Accept` →
-spawn persistent dials (`Cmd::Dial{persistent:true}` behind `SupervisedPeer`) →
+**Startup** (`client/src/main.rs`): `Flags::parse` → `rejected`/`-h` → config →
+`Node::new` → spawn listeners (`tls_listen`/`ws_listen`/`quic_listen`/`listen`)
+each sending `Cmd::Accept` → spawn persistent dials
+(`Cmd::Dial{persistent:true}` behind `SupervisedPeer`) →
 spawn `admin::serve_admin` → spawn `multicast::run` (socket + timers +
 `Multicast::announce`/`receive`, commands into `Node`) → spawn `tun::bridge` if
-`TunnelLocalTraffic` → `Node::run`. Every task talks to the node only through
-`Cmd`; only `run` touches `Router`/`LinkSet`.
+`IfName`/`IfMTU` ask for one → `Node::run`. Every task talks to the node only
+through `Cmd`; only `run` touches `Router`/`LinkSet`.
+
+**As shipped by Slice 6, the chain stops after config.** `config_stage` handles
+`-genconf` (print and exit) and the load path, then prints `-address`/`-subnet`/
+`-publickey` in Go's order and exits; a loaded config with nothing to print is
+reported (`config loaded for address …`) and `exit(2)`, because wiring a whole
+node to a config is Slice 7's admin work and dialling out with an identity the
+operator only asked us to *read* would be worse. `TunnelLocalTraffic` is gone from
+the sketch above: it is not a 0.5.14 `NodeConfig` field.
 
 **Multicast beacon in** — client `recv_from` → `Multicast::receive(zone, from,
 buf)` → decode → version/self checks → iface lookup → `membership_hash` compare →
@@ -501,7 +547,22 @@ hermetic.
    router would be a more natural home for peer statistics (Go keeps them on
    `peer`), but `Router` never sees raw reads — the set is the only place both
    directions pass. If we later move I/O behind the router, this moves back.
-6. **Config unknown keys are an error.** Go's `-useconf` tolerates junk keys
-   silently. Strictness helps operators find typos and hurts nobody… unless
-   someone pipes a Go-generated config at us, which is exactly what an
-   interop test will do. Revisit at the first live check.
+6. **Config unknown keys are an error.** RESOLVED THE OTHER WAY at Slice 6
+   (2026-09-24). We are lenient, exactly like Go: Go's `DisallowUnknownFields`
+   call sits in the admin decoder (`admin.go`) and is inert on the config path, so
+   `encoding/json` ignores junk keys, and an unknown key in a config file is a
+   *typo in a key Go renamed* far more often than it is a typo we can catch.
+   Piped Go output is the case that must never break, so it decided the question.
+   `unknown_keys_are_ignored_like_go` is the test. The strictness we do keep is
+   about flags, not keys: an unknown *flag* is rejected with Go's `flag` wording,
+   because `-suseconf` silently running the demo probe is a footgun an operator
+   cannot see.
+7. **A `null` in a config is an error.** Also resolved at Slice 6: Go's
+   `encoding/json` leaves the destination untouched for `null`, at every depth, so
+   a null is *identical to absent*. Reproduced by stripping nulls recursively
+   before deserialising — the alternative is a per-field `deserialize_with` on 14
+   fields that still would not cover nulls inside `MulticastInterfaces` entries.
+   Divergences we chose to keep, and why they cannot hurt interop, are in
+   `00-status.md` under "Slice 6 findings": JSON-only output (`-json` is a no-op),
+   no HJSON/UTF-16 BOM sniff, `KeyMismatch` checked where Go trusts the tail, and
+   no `-normaliseconf`/`-exportkey`/`-autoconf` until something asks for them.
