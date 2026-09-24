@@ -296,6 +296,9 @@ mod tests {
         // Roots local advertises vendor; decodes as Roots.
         let m = Meta::local(&pk, 0);
         let enc = m.encode(&sk, b"").unwrap();
+        // Documented in docs/protocol/20-handshake.md: Go's 123 bytes plus a
+        // 9-byte vendor TLV and an 8-byte features TLV.
+        assert_eq!(enc.len(), 123 + 9 + 8, "roots meta length");
         let dec = Meta::decode(&enc, b"").unwrap();
         assert_eq!(dec, m);
         assert!(dec.peer_kind().is_roots());

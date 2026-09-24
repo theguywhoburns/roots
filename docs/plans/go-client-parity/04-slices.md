@@ -39,7 +39,7 @@ Three ordering rules that are not obvious from the list:
       infos and only B holds 3 — the ends never learn each other from the tree.
       Recorded in `docs/architecture-map.md` and `AGENTS.md`.
 
-- [ ] **Slice 2 — the capture harness and the first Go `meta` bytes.**
+- [x] **Slice 2 — the capture harness and the first Go `meta` bytes.**
       `examples/go_capture.rs`: write a JSON config, start
       `/run/current-system/sw/bin/yggdrasil -useconf`, dial its `Listen` port
       with our `Tcp`, tee raw bytes both directions, decode the `meta`, exit.
@@ -50,6 +50,22 @@ Three ordering rules that are not obvious from the list:
       written from the capture, with the real bytes at real offsets.
       *Proves:* the worst coverage hole (12 of 22 → 14 of 22) is closable here,
       and closes repeatably.
+      **Done 2026-09-24:** both `meta` branches are byte-identical to Go 0.5.14
+      (123 B, TLVs at 6/12/18/54, signature at 59), a re-run reproduces them
+      exactly, and three real Go frames (`SigReq`, `BloomFilter`, `Announce`)
+      pin the envelope. `tests/go_vectors.rs` is 3 tests inside
+      `cargo test --locked`, pure committed hex — no Go, no namespace, no
+      network in CI. Mutation proof: setting `PROTOCOL_MINOR = 6` fails both
+      meta tests at offset 15 (the minor value byte); reverted, and the only
+      `src/` change left is one roots-`meta`-size assert in `handshake.rs`.
+      `docs/protocol/README.md` + `10-envelope.md` + `20-handshake.md` written
+      from these bytes.
+      **Three traps found, all handled by the harness now** (detail in
+      `00-status.md`): Go panics without a private namespace, a fresh netns has
+      `lo` down, and a link carrying the listener's own key dies silently as
+      `ErrLinkToSelf`. **Gate 3 deviation:** the frames path is a bare
+      `TcpStream` plus our own `meta` exchange, not `link::dial` + a read loop,
+      and no MITM relay turned out to be needed — `go_relay.rs` is not built.
 
 - [ ] **Slice 3 — workspace split; `Client` loses its loop.** `[workspace]
       members = ["client"]` in the root manifest, `[[bin]]` deleted from it,

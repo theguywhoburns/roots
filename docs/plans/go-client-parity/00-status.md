@@ -17,7 +17,7 @@ every interop claim lives in prose. Agreed scope:
 
 - [x] Static CI — `.github/workflows/ci.yml` written 2026-09-24: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` on `ubuntu-latest` with the pinned nightly. No Go, no submodules, no live peers. All three commands verified green locally (71 unit + 2 loopback integration tests, ~25 s); **not yet observed running on a runner** — first push confirms it.
 - [x] Three-node local mesh test — done as Slice 1 (`tests/mesh3.rs`, 2026-09-24): Rust↔Rust↔Rust A—B—C over one loopback listener, asserting tree convergence, a DHT resolve across the hop, transit forwarding through a node that cannot consume the traffic, dead-link eviction, and a session that survives it. Runs inside `cargo test --locked`, so CI covers it.
-- [x] Go oracle is available **without a Go toolchain**: `/run/current-system/sw/bin/yggdrasil` (0.5.14, the exact version `reference/yggdrasil-go` pins) takes a JSON config on stdin (`-useconf`, `-genconf -json`) and runs unprivileged with no TUN. Vectors come from *capturing* it, not from transcribing Go tests. A Go **compiler** is still absent and still only needed for the ironwood `vecgen` harness.
+- [x] Go oracle is available **without a Go toolchain**: `/run/current-system/sw/bin/yggdrasil` (0.5.14, the exact version `reference/yggdrasil-go` pins) takes a JSON config on stdin (`-useconf`, `-genconf -json`). **It does not run unprivileged as written here** — corrected 2026-09-24 during Slice 2: startup ends in `panic: failed to create TUN: operation not permitted` (`cmd/yggdrasil/main.go:282`), so every capture runs inside `unshare -Un --map-root-user`, where TUN creation succeeds in a private net namespace with no real interfaces — and where `lo` starts *down*, which the harness fixes itself. Working command in `docs/protocol/20-handshake.md`. Vectors come from *capturing* it, not from transcribing Go tests. A Go **compiler** is still absent and still only needed for the ironwood `vecgen` harness.
 - [ ] Later: same CI workflow shape with a real Go oracle job, scheduled rather than per-push, on the machine that gets `languages.go`.
 
 ## Slices
@@ -25,7 +25,7 @@ every interop claim lives in prose. Agreed scope:
 Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 
 - [x] Slice 1 — three-node loopback mesh test (the outstanding prerequisite; the refactor safety net) — DONE 2026-09-24, `tests/mesh3.rs`, 2.3 s, 5/5 clean runs
-- [ ] Slice 2 — capture harness + first Go `meta` bytes (12/22 → 14/22)
+- [x] Slice 2 — capture harness + first Go `meta` bytes (12/22 → 14/22) — DONE 2026-09-24, `examples/go_capture.rs` + `tests/go_vectors.rs` (3 tests), `docs/protocol/10-envelope.md` + `20-handshake.md`
 - [ ] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client`
 - [ ] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert
 - [ ] Slice 5 — one-task node loop + `link_id` dedup command queue
@@ -84,6 +84,42 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
   deleting the `links.remove` eviction in `serve_links` fails its phase 4, and
   deleting the transit write in `traffic.rs::handle_inbound_traffic` fails its
   phase 3. Both mutations were reverted; `git diff` on `src/` is clean.
+- **Slice 2 findings — the oracle mechanism works, three traps in it.**
+  - The Go node **panics at startup without privileges** (`failed to create
+    TUN: operation not permitted`, `cmd/yggdrasil/main.go:282`). Run captures in
+    `unshare -Un --map-root-user`; inside it Go makes a TUN in a private net
+    namespace that has no real interfaces, peers over loopback, and never
+    touches the host. The status bullet that claimed "runs unprivileged with no
+    TUN" was wrong and is corrected above.
+  - **A link dialed with the listener's own keypair dies silently.** Go checks
+    the remote `meta` public key against its own and returns `ErrLinkToSelf`
+    (`link.go:661-663`, `:158`), so the handshake completes, Go closes, and no
+    frame ever arrives. That cost an hour of empty captures. `go_capture.rs`
+    therefore uses a second identity (`OUR_SEED`) for the `--frames` window and
+    Go's seed only to re-sign its own `meta`. **This also invalidates Gate 3's
+    capture design**: the plan assumed "`link::dial` handles the handshake, then
+    a plain read loop" for the `--frames` path, but `link::dial` consumes the
+    remote `meta` inside the handshake and hands back no raw bytes, which is
+    exactly what a capture needs. The harness therefore holds a bare
+    `TcpStream`, performs the `meta` exchange itself (`read_meta`, then writing
+    our re-encoded bytes), and reads envelope frames with `read_frame_raw`. The
+    MITM variant (`go_relay.rs`) is unnecessary for this: tee-ing one raw socket
+    in both directions is enough, and Slice 2 shipped without it. See
+    `examples/go_capture.rs`.
+  - `?password=` is capped at `blake2b.Size` = 64 (`link.go:200-205`), which is
+    our `MAX_PASSWORD_LEN`; empty and absent are the same unkeyed branch, now
+    proven against Go's own bytes rather than asserted.
+  - Two more traps, both fixed in the harness rather than remembered: a fresh
+    netns has **`lo` down**, so every loopback connect is `ENETUNREACH` (the
+    harness runs `ip link set lo up`, which is what its in-namespace
+    `CAP_NET_ADMIN` is for), and an orphaned Go child **inherits our stdout**,
+    so a panicking capture leaves `go_capture | tail` hanging forever instead of
+    reporting the failure (`Go` is now a Drop guard that kills and reaps).
+- **Open risk recorded in `docs/protocol/20-handshake.md`:** our vendor and
+  features tags are 4 and 5 — the *next* numbers after Go's `iota` block, not
+  reserved out-of-band numbers. If upstream adds a real tag 4 or 5 first, Go
+  applies its length check to our value and refuses the link. Re-check those two
+  numbers whenever `reference/yggdrasil-go` is bumped.
 - **Gate 2 findings, decided in the draft (2026-09-24):**
   - `Client`/`Client::run_peer` (`src/lib.rs:47-155`) is node policy inside the
     library and is the one real boundary violation. Rule going forward: the
