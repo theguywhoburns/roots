@@ -477,10 +477,11 @@ Three ordering rules that are not obvious from the list:
       of the returned `AnyConn` (`client/src/node.rs:324,357`). Recorded as a
       TODO, not a parity fix.
 
-      **Every behaviour reverted one at a time.** Twelve reverts in the library,
-      three in the client's row set, ten in the admin body — a mutation counted
-      as killed only if a test names it, and cargo stops at the first failing
-      test target, so each client revert ran against both files separately.
+      **Every behaviour reverted one at a time.** Nineteen reverts — six in the
+      library, three in the client's row set, ten in the admin body. A mutation
+      counts as killed only if a test names it, and cargo stops at the first
+      failing test target, so each client revert ran against `peer_rows` and
+      `admin_loopback` separately.
 
       *8a — the library (`src/link.rs`, `src/tree.rs`):*
 
