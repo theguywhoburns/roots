@@ -323,6 +323,33 @@ running Go node, so the vector slices come *before* the doc pages that cite
 them; `docs/protocol/20-handshake.md` is written in the same slice as its
 vector, never after.
 
+> **Correction, 2026-09-24 (Slice 2, after the harness was built). The decision
+> to capture rather than transcribe stands and was right; four mechanics in the
+> section above were wrong.**
+>
+> 1. `AdminListen: "tcp://127.0.0.1:19xxx"` is unnecessary — `""` disables admin
+>    and removes a port to collide with. `TunnelLocalTraffic: false` does **not**
+>    stop Go from creating a TUN: `cmd/yggdrasil/main.go:282` panics on
+>    `operation not permitted` for any unprivileged start, so the oracle runs
+>    under `unshare -Un --map-root-user` — and a fresh netns has `lo` down, which
+>    the harness raises itself.
+> 2. "Dial it with our `Tcp` transport while a `tee` wrapper records raw bytes"
+>    cannot work: `link::dial` consumes the remote `meta` inside the handshake
+>    and returns no raw bytes, which is the entire object of the exercise. The
+>    harness holds a bare `TcpStream`, reads Go's `meta` verbatim (`read_meta`),
+>    writes its own re-encoded bytes, then reads envelope frames
+>    (`read_frame_raw`).
+> 3. A **second identity is required**, not optional. A link whose `meta` carries
+>    the listener's own key is accepted and then closed silently
+>    (`ErrLinkToSelf`, `core/link.go:158`, checked at :662), so the `--frames`
+>    window produced nothing until the harness dialled as a separate node.
+>    `OUR_SEED` is now part of the design.
+> 4. Shape 2 (`examples/go_relay.rs`, the Go↔Go MITM) turned out **not** to be
+>    needed for the first kinds: one dialled listener already yields Go's write
+>    path for `meta`, `SigReq`, `BloomFilter` and `Announce`, so Slice 2 shipped
+>    without it. It stays in the plan at Slice 13, where a session `ack`/`key`
+>    rotation is the only remaining thing that needs two Go nodes.
+
 ## Test plan
 
 Named before they exist. Every "fail" column says what the test does to today's
