@@ -28,7 +28,7 @@ async fn main() {
         .await
         .expect("register");
     // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
     let mut outbox = vec![(go_key, b"hello-oracle".to_vec())];
     for i in 0..120 {
         if let Err(e) = router

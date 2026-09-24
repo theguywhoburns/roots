@@ -236,7 +236,7 @@ impl crate::router::Router {
     }
     async fn send_req(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let req = self.new_req();
@@ -252,7 +252,7 @@ impl crate::router::Router {
     /// Answer an inbound SigReq (Go `_handleRequest`).
     pub(crate) async fn handle_request(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer_key: [u8; KEY_LEN],
         req: SigReq,
     ) -> Result<(), Error> {
@@ -386,7 +386,7 @@ impl crate::router::Router {
     /// Deterministic parent selection (Go `_fix`). Returns announces to send.
     pub(crate) async fn fix(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let self_info = self.tree.infos.get(&self.pubkey).copied();
@@ -394,7 +394,10 @@ impl crate::router::Router {
         let mut best_parent = self.pubkey;
         let mut best_cost = u64::MAX;
         if let Some(info) = self_info
-            && self.tree.peers.contains_key(&info.parent)
+            // Go asks the LIVE link map (`if _, isIn := r.peers[self.parent]`,
+            // router.go:229). `tree.peers` outlives links, so asking it would
+            // keep a dead parent in play forever.
+            && links.peers().contains(&info.parent)
         {
             let (root, dists) = self.root_and_dists(&self.pubkey);
             if root < best_root
@@ -464,7 +467,7 @@ impl crate::router::Router {
         let _ = peer_key;
         Ok(())
     }
-    fn use_response(&mut self, peer_key: [u8; KEY_LEN], res: &SigRes) -> bool {
+    pub(crate) fn use_response(&mut self, peer_key: [u8; KEY_LEN], res: &SigRes) -> bool {
         let bs = res.bytes_for_sig(&self.pubkey, &peer_key);
         let info = Info {
             parent: peer_key,
@@ -492,11 +495,14 @@ impl crate::router::Router {
         self.update(&ann);
         self.tree.self_refresh_at = Some(Instant::now() + TREE_REFRESH);
     }
-    async fn send_all_reqs(&mut self, links: &mut LinkSet<'_>) -> Result<(), Error> {
-        // Go `_sendReqs` clears req/res state and re-requests every peer.
+    pub(crate) async fn send_all_reqs(&mut self, links: &mut LinkSet) -> Result<(), Error> {
+        // Go `_sendReqs` clears req/res state, then iterates the LIVE link
+        // map (`for pk, ps := range r.peers`, router.go:189), so a peer whose
+        // link just died is never addressed. Iterating `tree.peers` instead —
+        // which outlives links — hands `send_req` a key with no link and a
+        // hard send has nowhere to go.
         self.tree.responses.clear();
-        let keys: Vec<[u8; KEY_LEN]> = self.tree.peers.keys().copied().collect();
-        for k in keys {
+        for k in links.peers() {
             self.send_req(links, k).await?;
         }
         Ok(())
@@ -523,7 +529,7 @@ impl crate::router::Router {
     /// Send unsent ancestry announces to one peer (Go `_sendAnnounces`).
     pub(crate) async fn send_announces(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let mut to_send: Vec<[u8; KEY_LEN]> = Vec::new();
@@ -551,7 +557,7 @@ impl crate::router::Router {
     }
     pub(crate) fn handle_announce(
         &mut self,
-        _links: &mut LinkSet<'_>,
+        _links: &mut LinkSet,
         from: [u8; KEY_LEN],
         ann: &Announce,
     ) -> Option<Announce> {

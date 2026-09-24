@@ -11,6 +11,9 @@ use crate::error::Error;
 pub const MAX_MESSAGE_SIZE: usize = 65535 * 2;
 /// Keepalive reply delay after inbound non-keepalive traffic (Go: 1s).
 pub const KEEPALIVE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Number of link packet types. `Router::frames` and
+/// [`FrameType::ALL`] are both sized from it, so the two cannot drift.
+pub const FRAME_KINDS: usize = 10;
 
 /// Link packet types. Discriminants match Go's `wirePacketType` order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +32,23 @@ pub enum FrameType {
 }
 
 impl FrameType {
+    /// Every kind, indexed by discriminant. Sized by `FRAME_KINDS`, so
+    /// adding a variant without widening the count is a compile error
+    /// (missing element) and so is widening the count without the variant
+    /// (too many elements).
+    pub const ALL: [FrameType; FRAME_KINDS] = [
+        FrameType::Dummy,
+        FrameType::KeepAlive,
+        FrameType::SigReq,
+        FrameType::SigRes,
+        FrameType::Announce,
+        FrameType::BloomFilter,
+        FrameType::PathLookup,
+        FrameType::PathNotify,
+        FrameType::PathBroken,
+        FrameType::Traffic,
+    ];
+
     pub fn from_byte(b: u8) -> Result<Self, Error> {
         match b {
             0 => Ok(Self::Dummy),
@@ -46,6 +66,20 @@ impl FrameType {
     }
 }
 
+/// Every discriminant must be its own index in `ALL`: `Router::frames` and
+/// `RunStats::frames` are `[u64; FRAME_KINDS]` indexed by `ftype as usize`, so
+/// a gap or a duplicate is an out-of-bounds panic on the wire, not a typo.
+const _: () = {
+    let mut i = 0;
+    while i < FRAME_KINDS {
+        assert!(
+            FrameType::ALL[i] as usize == i,
+            "FrameType::ALL must be dense and in Go discriminant order"
+        );
+        i += 1;
+    }
+};
+
 /// Encode `type + payload` with uvarint length prefix.
 pub fn encode_frame(ftype: FrameType, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
@@ -53,6 +87,22 @@ pub fn encode_frame(ftype: FrameType, payload: &[u8]) -> Vec<u8> {
     out.push(ftype as u8);
     out.extend_from_slice(payload);
     out
+}
+
+/// Bytes a frame of this payload size occupies on the wire: the uvarint
+/// length prefix, the type byte, and the payload. Go's link byte counters add
+/// exactly these — `linkConn.Read`/`linkConn.Write` count every socket byte
+/// (`yggdrasil-go/src/core/link.go:784-793`), and the framing writer emits one
+/// `uvarint(1+len) + type + payload` per frame (`peers.go:202-208`).
+pub const fn wire_len(payload_len: usize) -> u64 {
+    let body = payload_len as u64 + 1;
+    let mut prefix = 1u64;
+    let mut rest = body;
+    while rest >= 0x80 {
+        prefix += 1;
+        rest >>= 7;
+    }
+    prefix + body
 }
 
 /// The exact bytes Go writes for a keepalive (`{0x01, KeepAlive}`).
@@ -155,6 +205,26 @@ mod tests {
             assert_eq!(dt, t);
             assert_eq!(payload, &[9, 8, 7]);
         }
+    }
+
+    #[test]
+    fn frame_kinds_match_table_len() {
+        // The counters that index by `ftype as usize` (`Router::frames`,
+        // `RunStats::frames`) are `[u64; FRAME_KINDS]`: a variant outside
+        // that window is an out-of-bounds panic on the wire, not a typo.
+        // The const block above is the real guard; this pins the same
+        // facts so a reader (and CI diff) sees them as a test.
+        assert_eq!(FRAME_KINDS, FrameType::ALL.len());
+        for (i, t) in FrameType::ALL.iter().enumerate() {
+            assert_eq!(*t as usize, i, "{t:?} is not at its discriminant index");
+            assert_eq!(FrameType::from_byte(i as u8).unwrap(), *t);
+        }
+        assert_eq!(FrameType::ALL[FRAME_KINDS - 1], FrameType::Traffic);
+        assert!(FrameType::from_byte(FRAME_KINDS as u8).is_err());
+        // Wire cost of a frame is what the byte counters add.
+        assert_eq!(wire_len(0), 2);
+        assert_eq!(wire_len(3), 5);
+        assert_eq!(wire_len(12_000), 12_003, "two-byte prefix at 16383 body");
     }
 
     #[test]

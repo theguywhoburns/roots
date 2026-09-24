@@ -45,7 +45,7 @@ async fn main() {
         .expect("register");
     // One set for the whole run: per-link send clocks must survive
     // slices, or lazy keepalives never fire and the peer times us out.
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
     let mut no_out = Vec::new();
 
     // Converge: short serve slices until we have a parent.

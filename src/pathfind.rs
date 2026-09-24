@@ -309,7 +309,7 @@ impl crate::router::Router {
     /// Originate a lookup (Go `_sendLookup` + `_handleLookup` for self).
     pub(crate) async fn send_lookup(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -329,7 +329,7 @@ impl crate::router::Router {
     /// then answer directly on a transformed-key match.
     pub(crate) async fn handle_lookup(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         lookup: &PathLookup,
@@ -367,7 +367,7 @@ impl crate::router::Router {
     /// the destination (Go `_handleNotify`).
     pub(crate) async fn handle_notify(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         notify: &PathNotify,
     ) -> Result<(), Error> {
@@ -375,7 +375,9 @@ impl crate::router::Router {
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
-            return links.write(next, FrameType::PathNotify, &buf).await;
+            return self
+                .write_via(links, next, FrameType::PathNotify, &buf)
+                .await;
         }
         if notify.dest != self.pubkey {
             return Ok(());
@@ -434,7 +436,7 @@ impl crate::router::Router {
     /// Handle a broken-path report (Go `_handleBroken`).
     pub(crate) async fn handle_broken(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         broken: &PathBroken,
     ) -> Result<(), Error> {
@@ -442,7 +444,9 @@ impl crate::router::Router {
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
-            return links.write(next, FrameType::PathBroken, &buf).await;
+            return self
+                .write_via(links, next, FrameType::PathBroken, &buf)
+                .await;
         }
         if broken.source != self.pubkey {
             return Ok(());
@@ -462,7 +466,7 @@ impl crate::router::Router {
     /// for a partial key.
     pub(crate) async fn rumor_lookup(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
@@ -494,7 +498,7 @@ impl crate::router::Router {
     /// buffering behind a lookup (Go `pathfinder._handleTraffic`).
     pub(crate) async fn pathfinder_send(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -527,13 +531,13 @@ impl crate::router::Router {
     /// for the send side; the watermark update is inside `greedy_next`).
     async fn route_traffic(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         tr: &crate::traffic::Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
-            return links.write(next, FrameType::Traffic, &buf).await;
+            return self.write_via(links, next, FrameType::Traffic, &buf).await;
         }
         Ok(())
     }

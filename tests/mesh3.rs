@@ -91,7 +91,7 @@ async fn inbox(tx: &Sender<Cmd>) -> Vec<([u8; KEY_LEN], Vec<u8>)> {
 /// whatever `report` says about the final state (B reports its live peers).
 async fn drive<E, F>(
     mut router: Router,
-    mut links: LinkSet<'_>,
+    mut links: LinkSet,
     rx: Receiver<Cmd>,
     stop: Arc<AtomicBool>,
     report: F,
@@ -168,8 +168,8 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
             let mut router = Router::new(sk);
             router.register(&mut ab, a_peer).await.expect("B A");
             router.register(&mut cb, c_peer).await.expect("B C");
-            let mut links = LinkSet::single(a_peer, &mut ab);
-            links.add(c_peer, &mut cb);
+            let mut links = LinkSet::single(roots::link::AnyConn::new(ab));
+            links.add(roots::link::AnyConn::new(cb));
             drive(router, links, rx, stop, |_, l| l.peers()).await
         })
     };
@@ -191,7 +191,7 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
             router.register(&mut conn, peer).await.expect("A reg");
             drive(
                 router,
-                LinkSet::single(peer, &mut conn),
+                LinkSet::single(roots::link::AnyConn::new(conn)),
                 rx,
                 stop,
                 |_, _| (),
@@ -217,7 +217,7 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
             router.register(&mut conn, peer).await.expect("C reg");
             drive(
                 router,
-                LinkSet::single(peer, &mut conn),
+                LinkSet::single(roots::link::AnyConn::new(conn)),
                 rx,
                 stop,
                 |_, _| (),

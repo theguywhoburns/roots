@@ -56,7 +56,7 @@ async fn main() {
         .await
         .expect("register");
     // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
     let mut no_out = Vec::new();
 
     let end = Instant::now() + Duration::from_secs(60);

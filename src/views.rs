@@ -125,6 +125,13 @@ impl Router {
         out
     }
 
+    /// Soft sends discarded because the chosen next hop has no open link.
+    /// Go has no equivalent counter (it drops them in silence); this is the
+    /// only trace those drops leave.
+    pub fn dropped_no_link(&self) -> u64 {
+        self.dropped_no_link
+    }
+
     /// Spanning-tree entries as `(key, parent, seq)`, sorted by key
     /// (for diagnostics / admin adapter).
     pub fn tree_entries(&self) -> Vec<([u8; KEY_LEN], [u8; KEY_LEN], u64)> {

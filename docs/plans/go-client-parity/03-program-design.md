@@ -129,6 +129,41 @@ Which `links.write` call becomes which: **hard** — `tree.rs:250,263,546`,
 **soft** — `traffic.rs:71`, `pathfind.rs:378,445,536`, `bloom.rs:349,394` (all
 address a `greedy_next` choice or a fan-out target).
 
+### Slice 4 corrections (recorded at implementation, 2026-09-24)
+
+- **Counters are wire bytes.** `rx`/`tx` add `frame::wire_len(payload.len())`
+  in both directions, so a frame costs what it costs on the socket (Go counts
+  raw socket bytes, `yggdrasil-go/src/core/link.go:784-793`). The handshake
+  bytes stay outside the counters — the known gap, stated on the test.
+- **Two router-state reads moved onto the live set.** The table above kept
+  `tree.rs:546` (`_sendReqs`) hard, which is right only if the loop iterates
+  what Go iterates: `for pk, ps := range r.peers` (`router.go:189`). So
+  `send_all_reqs` now iterates `links.peers()`, and `fix` asks
+  `links.peers().contains(&info.parent)` instead of `tree.peers`
+  (`router.go:229`). Both are mutation-pinned (`router_books_can_name_a_peer_with_no_link`,
+  `fix_refuses_a_parent_with_no_link`); a hard send against the old
+  `tree.peers` iteration aborts the serve on a stale key.
+- **`Transport::Stream` gained `+ 'static`.** The set owns its conns, so a
+  borrowed stream cannot be a member.
+- **Two additions the design did not anticipate**, both required to make the
+  eviction claim true: `LinkSet::send` **retires** an entry whose `write_frame`
+  fails (Go discards write errors outright, `peers.go:189`, and lets that
+  peer's own reader tear it down), and `Router::fatal_link_error(&links, &err)`
+  decides whether a failed serve step aborts `serve_links` — a link error only
+  means the set shrank, so it is fatal exactly when nothing is left to serve.
+  Without both, a link that was dead-but-not-yet-evicted aborted every
+  survivor with `Io(ConnectionReset)`.
+- **Divergence found and left in place**, because fixing it is the hardening
+  slice's job: nothing prunes `tree.peers`, `tree.infos` or `bloom.on_tree` when
+  a link dies, so a node keeps a parent it has no link for. Go prunes all of it
+  in `removePeer` (`ironwood/network/router.go:147`). Slice 4 makes the stale
+  key *tolerable*; the lifecycle slice makes it *gone*.
+  `a_stale_parent_is_kept_and_the_serve_survives_it` asserts the current shape
+  as a tripwire and says so in its message.
+- `TreeState::send_all_reqs` and `Router::use_response` are `pub(crate)` so a
+  fixture can drive them; `use_response` is also how the `fix` test adopts its
+  own lineage, rather than hand-writing an info no signature check would accept.
+
 ```rust
 // src/driver.rs — resolve-and-hold, so TUN never blocks the loop.
 pub enum Route { Sent, Queued }

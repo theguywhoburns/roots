@@ -10,6 +10,7 @@ use ed25519_dalek::SigningKey;
 
 use crate::address::KEY_LEN;
 use crate::bloom::BloomState;
+use crate::frame::FRAME_KINDS;
 use crate::pathfind::PathState;
 use crate::proto::ProtoState;
 use crate::session::SessionState;
@@ -39,7 +40,10 @@ pub struct Router {
     /// where `proto_bytes` starts with the `PROTO_*` dispatch byte.
     pub proto_inbox: Vec<([u8; KEY_LEN], Vec<u8>)>,
     /// Frames received per type (for diagnostics).
-    pub frames: [u64; 10],
+    pub frames: [u64; FRAME_KINDS],
+    /// Soft sends the set discarded because the chosen next hop has no link.
+    /// Go drops these silently; a counter is what makes the drop visible.
+    pub(crate) dropped_no_link: u64,
 }
 
 impl Router {
@@ -55,7 +59,8 @@ impl Router {
             proto: ProtoState::default(),
             inbox: Vec::new(),
             proto_inbox: Vec::new(),
-            frames: [0; 10],
+            frames: [0; FRAME_KINDS],
+            dropped_no_link: 0,
         }
     }
 
@@ -114,8 +119,11 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    use crate::frame::FrameType;
     use crate::link::{LinkOptions, LinkSet, Tcp};
     use crate::peer::{PeerKind, PeerState};
+    use crate::tree::{Info, SigReq, SigRes};
+    use ed25519_dalek::Signer;
 
     #[test]
     fn query_snapshots_read_state() {
@@ -164,6 +172,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dropped_no_link_counts_soft_sends() {
+        // A soft send that finds no link is a drop, and the counter is what
+        // makes it visible: Go's equivalent drop is silent (`router.go`
+        // `peers[key]` lookup), which is how a broken next hop hid for slices.
+        let mut router = Router::new(SigningKey::from_bytes(&[5; 32]));
+        let mut links = LinkSet::new();
+        let absent = [9u8; KEY_LEN];
+        for _ in 0..2 {
+            router
+                .write_via(&mut links, absent, FrameType::KeepAlive, &[])
+                .await
+                .unwrap();
+        }
+        assert_eq!(router.dropped_no_link(), 2);
+        // Hard sends bypass the counter entirely: `LinkSet::write` reports
+        // the missing link as `Error::NoLink` (see `linkset_write_reports_missing_peer`),
+        // so a drop can only ever be a soft one.
+        assert!(
+            matches!(
+                links.write(absent, FrameType::KeepAlive, &[]).await,
+                Err(crate::error::Error::NoLink)
+            ),
+            "hard send must not be swallowed by the counter"
+        );
+        assert_eq!(router.dropped_no_link(), 2, "hard send never counts");
+    }
+
+    #[tokio::test]
+    async fn only_an_empty_set_makes_a_link_error_fatal() {
+        // The whole "one dead link must not kill the others" rule reduces to
+        // this predicate, so it is checked directly rather than through
+        // socket-death timing that a test cannot control.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _hold = tokio::spawn(async move {
+            let (peer, _) = listener.accept().await.unwrap();
+            // Held, never read: the link below stays live for this test.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(peer);
+        });
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let key = [1u8; KEY_LEN];
+        let mut links = LinkSet::single(crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
+            remote_key: key,
+            priority: 0,
+            kind: PeerKind::Go,
+            inbound: false,
+            stream: sock,
+        }));
+        let io = crate::error::Error::Io(std::io::Error::from_raw_os_error(104));
+        assert!(
+            !Router::fatal_link_error(&links, &io),
+            "a socket error on one of several links is not fatal"
+        );
+        assert!(
+            !Router::fatal_link_error(&links, &crate::error::Error::NoLink),
+            "a missing link is not fatal while others live"
+        );
+        assert!(
+            Router::fatal_link_error(&links, &crate::error::Error::Timeout),
+            "a non-link error stays fatal"
+        );
+        drop(links.remove(&key));
+        assert!(
+            Router::fatal_link_error(&links, &io),
+            "an empty set is fatal: the single-link `serve` contract"
+        );
+    }
+
+    #[tokio::test]
     async fn mixed_transport_links_share_one_router() {
         // Slice 10a: one Router drives a TCP link and a WS link (the WS
         // side type-erased through `AnyConn`) as `&mut dyn Link`. Tree
@@ -188,11 +266,12 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(s1_sk);
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
@@ -206,7 +285,7 @@ mod tests {
             let key = conn.remote_key;
             let mut router = Router::new(s2_sk);
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
@@ -230,8 +309,8 @@ mod tests {
 
         // One router serves both links through a single set (the 10b
         // shape); TCP stays concrete, WS arrives type-erased.
-        let mut links = LinkSet::single(tcp_peer, &mut tcp_conn);
-        links.add(ws_peer, &mut ws_conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(tcp_conn));
+        links.add(ws_conn);
         router
             .serve_links(&mut links, Some(Duration::from_secs(8)), &mut Vec::new())
             .await
@@ -252,11 +331,8 @@ mod tests {
             router.maintain(&mut links, tcp_peer).await.unwrap();
             router.maintain(&mut links, ws_peer).await.unwrap();
             for peer in [tcp_peer, ws_peer] {
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    links.get(&peer).unwrap().read_frame(),
-                )
-                .await
+                if let Ok(Ok((ftype, payload))) =
+                    tokio::time::timeout(Duration::from_millis(100), links.read_frame(&peer)).await
                 {
                     router
                         .dispatch_frame(&mut links, peer, ftype, &payload)
@@ -270,53 +346,70 @@ mod tests {
         srv2.abort();
     }
 
-    #[tokio::test]
-    async fn serve_links_evicts_dead_link() {
-        // Two loopback links, one peer dies mid-serve: the dead link is
-        // evicted from the set and the survivor keeps serving (instead
-        // of one dead link aborting the whole serve like single-link
-        // `serve` does when its only link drops).
-        async fn run_server(
-            listener: tokio::net::TcpListener,
-            sk: SigningKey,
-            die_after: Option<Duration>,
-        ) {
-            let (sock, _) = listener.accept().await.unwrap();
-            let mut sock = sock;
-            let opts = LinkOptions::default();
-            let (key, _, kind) = crate::link::run_handshake(&mut sock, &sk, &opts, true)
-                .await
-                .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
-                remote_key: key,
-                priority: 0,
-                kind,
-                stream: sock,
-            };
-            let mut router = Router::new(sk);
-            router.register(&mut conn, key).await.unwrap();
-            if let Some(d) = die_after {
-                // Die abruptly: no FIN handshake, just drop the socket.
-                tokio::time::sleep(d).await;
-                return;
-            }
-            let mut links = LinkSet::single(key, &mut conn);
-            let _ = router
-                .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
-                .await;
+    /// One loopback server: handshake, register, then either drop the socket
+    /// after `die_after` (killing the link mid-serve) or serve for 15s.
+    async fn run_server(
+        listener: tokio::net::TcpListener,
+        sk: SigningKey,
+        die_after: Option<Duration>,
+    ) {
+        let (sock, _) = listener.accept().await.unwrap();
+        let mut sock = sock;
+        let opts = LinkOptions::default();
+        let (key, _, kind) = crate::link::run_handshake(&mut sock, &sk, &opts, true)
+            .await
+            .unwrap();
+        let mut conn = crate::link::PeerConn::<Tcp> {
+            remote_key: key,
+            priority: 0,
+            kind,
+            inbound: true,
+            stream: sock,
+        };
+        let mut router = Router::new(sk);
+        router.register(&mut conn, key).await.unwrap();
+        if let Some(d) = die_after {
+            // Die abruptly: no FIN handshake, just drop the socket.
+            tokio::time::sleep(d).await;
+            return;
         }
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        let _ = router
+            .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
+            .await;
+    }
 
-        let c_sk = SigningKey::from_bytes(&[0x41; 32]);
-        let s1_sk = SigningKey::from_bytes(&[0x11; 32]);
-        let s2_sk = SigningKey::from_bytes(&[0x21; 32]);
+    /// Three identities ordered by public key: the LARGEST is the client and
+    /// the two smaller ones its peers. Go's `_fix` picks the lowest root it
+    /// knows, so a client that outranks both peers can never be its own root
+    /// — it has to adopt one of them.
+    fn client_and_peers() -> (SigningKey, SigningKey, SigningKey) {
+        let mut keys: Vec<SigningKey> = [1u8, 2, 3]
+            .iter()
+            .map(|b| SigningKey::from_bytes(&[*b; 32]))
+            .collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        (keys.remove(2), keys.remove(0), keys.remove(0))
+    }
 
+    /// A client `Router` holding two loopback links, both registered and in
+    /// one owned set. `dying` names the peer whose server task drops its
+    /// socket 2s in (`0` keeps both alive).
+    async fn client_over_two_links(dying: u8) -> (Router, LinkSet, [u8; 32], [u8; 32]) {
+        let (c_sk, s1_sk, s2_sk) = client_and_peers();
         let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a1 = l1.local_addr().unwrap();
         let l2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let a2 = l2.local_addr().unwrap();
-        let srv1 = tokio::spawn(run_server(l1, s1_sk, None));
-        let srv2 = tokio::spawn(run_server(l2, s2_sk, Some(Duration::from_secs(1))));
-
+        let die = |n: u8| {
+            if dying == n {
+                Some(Duration::from_secs(2))
+            } else {
+                None
+            }
+        };
+        tokio::spawn(run_server(l1, s1_sk, die(1)));
+        tokio::spawn(run_server(l2, s2_sk, die(2)));
         let mut c1 = crate::link::dial(&format!("tcp://{a1}"), &c_sk, &LinkOptions::default())
             .await
             .unwrap();
@@ -325,22 +418,235 @@ mod tests {
             .await
             .unwrap();
         let p2 = c2.remote_key;
-
         let mut router = Router::new(c_sk);
         router.register(&mut c1, p1).await.unwrap();
         router.register(&mut c2, p2).await.unwrap();
-        let mut links = LinkSet::single(p1, &mut c1);
-        links.add(p2, &mut c2);
-        // Must return Ok at hold expiry even though p2 died mid-serve.
+        let mut links = LinkSet::single(crate::link::AnyConn::new(c1));
+        links.add(crate::link::AnyConn::new(c2));
+        (router, links, p1, p2)
+    }
+
+    /// Pump short slices until the client has a parent that is one of its two
+    /// links — being its own root counts as a parent, so `parent().is_some()`
+    /// alone would return before the tree formed.
+    async fn converge(router: &mut Router, links: &mut LinkSet, peers: ([u8; 32], [u8; 32])) {
+        for _ in 0..6 {
+            router
+                .serve_links(links, Some(Duration::from_millis(250)), &mut Vec::new())
+                .await
+                .expect("converges over live links");
+            if let Some(p) = router.parent()
+                && (p == peers.0 || p == peers.1)
+            {
+                return;
+            }
+        }
+        panic!("never parented onto a link");
+    }
+
+    #[tokio::test]
+    async fn serve_links_evicts_a_dead_link() {
+        // Two loopback links; p1's socket dies mid-serve. The dead link is
+        // evicted and the survivor keeps serving, instead of one dead link
+        // aborting the whole serve the way single-link `serve` returns an
+        // error when its only link drops.
+        let (mut router, mut links, p1, p2) = client_over_two_links(1).await;
+        converge(&mut router, &mut links, (p1, p2)).await;
         router
-            .serve_links(&mut links, Some(Duration::from_secs(5)), &mut Vec::new())
+            .serve_links(&mut links, Some(Duration::from_secs(4)), &mut Vec::new())
             .await
             .expect("survivor keeps serving");
-        assert!(router.parent().is_some(), "converged via survivor");
-        assert!(!links.peers().contains(&p2), "dead link evicted");
-        assert!(links.peers().contains(&p1), "live link kept");
-        srv1.abort();
-        srv2.abort();
+        assert!(!links.peers().contains(&p1), "dead link evicted");
+        assert!(links.peers().contains(&p2), "live link kept");
+        assert_ne!(
+            router.parent(),
+            Some(p1),
+            "never left parented onto a peer with no link"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_parent_is_kept_and_the_serve_survives_it() {
+        // Characterization + tripwire, not Slice 4 evidence: the parent's link
+        // leaves the set while `tree.peers`, `tree.infos` and `bloom.on_tree`
+        // still name that key. What Slice 4 guarantees is the tolerance — no
+        // send to that key aborts the serve, and the survivor keeps working.
+        // What it does NOT fix is where the tree points afterwards: the client
+        // keeps a parent it has no link for, because nothing prunes
+        // router-state-addressed books when a link dies. Go prunes them in
+        // `removePeer` (`router.go:147`), so the last assertion here must
+        // change when the router-state lifecycle slice lands.
+        let (mut router, mut links, p1, p2) = client_over_two_links(0).await;
+        converge(&mut router, &mut links, (p1, p2)).await;
+        let dead = router.parent().expect("parented onto one of the links");
+        assert!(dead == p1 || dead == p2, "parent is a live link");
+        let live = if dead == p1 { p2 } else { p1 };
+        drop(links.remove(&dead).expect("parent link was in the set"));
+        router
+            .serve_links(&mut links, Some(Duration::from_secs(2)), &mut Vec::new())
+            .await
+            .expect("the stale key must not abort the serve");
+        assert_eq!(
+            router.parent(),
+            Some(dead),
+            "KNOWN DIVERGENCE, tripwire for the router-state lifecycle slice: \
+             nothing prunes `tree.peers`/`infos`, so the client keeps a parent \
+             it has no link for. Go prunes it in `removePeer` (router.go:147)."
+        );
+        assert!(links.peers().contains(&live), "survivor untouched");
+    }
+
+    #[tokio::test]
+    async fn router_books_can_name_a_peer_with_no_link() {
+        // The stale-key window itself, driven from the books instead of from
+        // socket timing: Go prunes its router books when a link dies
+        // (`removePeer`, router.go:147 clears peers/responses/ancs and the
+        // bloom entry), we keep them, so `tree.peers` and `bloom.on_tree` can
+        // name a key that has no link. Anything addressed at those books must
+        // cope — `_sendReqs` iterates the live link map (router.go:189) and
+        // the bloom fan-out is a soft send (bloomfilter.go:277). Both were
+        // hard sends before Slice 4, which is how a stale key aborted a serve.
+        let (mut router, mut links, p1, p2) = client_over_two_links(0).await;
+        converge(&mut router, &mut links, (p1, p2)).await;
+        let dead = router.parent().expect("parented onto one of the links");
+        for k in links.peers() {
+            drop(links.remove(&k));
+        }
+        assert!(
+            router.tree.peers.contains_key(&dead),
+            "the book outlives the link: that is the divergence being survived"
+        );
+        assert!(
+            router.bloom.on_tree.contains_key(&dead),
+            "the bloom book outlives the link too"
+        );
+        router
+            .send_all_reqs(&mut links)
+            .await
+            .expect("a stale tree peer is never addressed");
+        router.bloom.send.clear(); // force a pending diff to advertise
+        router
+            .bloom_maintenance(&mut links)
+            .await
+            .expect("the stale on-tree entry is a counted skip, not an error");
+        assert!(
+            router.dropped_no_link() >= 1,
+            "the skip is visible: {p1:?} and {p2:?} left no link behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_refuses_a_parent_with_no_link() {
+        // `_fix` asks the LIVE link map whether its parent is still there (Go
+        // router.go:229), and the books answer for nothing: `tree.peers`
+        // outlives links here, so a dead parent would stay in play. The
+        // scenario is built by hand because no converged loopback star
+        // produces it — our star's parent never leads to a root better than
+        // self, so the guarded branch is dead code there (see
+        // `a_stale_parent_is_kept_and_the_serve_survives_it`).
+        let mut keys: Vec<SigningKey> = [1u8, 2, 3, 4]
+            .iter()
+            .map(|b| SigningKey::from_bytes(&[*b; 32]))
+            .collect();
+        keys.sort_by_key(|k| k.verifying_key().to_bytes());
+        // Ascending pubkeys: `a` roots the tree, `live` and `dead` hang one
+        // hop below it (`live` first, so it wins the candidate scan), and the
+        // client outranks all three.
+        let (a, live, dead, c) = (
+            keys.remove(0),
+            keys.remove(0),
+            keys.remove(0),
+            keys.remove(0),
+        );
+        let (a_pub, l_pub, d_pub, c_pub) = (
+            a.verifying_key().to_bytes(),
+            live.verifying_key().to_bytes(),
+            dead.verifying_key().to_bytes(),
+            c.verifying_key().to_bytes(),
+        );
+        let mut router = Router::new(c);
+        let self_root = SigRes::seal(SigReq { seq: 1, nonce: 7 }, 0, &a_pub, &a, &a_pub);
+        router.tree.infos.insert(
+            a_pub,
+            Info {
+                parent: a_pub,
+                res: self_root,
+                sig: self_root.psig,
+            },
+        );
+        // Third-party lineage. These are the records `handle_announce` would
+        // have stored after verifying: `fix` only reads `parent` out of them,
+        // so they are bookkeeping, not a claim we checked a signature for.
+        for (pk, sk) in [(l_pub, &live), (d_pub, &dead)] {
+            let under_a = SigRes::seal(SigReq { seq: 1, nonce: 8 }, 5, &pk, &a, &a_pub);
+            let sig = sk.sign(&under_a.bytes_for_sig(&pk, &a_pub)).to_bytes();
+            router.tree.infos.insert(
+                pk,
+                Info {
+                    parent: a_pub,
+                    res: under_a,
+                    sig,
+                },
+            );
+        }
+        // Our own lineage: parented onto `dead` through the real adoption path
+        // (`use_response` builds the announce, verifies it, stores it), on an
+        // older request than the one both peers have now answered, so
+        // `update` accepts the new one.
+        let from_dead = SigRes::seal(SigReq { seq: 1, nonce: 1 }, 5, &c_pub, &dead, &d_pub);
+        assert!(
+            router.use_response(d_pub, &from_dead),
+            "our own announce has to verify, or the fixture proves nothing"
+        );
+        let open = router.new_req();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _hold = tokio::spawn(async move {
+            let (peer, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(peer);
+        });
+        let sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut links = LinkSet::single(crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
+            remote_key: l_pub,
+            priority: 0,
+            kind: PeerKind::Go,
+            inbound: false,
+            stream: sock,
+        }));
+        for pk in [l_pub, d_pub] {
+            router.tree.peers.insert(
+                pk,
+                PeerState {
+                    port: 1,
+                    req: open,
+                    responded: true,
+                    lag: Duration::from_millis(10),
+                    sent_at: None,
+                    prio: 0,
+                    order: 0,
+                    kind: PeerKind::Go,
+                },
+            );
+            // What `handle_response` would have kept: our own request, signed
+            // by the peer that answered it.
+            let signer = if pk == l_pub { &live } else { &dead };
+            router
+                .tree
+                .responses
+                .insert(pk, SigRes::seal(open, 5, &c_pub, signer, &pk));
+        }
+        assert_eq!(router.parent(), Some(d_pub), "parented onto `dead`");
+        assert!(!links.peers().contains(&d_pub), "`dead` has no link");
+        router
+            .fix(&mut links, l_pub)
+            .await
+            .expect("the live peer is reachable");
+        assert_eq!(
+            router.parent(),
+            Some(l_pub),
+            "a parent with no link is refused, even though the books name it"
+        );
     }
 
     #[tokio::test]
@@ -363,6 +669,7 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
@@ -370,7 +677,7 @@ mod tests {
             // what we assert below, not a clean shutdown.
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
                 .await;
@@ -384,7 +691,7 @@ mod tests {
         let mut router = Router::new(a_sk);
         let mut no_out = Vec::new();
         router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(peer_key, &mut conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
         let _ = router
             .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
             .await;
@@ -419,12 +726,13 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(10)), &mut no_out)
                 .await;
@@ -439,7 +747,7 @@ mod tests {
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
         let mut outgoing = vec![(b_pub, b"ping-0".to_vec())];
-        let mut links = LinkSet::single(peer_key, &mut conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
         let _ = router
             .serve(&mut links, Some(Duration::from_secs(10)), &mut outgoing)
             .await;
@@ -478,12 +786,13 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
@@ -498,15 +807,12 @@ mod tests {
         router.register(&mut conn, peer_key).await.unwrap();
         // Converge first (mirrors serve slices): maintain + dispatch.
         // The set lives across converge and resolve so send clocks persist.
-        let mut links = LinkSet::single(peer_key, &mut conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
             router.maintain(&mut links, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                Duration::from_millis(300),
-                links.get(&peer_key).unwrap().read_frame(),
-            )
-            .await
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
             {
                 router.frames[ftype as usize] += 1;
                 router
@@ -552,12 +858,13 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
@@ -570,15 +877,12 @@ mod tests {
         let peer_key = conn.remote_key;
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(peer_key, &mut conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
             router.maintain(&mut links, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                Duration::from_millis(300),
-                links.get(&peer_key).unwrap().read_frame(),
-            )
-            .await
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
             {
                 router.frames[ftype as usize] += 1;
                 router
@@ -626,20 +930,18 @@ mod tests {
                 remote_key: key,
                 priority: 0,
                 kind,
+                inbound: true,
                 stream: sock,
             };
             let mut router = Router::new(b_sk);
             router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(key, &mut conn);
+            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
             // Converge, then send FIRST (simultaneously with A below).
             let end = tokio::time::Instant::now() + Duration::from_secs(4);
             while tokio::time::Instant::now() < end {
                 router.maintain(&mut links, key).await.unwrap();
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(300),
-                    links.get(&key).unwrap().read_frame(),
-                )
-                .await
+                if let Ok(Ok((ftype, payload))) =
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
                 {
                     router
                         .dispatch_frame(&mut links, key, ftype, &payload)
@@ -659,11 +961,8 @@ mod tests {
             let end = tokio::time::Instant::now() + Duration::from_secs(8);
             while tokio::time::Instant::now() < end {
                 router.maintain(&mut links, key).await.unwrap();
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(300),
-                    links.get(&key).unwrap().read_frame(),
-                )
-                .await
+                if let Ok(Ok((ftype, payload))) =
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
                 {
                     router
                         .dispatch_frame(&mut links, key, ftype, &payload)
@@ -685,11 +984,8 @@ mod tests {
                     break;
                 }
                 router.maintain(&mut links, key).await.unwrap();
-                if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                    Duration::from_millis(300),
-                    links.get(&key).unwrap().read_frame(),
-                )
-                .await
+                if let Ok(Ok((ftype, payload))) =
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
                 {
                     router
                         .dispatch_frame(&mut links, key, ftype, &payload)
@@ -706,15 +1002,12 @@ mod tests {
         let peer_key = conn.remote_key;
         let mut router = Router::new(a_sk);
         router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(peer_key, &mut conn);
+        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
             router.maintain(&mut links, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                Duration::from_millis(300),
-                links.get(&peer_key).unwrap().read_frame(),
-            )
-            .await
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
             {
                 router
                     .dispatch_frame(&mut links, peer_key, ftype, &payload)
@@ -735,11 +1028,8 @@ mod tests {
         let end = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < end {
             router.maintain(&mut links, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                Duration::from_millis(300),
-                links.get(&peer_key).unwrap().read_frame(),
-            )
-            .await
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
             {
                 router
                     .dispatch_frame(&mut links, peer_key, ftype, &payload)
@@ -761,11 +1051,8 @@ mod tests {
                 break;
             }
             router.maintain(&mut links, peer_key).await.unwrap();
-            if let Ok(Ok((ftype, payload))) = tokio::time::timeout(
-                Duration::from_millis(300),
-                links.get(&peer_key).unwrap().read_frame(),
-            )
-            .await
+            if let Ok(Ok((ftype, payload))) =
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
             {
                 router
                     .dispatch_frame(&mut links, peer_key, ftype, &payload)

@@ -241,7 +241,7 @@ impl crate::router::Router {
     /// Send a session-layer payload inside network traffic to `dest`.
     async fn net_send(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
@@ -252,7 +252,7 @@ impl crate::router::Router {
     /// Handle one session payload extracted from inbound traffic.
     pub(crate) async fn handle_session_bytes(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         data: &[u8],
@@ -377,7 +377,7 @@ impl crate::router::Router {
     /// proto on flush.
     async fn session_send_inner(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,
@@ -404,7 +404,7 @@ impl crate::router::Router {
     /// App-level send: encrypt now or buffer behind an init (Go `writeTo`).
     pub(crate) async fn session_send(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         msg: Vec<u8>,
@@ -418,7 +418,7 @@ impl crate::router::Router {
     /// difference; session setup and buffering are shared).
     pub(crate) async fn session_send_kind(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,

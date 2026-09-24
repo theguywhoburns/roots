@@ -27,7 +27,7 @@ pub async fn run_peer(
                 supervised.record_success();
                 let peer_key = conn.remote_key;
                 if router.register(&mut conn, peer_key).await.is_ok() {
-                    let mut links = LinkSet::single(peer_key, &mut conn);
+                    let mut links = LinkSet::single(conn);
                     let _ = router.serve(&mut links, None, outgoing).await;
                     served += 1;
                     if max_serves.is_some_and(|m| served >= m) {

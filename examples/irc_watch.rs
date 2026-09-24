@@ -46,7 +46,7 @@ async fn main() {
         .await
         .expect("register");
     // One set for the whole run (see http_fetch).
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {

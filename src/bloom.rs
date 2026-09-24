@@ -329,7 +329,7 @@ impl crate::router::Router {
 
     pub(crate) async fn bloom_maintenance(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
     ) -> Result<(), crate::error::Error> {
         self.bloom_fix();
         let peers: Vec<[u8; KEY_LEN]> = self
@@ -345,8 +345,11 @@ impl crate::router::Router {
                 self.bloom.send.insert(pk, b.clone());
                 self.bloom.dirty.insert(pk, false);
                 let bytes = b.encode();
-                links
-                    .write(pk, crate::frame::FrameType::BloomFilter, &bytes)
+                // Soft send: the destination comes from router state (the
+                // on-tree list), not from the link being served, so a peer
+                // whose link just died is a skip — Go guards with
+                // `if ps, isIn := r.peers[k]; isIn` (`bloomfilter.go:277`).
+                self.write_via(links, pk, crate::frame::FrameType::BloomFilter, &bytes)
                     .await?;
             }
         }
@@ -368,7 +371,7 @@ impl crate::router::Router {
     /// Forward a multicast packet along the tree (Go `_sendMulticast`).
     pub(crate) async fn multicast(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         from_key: [u8; KEY_LEN],
         to_key: [u8; KEY_LEN],
         ftype: crate::frame::FrameType,
@@ -391,7 +394,7 @@ impl crate::router::Router {
             if !interested {
                 continue;
             }
-            links.write(k, ftype, payload).await?;
+            self.write_via(links, k, ftype, payload).await?;
         }
         Ok(())
     }

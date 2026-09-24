@@ -16,7 +16,8 @@ counts — read this file for the module graph, not that one.
 ```
   app / demo          client/src/{main,node}.rs · examples/* · tests/*
         |             drains Router::inbox / proto_inbox, feeds the outbox Vec,
-        |             owns LinkSet lifetime, smoltcp bridges, admin socket, TUN
+        |             owns the LinkSet (which owns its own conns), smoltcp
+        |             bridges, admin socket, TUN
         v
   facade              src/router.rs  Router { five tables }   (no locks, no tasks)
         |             src/views.rs read-only snapshots · src/traits.rs Snapshot
@@ -50,8 +51,8 @@ Go-origin column is taken from each module's own port header and checked against
 |---|---|---|
 | `lib.rs` | crate root, `Client` sugar (`new`, per-scheme dial, listen/accept), re-exports — no node loop (Slice 3) | — |
 | `router.rs` | `Router` struct composing the five tables; `new`, `pubkey`, `next_init_seq`, `announces_*`, `peer_kind`, `is_roots_peer`; `MAINTENANCE_INTERVAL`, `UNKNOWN_LATENCY` | — (facade) |
-| `driver.rs` | link I/O orchestration: `register` `resolve` `maintain` `dispatch_frame` `serve` `serve_links`, keepalive, dead-link eviction | `network/router.go` peer upkeep |
-| `views.rs` | read-only snapshots: `parent` `root_and_depth` `known_nodes` `dump` `has_path` `has_session` `path_details` `get_paths` `get_sessions` `link_peers` `tree_entries` + `Snapshot` impl | diagnostic funcs |
+| `driver.rs` | link I/O orchestration: `register` `resolve` `maintain` `dispatch_frame` `serve` `serve_links`, keepalive, dead-link eviction, `fatal_link_error` | `network/router.go` peer upkeep |
+| `views.rs` | read-only snapshots: `parent` `root_and_depth` `known_nodes` `dump` `has_path` `has_session` `path_details` `get_paths` `get_sessions` `link_peers` `dropped_no_link` `tree_entries` + `Snapshot` impl | diagnostic funcs |
 | `traits.rs` | `Snapshot` trait (25 lines) | — |
 | `tree.rs` | `TreeState`: spanning tree — SigReq/SigRes/Announce, `peers` `infos` `sent` `deadlines` `next_port`, root election | `ironwood/network/router.go` |
 | `pathfind.rs` | `PathState`: DHT pathfinder — `entries`, `rumors` (keyed by transformed key), lookup/notify/broken, `greedy_next` forwarding | `ironwood/network/pathfinder.go` |
@@ -61,11 +62,11 @@ Go-origin column is taken from each module's own port header and checked against
 | `traffic.rs` | `Traffic` header codec (path + from + source + dest + watermark + payload) and inbound forwarding decision | `ironwood/network/traffic.go` |
 | `peer.rs` | `PeerKind` (Go vs roots via vendor TLV), `feat` constants, `PeerState` | `meta` vendor fields |
 | `supervisor.rs` | persistent redial: `SupervisedPeer`, `due_indices`, `backoff_cap` | `core` peer monitor |
-| `link.rs` | `Transport`/`Link` traits, `AnyConn`, `LinkSet`, `complete_dial`/`complete_accept`/`dial_any`, URI parsing, backoff, `meta` handshake drive | `src/core` |
+| `link.rs` | `Transport`/`Link` traits, `AnyConn`, the **owning** `LinkSet` (`write` hard / `write_via` soft / `stats` / `idle_for`, retirement on write failure), `complete_dial`/`complete_accept`/`dial_any`, URI parsing, backoff, `meta` handshake drive | `src/core` |
 | `tls.rs` | `Tls` transport (`tls://`), rustls/ring NoVerify, rcgen listener cert | `src/core/link_tls.go` |
 | `ws.rs` | `Ws`/`Wss` transports, `ygg-ws` subprotocol, message-per-flush | `src/core/link_ws.go` |
 | `quic.rs` | `Quic` transport (quinn), one bidi stream per link | `src/core/link_quic.go` |
-| `frame.rs` | link framing, `FrameType`, uvarint + path helpers, keepalive, size caps | `ironwood/network/peers.go` + `wire.go` |
+| `frame.rs` | link framing, `FrameType` + `FRAME_KINDS`/`FrameType::ALL`, `wire_len` (what the counters count), uvarint + path helpers, keepalive, size caps | `ironwood/network/peers.go` + `wire.go` |
 | `handshake.rs` | `meta` TLV codec + signature, `Meta` struct, version gate | `src/core/version.go` |
 | `address.rs` | key -> IPv6 (`02…` node, `03…` subnet), `lookup_key_for_addr`, prefix scan | `src/address/address.go` |
 | `error.rs` | `Error` enum (thiserror) | — |
@@ -85,13 +86,17 @@ servers; the only `Arc` is the required rustls config handle in
 - Each algorithm module adds its own `impl crate::router::Router` block, so
   cross-table work is a method call on one borrow (`self.bloom_fix(...)`,
   `self.greedy_next(...)`) rather than a shared god-object field access.
-- Async methods never hold a connection: `LinkSet<'a>` owns
-  `Vec<([u8;32], &'a mut dyn Link)>` plus per-link `last_write` clocks and is
-  passed `&mut` into every I/O call. **The set is caller-owned and must outlive
-  slices** — it is where the keepalive clock lives.
+- Async methods never hold a connection: `LinkSet` **owns** its links
+  (`Vec<LinkEntry>` of `AnyConn` plus per-link `last_write` clocks, no lifetime
+  parameter since Slice 4), so it is `'static` and movable into one task's loop
+  without a lock. Every router I/O call still takes `&mut LinkSet`. **The set is
+  caller-owned and must outlive slices** — it is where the keepalive clock lives.
+- Sends are keyed by link peer, and a write failure retires the entry: `send`
+  removes the link whose `write_frame` errored before returning, so the next
+  `maintain` sees a smaller set rather than a poisoned one.
 - `SessionState::init_seq` is the one atomic (`Cell`-like usage through `&self`),
   because init/ack construction happens while `sess.sessions` is already mutably
-  borrowed (`router.rs:73-84`).
+  borrowed (`router.rs:78-89`).
 
 Egress has no public send function. Apps drain `Router::inbox` /
 `Router::proto_inbox` and push `(dest_key, payload)` into the `outgoing` `Vec`
@@ -109,7 +114,7 @@ tree    --> bloom    bloom advertises bits derived from our parent info
 
 session --> path     every outbound byte rides pathfinder_send
 path    --> session  a notify flushes whatever pathfinder_send parked in
-                     rumors[].pending (pathfind.rs:422-430); session setup
+                     rumors[].pending (pathfind.rs:424-431); session setup
                      refreshes the entry deadline
 path    --> traffic  greedy_next picks the next hop for a forwarding packet
 bloom   --> path     multicast gate: flood a lookup/notify only to useful peers
@@ -124,12 +129,12 @@ consumer. `proto` is a session payload variant, not a separate transport.
 ## Link lifecycle
 
 1. **Dial or accept.** `dial_any` parses the scheme and dispatches to
-   `Tcp`/`Tls`/`Ws`/`Wss`/`Quic` (`link.rs:649-660`); listener paths accept and
+   `Tcp`/`Tls`/`Ws`/`Wss`/`Quic` (`link.rs:770-790`); listener paths accept and
    upgrade. Both wrap the stream in `AnyConn::new`, which hoists
    `remote_key`/`priority`/`PeerKind` and boxes the stream.
 2. **Handshake.** `complete_dial` merges URI opts then runs `run_handshake`
    under `HANDSHAKE_TIMEOUT` as outbound; `complete_accept` runs it inbound and
-   deliberately skips `merge_opts` (`link.rs:602-644`). The exchange yields
+   deliberately skips `merge_opts` (`link.rs:721-768`). The exchange yields
    `(remote_key, priority, PeerKind)` — **no key material**; session keys come
    later from `crypto_box` in `session.rs`.
 3. **`register` — once per link, never per slice** (`driver.rs:19`). Writes our
@@ -137,24 +142,28 @@ consumer. `proto` is a session payload variant, not a separate transport.
    Port, `req` and `lag` are reused for a known key so a redial does not look
    like a new node.
 4. **`serve` / `serve_links` — repeated slices** over the same `LinkSet`
-   (`driver.rs:318`/`331`; `serve` forwards straight to `serve_links`, so
+   (`driver.rs:344`/`357`; `serve` forwards straight to `serve_links`, so
    single-link is just a one-entry set). One slice:
    splice `sess.resend` onto the front of `outgoing` → one `maintain` per peer →
    loop { expiry check → drain outbox via `session_send` → `maintain` per peer
    every 1 s → read one frame per link (reads sliced to 100 ms only when 2+
-   links) → `frames[t] += 1` → `dispatch_frame` → on read error evict the link,
-   error only when the set goes empty → on quiet timeout `keepalive_if_idle` }.
-5. **`maintain` tick** (`driver.rs:168`): `expire` → `fix` → `send_announces` →
+   links) → count the frame's wire bytes into the entry's `rx` → `frames[t] += 1`
+   → `dispatch_frame` → on read **or write** error evict the link, abort the
+   serve only if `fatal_link_error` says so (i.e. only when the set went empty or
+   the error is ours) → on quiet timeout `keepalive_if_idle` }.
+   Because the set owns its conns, eviction hands the `AnyConn` back to the
+   caller (`remove`) instead of invalidating a borrow.
+5. **`maintain` tick** (`driver.rs:165`): `expire` → `fix` → `send_announces` →
    `bloom_maintenance` → `expire_ephemeral` → re-`rumor_lookup` still-pending
    rumors.
 
 `resolve` is the same loop pinned to one peer: `rumor_lookup` → throttled
 `maintain` → read → `dispatch_frame` → test `path.entries` for a key whose
-address or subnet matches (`driver.rs:109-165`).
+address or subnet matches (`driver.rs:109-162`).
 
 ## Frame dispatch
 
-`dispatch_frame` (`driver.rs:230-302`) is a `match` on `FrameType`:
+`dispatch_frame` (`driver.rs:256-329`) is a `match` on `FrameType`:
 
 | type | handler | table |
 |---|---|---|
@@ -199,8 +208,13 @@ dev-dependencies leave the root manifest.
 
 Wire-level (must stay byte-identical to Go):
 - `FrameType` discriminant order mirrors Go `wirePacketType`; `Router::frames`
-  is `[u64; 10]` indexed by `ftype as usize`, so a new type panics. Counters are
-  bumped by the **caller** of `dispatch_frame`, not inside it.
+  is `[u64; FRAME_KINDS]` indexed by `ftype as usize`, so a new type panics —
+  `FRAME_KINDS` (`frame.rs:16`) and `FrameType::ALL` are both sized from the
+  same const and `frame_kinds_match_table_len` asserts the table and the count
+  agree. Counters are bumped by the **caller** of `dispatch_frame`, not inside it.
+- Link byte counters are `frame::wire_len(payload.len())` in both directions, so
+  `getPeers`' `bytes_recvd`/`bytes_sent` will be what the peer's NIC saw, not the
+  payload size (Go counts on the framed stream).
 - `meta` signature must remain the trailing 64 bytes; empty password takes a
   different unkeyed hash branch — nil-vs-`""` interop depends on it.
 - `run_handshake` writes ours before reading theirs; reordering deadlocks both
@@ -211,7 +225,7 @@ Wire-level (must stay byte-identical to Go):
 - DHT rumors rendezvous by **transformed** key, so a full-key notify matches a
   partial-key lookup. Keying by destination key drops every resolution.
 - `SigRes.psig` and announce `sig` cover node + parent + req + **port**.
-- Announce scope: `_send_announces` (`tree.rs:524`, mirroring Go
+- Announce scope: `_send_announces` (`tree.rs:530`, mirroring Go
   `network/router.go:321`) sends the ancestry of self plus the ancestry of that
   one peer — never the whole table. So `tree.infos` holds a node's line to the
   root and its neighbours on it, and in a line A—B—C the two ends legitimately
@@ -228,16 +242,39 @@ Lifetime / sequencing:
   stagger proto requests behind `has_session`.
 - `ws://` requires the `ygg-ws` subprotocol both ways. `QuicStream` must keep
   endpoint + conn handles alive or the connection tears mid-link.
-- `LinkSet::write` returns `Ok(())` when the target has no entry — silent loss.
-- A dead link is evicted from the `LinkSet` only (`driver.rs:396`); `tree.peers`,
+- Two send strengths, and picking wrong one is the silent-failure bug this split
+  exists to kill: `LinkSet::write` is **hard** (`Err(Error::NoLink)` for a peer
+  with no entry) and is only for a caller that just held that link;
+  `LinkSet::write_via` is **soft** (`Ok(false)`, frame discarded, counted by
+  `Router::dropped_no_link`) and is mandatory for anything addressed from router
+  state. Every `Ok(false)`/`Err(NoLink)` is visible — a drop nobody can count is
+  the failure mode Gate 2 audited.
+- **Router books outlive links, so a key they name may have no link** (Slice 4).
+  Nothing prunes `tree.peers`/`tree.infos`/`bloom.on_tree` when a link dies —
+  Go's `removePeer` (`router.go:147`) does, and adding that is the router-state
+  lifecycle slice's job. Until then the three reads that mirror Go must ask the
+  live set: `_sendReqs` iterates `links.peers()` (`router.go:189`), the bloom
+  fan-out is guarded by the peer lookup (`bloomfilter.go:277`), and `fix` checks
+  `links.peers().contains(&info.parent)` (`router.go:229`). Each has a test that
+  fails only when the guard is reverted
+  (`router_books_can_name_a_peer_with_no_link`,
+  `fix_refuses_a_parent_with_no_link`); `tests/mesh3.rs` passes under all three
+  reversions, so it is not the coverage.
+- A dead link is evicted from the `LinkSet` only (`driver.rs:446`); `tree.peers`,
   `tree.responses` and `bloom.send`/`recv` keep their entries. Deliberate — that
   retention is what lets traffic self-heal across redials. Every map keyed by a
   *network node* does expire (`tree.infos` + `tree.deadlines` at
-  `tree.rs:346-350`, `path.entries` / `path.rumors` / `sess.bufs` /
-  `sess.sessions` at `driver.rs:205-210`, and each `tree.sent[peer]` set is
-  pruned by the same pass at `tree.rs:314-316`), so surviving growth is bounded
+  `tree.rs:336-349`, `path.entries` / `path.rumors` / `sess.bufs` /
+  `sess.sessions` at `driver.rs:200-207`, and each `tree.sent[peer]` set is
+  pruned by the same pass at `tree.rs:345-349`), so surviving growth is bounded
   by distinct link peers ever seen, not by network size. Repeated admin
   `addPeer` against many one-off URIs is the realistic way to grow it.
+- Link errors are fatal **only when they take the last link with them**:
+  `Router::fatal_link_error(links, e)` gates all five `serve_links` error sites
+  — `Error::Io`/`Error::NoLink` on a set that still has members just drop that
+  member, anything else aborts (that error came from our own code, not the
+  wire). Mirrors Go, where each peer owns a reader goroutine whose
+  `defer router.removePeer` cannot disturb the others (`peers.go:189,228,449`).
 - Dead code mirrors Go: `BloomState::dirty` is written and never read; `fix`
   ignores its `peer_key` yet is called per link per tick. Leave both.
 

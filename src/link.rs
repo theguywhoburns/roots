@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use crate::address::KEY_LEN;
 use crate::error::Error;
-use crate::frame::{self, FrameType, MAX_MESSAGE_SIZE};
+use crate::frame::{self, FRAME_KINDS, FrameType, MAX_MESSAGE_SIZE};
 use crate::handshake::{HEADER_LEN, Meta};
 
 /// Timeout for the TCP connect itself (Go: 5s).
@@ -80,7 +80,7 @@ pub fn parse_go_duration(s: &str) -> Result<Duration, Error> {
 /// A link transport. The associated [`Transport::Stream`] is what
 /// [`run_handshake`] runs the `meta` exchange over.
 pub trait Transport {
-    type Stream: AsyncRead + AsyncWrite + Unpin + Send;
+    type Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static;
     fn dial(
         addr: &str,
         timeout: Duration,
@@ -149,18 +149,19 @@ pub struct AnyConn {
     pub remote_key: [u8; KEY_LEN],
     pub priority: u8,
     pub kind: crate::peer::PeerKind,
+    /// Which way the socket came up (dial = outbound, accept = inbound);
+    /// `getPeers` reports it, so it must survive type erasure.
+    pub inbound: bool,
     pub stream: Box<dyn LinkStream>,
 }
 
 impl AnyConn {
-    pub fn new<T: Transport>(conn: PeerConn<T>) -> Self
-    where
-        T::Stream: 'static,
-    {
+    pub fn new<T: Transport>(conn: PeerConn<T>) -> Self {
         Self {
             remote_key: conn.remote_key,
             priority: conn.priority,
             kind: conn.kind,
+            inbound: conn.inbound,
             stream: Box::new(conn.stream),
         }
     }
@@ -188,59 +189,98 @@ impl Link for AnyConn {
     }
 }
 
+/// One link the set owns: the conn plus what the set measures about it.
+struct LinkEntry {
+    peer: [u8; KEY_LEN],
+    link: AnyConn,
+    up: std::time::Instant,
+    rx: u64,
+    tx: u64,
+}
+
+/// What the set measures about one live link. This is the source for
+/// `getPeers`' `uptime`, `bytes_recvd`, `bytes_sent` and `inbound`.
+#[derive(Clone, Copy, Debug)]
+pub struct LinkStats {
+    pub up: Duration,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub inbound: bool,
+}
+
 /// The multi-peer connection map (Slice 10b): one entry per link keyed
-/// by the peer's node key. All router I/O goes through the set, so mixed
-/// transports share one code path; a target with no entry is silently
-/// skipped (a next hop we hold no link for). Single-link callers
-/// (`serve`, `resolve`) wrap their one link and delegate.
+/// by the peer's node key. The set **owns** its links, so it is `'static`
+/// and a caller can keep it across await points or hand it to a queue; all
+/// router I/O goes through it, so mixed transports share one code path and
+/// every byte is counted.
+///
+/// Two send calls, deliberately different (Gate 2's silent-failure audit):
+/// [`LinkSet::write`] is hard — the caller named a link it is serving, so a
+/// missing entry is a bug and says so. [`LinkSet::write_via`] is soft — a next
+/// hop the pathfinder picked may simply have no link, which Go drops silently
+/// (`router.go` `peers[key]` lookup); we report it so the caller can count it.
 #[derive(Default)]
-pub struct LinkSet<'a> {
-    entries: Vec<([u8; KEY_LEN], &'a mut dyn Link)>,
+pub struct LinkSet {
+    entries: Vec<LinkEntry>,
     last_write: std::collections::HashMap<[u8; KEY_LEN], std::time::Instant>,
 }
 
-impl<'a> LinkSet<'a> {
+impl LinkSet {
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Wrap a single link (single-peer callers).
-    pub fn single(peer: [u8; KEY_LEN], link: &'a mut dyn Link) -> Self {
+    pub fn single(conn: AnyConn) -> Self {
         let mut set = Self::default();
-        set.add(peer, link);
+        set.add(conn);
         set
     }
 
-    pub fn add(&mut self, peer: [u8; KEY_LEN], link: &'a mut dyn Link) {
-        if let Some(slot) = self.entries.iter_mut().find(|(k, _)| *k == peer) {
-            slot.1 = link;
-        } else {
-            self.entries.push((peer, link));
-        }
+    /// Insert (or replace, keyed by remote) a link, returning the displaced
+    /// one. The send clock survives a replace — it is the keepalive state the
+    /// next slice depends on — everything else belongs to the new link.
+    pub fn add(&mut self, conn: AnyConn) -> Option<AnyConn> {
+        let peer = conn.remote_key;
         self.last_write
             .entry(peer)
             .or_insert_with(std::time::Instant::now);
+        let now = std::time::Instant::now();
+        if let Some(slot) = self.entries.iter_mut().find(|e| e.peer == peer) {
+            let displaced = std::mem::replace(&mut slot.link, conn);
+            slot.up = now;
+            slot.rx = 0;
+            slot.tx = 0;
+            return Some(displaced);
+        }
+        self.entries.push(LinkEntry {
+            peer,
+            link: conn,
+            up: now,
+            rx: 0,
+            tx: 0,
+        });
+        None
     }
 
     /// Peer keys currently in the set (for per-link maintain loops).
     pub fn peers(&self) -> Vec<[u8; KEY_LEN]> {
-        self.entries.iter().map(|(k, _)| *k).collect()
+        self.entries.iter().map(|e| e.peer).collect()
     }
 
-    /// Reborrowing access to one link's framed I/O.
-    pub fn get(&mut self, peer: &[u8; KEY_LEN]) -> Option<&mut dyn Link> {
-        for (k, l) in self.entries.iter_mut() {
-            if k == peer {
-                return Some(&mut **l);
-            }
-        }
-        None
+    /// Direct access to one link, for I/O the set itself does not mediate.
+    pub fn get(&mut self, peer: &[u8; KEY_LEN]) -> Option<&mut AnyConn> {
+        self.entries
+            .iter_mut()
+            .find(|e| &e.peer == peer)
+            .map(|e| &mut e.link)
     }
 
-    /// Drop a link from the set (dead links; the caller owns the conn).
-    /// Send clocks for remaining links are untouched.
-    pub fn remove(&mut self, peer: &[u8; KEY_LEN]) {
-        self.entries.retain(|(k, _)| k != peer);
+    /// Take a link out of the set (dead links, or handing ownership back to
+    /// the caller). Send clocks for remaining links are untouched.
+    pub fn remove(&mut self, peer: &[u8; KEY_LEN]) -> Option<AnyConn> {
+        let at = self.entries.iter().position(|e| &e.peer == peer)?;
+        Some(self.entries.remove(at).link)
     }
 
     /// True when no links remain.
@@ -248,20 +288,96 @@ impl<'a> LinkSet<'a> {
         self.entries.is_empty()
     }
 
-    /// Write one frame to the link for `target` (no entry = drop).
-    /// Stamps the send time, which drives Go-style lazy keepalives:
-    /// a keepalive goes out only after a full idle tick with no sends.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Counters for one live link, or `None` if we hold no link to that key.
+    pub fn stats(&self, peer: &[u8; KEY_LEN]) -> Option<LinkStats> {
+        self.entries
+            .iter()
+            .find(|e| &e.peer == peer)
+            .map(|e| LinkStats {
+                up: e.up.elapsed(),
+                rx_bytes: e.rx,
+                tx_bytes: e.tx,
+                inbound: e.link.inbound,
+            })
+    }
+
+    /// Hard send: `target` is a link the caller believes it is serving, so a
+    /// missing entry is [`Error::NoLink`] rather than a silent drop. Stamps
+    /// the send time, which drives Go-style lazy keepalives: a keepalive goes
+    /// out only after a full idle tick with no sends.
     pub async fn write(
         &mut self,
         target: [u8; KEY_LEN],
         ftype: FrameType,
         payload: &[u8],
     ) -> Result<(), Error> {
-        if let Some(link) = self.get(&target) {
-            link.write_frame(ftype, payload).await?;
-            self.last_write.insert(target, std::time::Instant::now());
+        if self.send(target, ftype, payload).await? {
+            Ok(())
+        } else {
+            Err(Error::NoLink)
         }
-        Ok(())
+    }
+
+    /// Soft send: `Ok(false)` means "no link to that next hop" — normal while
+    /// the DHT converges, and the frame was discarded. The caller counts it
+    /// (`Router::dropped_no_link`), because a drop nobody can see is the bug
+    /// this split exists to fix.
+    pub async fn write_via(
+        &mut self,
+        target: [u8; KEY_LEN],
+        ftype: FrameType,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
+        self.send(target, ftype, payload).await
+    }
+
+    async fn send(
+        &mut self,
+        target: [u8; KEY_LEN],
+        ftype: FrameType,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
+        let Some(at) = self.entries.iter().position(|e| e.peer == target) else {
+            return Ok(false);
+        };
+        match self.entries[at].link.write_frame(ftype, payload).await {
+            Ok(()) => {
+                self.entries[at].tx += frame::wire_len(payload.len());
+                self.last_write.insert(target, std::time::Instant::now());
+                Ok(true)
+            }
+            // A socket that refuses a frame is gone: retire the link here so
+            // nothing addresses it again. Go discards write errors outright
+            // (`peers.go:189` `_, _ = w.wbuf.Write(bs)`, `pop()` ignores
+            // `Flush`) and lets that peer's own read goroutine tear it down;
+            // keeping the dead link in the set would let one failed write
+            // poison every later send in the serve.
+            Err(e) => {
+                self.entries.remove(at);
+                Err(e)
+            }
+        }
+    }
+
+    /// The set's only read path, so `rx` cannot be bypassed. Times out and
+    /// errors exactly like [`Link::read_frame`] on the inner link; no entry
+    /// for `peer` is [`Error::NoLink`].
+    pub async fn read_frame(
+        &mut self,
+        peer: &[u8; KEY_LEN],
+    ) -> Result<(FrameType, Vec<u8>), Error> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| &e.peer == peer)
+            .ok_or(Error::NoLink)?;
+        let (ftype, payload) = entry.link.read_frame().await?;
+        entry.rx += frame::wire_len(payload.len());
+        Ok((ftype, payload))
     }
 
     /// Time since the last frame sent to `peer` (zero for unknown links).
@@ -292,6 +408,9 @@ pub struct PeerConn<T: Transport = Tcp> {
     pub remote_key: [u8; KEY_LEN],
     pub priority: u8,
     pub kind: crate::peer::PeerKind,
+    /// Set by [`complete_accept`], cleared by [`complete_dial`]: which way the
+    /// socket came up.
+    pub inbound: bool,
     pub stream: T::Stream,
 }
 
@@ -481,7 +600,7 @@ pub async fn accept(
 /// Per-type frame counters from a [`PeerConn::run`] session.
 #[derive(Debug, Default)]
 pub struct RunStats {
-    pub frames: [u64; 10],
+    pub frames: [u64; FRAME_KINDS],
     pub keepalives_sent: u64,
     pub payload_bytes: u64,
 }
@@ -617,6 +736,7 @@ pub async fn complete_dial<T: Transport>(
         remote_key,
         priority,
         kind,
+        inbound: false,
         stream,
     })
 }
@@ -639,6 +759,7 @@ pub async fn complete_accept<T: Transport>(
         remote_key,
         priority,
         kind,
+        inbound: true,
         stream,
     })
 }
@@ -794,6 +915,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn linkset_write_reports_missing_peer() {
+        // The two send calls disagree on purpose (Gate 2's silent-failure
+        // audit): naming a link we believe we serve is a bug, picking a next
+        // hop that has no link is normal.
+        let absent = [7u8; KEY_LEN];
+        let mut links = LinkSet::new();
+        assert!(
+            matches!(
+                links.write(absent, FrameType::KeepAlive, &[]).await,
+                Err(Error::NoLink)
+            ),
+            "hard send must report the missing link"
+        );
+        assert!(
+            !links
+                .write_via(absent, FrameType::KeepAlive, &[])
+                .await
+                .unwrap(),
+            "soft send must report the drop without failing"
+        );
+        assert!(
+            matches!(links.read_frame(&absent).await, Err(Error::NoLink)),
+            "the set's only read path reports a missing link too"
+        );
+        assert!(
+            links.is_empty(),
+            "a failed send must not create a set entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn anyconn_records_direction() {
+        // `inbound` rides onto the type-erased link from the handshake
+        // templates, so `getPeers` can still report it after erasure.
+        let client_sk = SigningKey::from_bytes(&[31; 32]);
+        let server_sk = SigningKey::from_bytes(&[32; 32]);
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let conn = accept(&listener, &server_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            assert!(conn.inbound, "accept template marks inbound");
+            let links = LinkSet::single(AnyConn::new(conn));
+            let peer = links.peers()[0];
+            links.stats(&peer).unwrap().inbound
+        });
+        let conn = dial(
+            &format!("tcp://{addr}"),
+            &client_sk,
+            &LinkOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!conn.inbound, "dial template marks outbound");
+        let peer = conn.remote_key;
+        let mut links = LinkSet::single(AnyConn::new(conn));
+        let stats = links.stats(&peer).unwrap();
+        assert!(!stats.inbound, "erased link keeps the outbound flag");
+        assert_eq!(links.len(), 1);
+        assert_eq!(stats.rx_bytes, 0);
+        assert_eq!(stats.tx_bytes, 0);
+        assert!(stats.up < Duration::from_secs(5));
+        assert!(
+            links.stats(&[0; KEY_LEN]).is_none(),
+            "no counters for a peer we hold no link to"
+        );
+        // Ownership round trip: `remove` hands the link back to the caller and
+        // `add` takes it again, while the send clock — the keepalive state the
+        // next slice's queue depends on — survives.
+        let idle_before = links.idle_for(&peer);
+        let back = links.remove(&peer).unwrap();
+        assert!(!back.inbound, "handed-back link keeps its direction");
+        assert!(links.is_empty() && links.stats(&peer).is_none());
+        assert!(links.add(back).is_none(), "fresh slot displaces nothing");
+        assert_eq!(links.len(), 1);
+        assert!(!links.stats(&peer).unwrap().inbound);
+        assert!(
+            links.idle_for(&peer) >= idle_before,
+            "re-adding must not reset the send clock"
+        );
+        assert!(server.await.unwrap(), "erased inbound link reports inbound");
+    }
+
+    #[tokio::test]
+    async fn link_stats_counts_frame_bytes() {
+        // rx/tx are wire bytes, not payload bytes: Go adds every socket byte
+        // it reads or writes (`yggdrasil-go/src/core/link.go:784-793`), and a
+        // frame costs `uvarint(1+len) + type + payload` on the wire. The
+        // counters start at the first frame, so the handshake bytes are the
+        // known gap versus Go's totals — frame traffic is what diverges.
+        let a_sk = SigningKey::from_bytes(&[41; 32]);
+        let b_sk = SigningKey::from_bytes(&[42; 32]);
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let conn = accept(&listener, &b_sk, &LinkOptions::default())
+                .await
+                .unwrap();
+            let peer = conn.remote_key;
+            let mut links = LinkSet::single(AnyConn::new(conn));
+            let (ftype, _payload) = links.read_frame(&peer).await.unwrap();
+            (ftype, links.stats(&peer).unwrap().rx_bytes)
+        });
+        let conn = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let peer = conn.remote_key;
+        let mut links = LinkSet::single(AnyConn::new(conn));
+        links
+            .write(peer, FrameType::SigReq, &[1, 2, 3])
+            .await
+            .unwrap();
+        let sent = links.stats(&peer).unwrap().tx_bytes;
+        assert_eq!(sent, 5, "1 prefix + 1 type byte + 3 payload bytes");
+        let (ftype, got) = server.await.unwrap();
+        assert_eq!(ftype, FrameType::SigReq);
+        assert_eq!(got, sent, "both ends counted the same bytes");
+    }
+
+    #[tokio::test]
     async fn frame_exchange_over_loopback() {
         let a_sk = SigningKey::from_bytes(&[21; 32]);
         let b_sk = SigningKey::from_bytes(&[22; 32]);
@@ -809,6 +1051,7 @@ mod tests {
                 remote_key: [0; KEY_LEN],
                 priority: 0,
                 kind: crate::peer::PeerKind::Go,
+                inbound: true,
                 stream: sock,
             };
             let (ftype, payload) = tmp.read_frame().await.unwrap();
@@ -825,5 +1068,51 @@ mod tests {
         assert_eq!(ftype, FrameType::KeepAlive);
         assert!(payload.is_empty());
         server.await.unwrap();
+    }
+
+    /// In-memory transport, so a test can hand the set a link whose writes
+    /// are certain to fail (a `duplex` pair with the far half dropped)
+    /// instead of racing a real socket's reset timing.
+    #[derive(Clone)]
+    struct Mem;
+
+    impl Transport for Mem {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(_addr: &str, _timeout: Duration) -> Result<Self::Stream, Error> {
+            unreachable!("test links are assembled by hand")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_retires_the_link() {
+        // The multi-link serve only survives a dying link because the set
+        // retires it where the failure is noticed: a link that refuses a
+        // frame leaves the map instead of staying to poison every later send.
+        // (Go gets this for free — each peer has its own reader goroutine,
+        // `peers.go:228`, and write errors are discarded outright.)
+        let key = [3u8; KEY_LEN];
+        let (mine, theirs) = tokio::io::duplex(64);
+        drop(theirs);
+        let mut links = LinkSet::single(AnyConn::new(PeerConn::<Mem> {
+            remote_key: key,
+            priority: 0,
+            kind: crate::peer::PeerKind::Go,
+            inbound: false,
+            stream: mine,
+        }));
+        let err = links
+            .write(key, FrameType::KeepAlive, &[7u8; 512])
+            .await
+            .expect_err("a write to a closed link must report the io error");
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+        assert!(links.is_empty(), "the failing link is retired, not kept");
+        assert!(
+            matches!(
+                links.write(key, FrameType::KeepAlive, &[]).await,
+                Err(Error::NoLink)
+            ),
+            "the key is gone, so a later send reports it as missing"
+        );
     }
 }

@@ -102,6 +102,43 @@ Three ordering rules that are not obvious from the list:
       *Proves:* four new tests, and the two silent-failure footguns Gate 2 named
       stop being silent. This is the enabler for the queue in Slice 5; it is the
       scariest diff in the plan, which is why Slice 1 exists.
+      **Done 2026-09-24:** nine new or rewritten tests; the CI trio green
+      (81 unit + 6 integration, ~14 s). Every behaviour this slice changed is
+      pinned by reverting it, one at a time, and naming the test that fails:
+
+      | Reverted fix | Killed by |
+      |---|---|
+      | `_sendReqs` iterates the live set (`router.go:189`) | `router_books_can_name_a_peer_with_no_link` |
+      | bloom fan-out is a soft send (`bloomfilter.go:277`) | `router_books_can_name_a_peer_with_no_link` |
+      | `_fix` asks the live set for parent liveness (`router.go:229`) | `fix_refuses_a_parent_with_no_link` |
+      | a link error aborts the serve only when the set is empty | `only_an_empty_set_makes_a_link_error_fatal` |
+      | a refused write retires its link | `a_failed_write_retires_the_link` |
+      | hard send reports a missing link (`Err(NoLink)`) | `linkset_write_reports_missing_peer`, `a_failed_write_retires_the_link`, `dropped_no_link_counts_soft_sends` |
+
+      - **Two changes the design did not anticipate**, both needed to make the
+        eviction claim true: `LinkSet::send` retires an entry whose
+        `write_frame` fails, and `Router::fatal_link_error(&links, &err)` gates
+        the five `serve_links` error sites. Without them a link that was dead
+        but not yet evicted aborted every survivor with
+        `Io(ConnectionReset)`. Go needs neither: each peer owns a reader
+        goroutine (`peers.go:228`) and write errors are discarded outright
+        (`peers.go:189`).
+      - **`tests/mesh3.rs` passes under all three router-state liveness
+        reversions.** The tolerance above absorbs them, and no loopback scenario
+        reaches the window — which is why the two targeted tests exist rather
+        than a mesh variant. The same is true of the retirement test's socket:
+        loopback TCP absorbs writes to a closed peer until the reset lands, so
+        `a_failed_write_retires_the_link` uses `tokio::io::duplex` with the far
+        half dropped, which fails for certain.
+      - **Divergence found, deliberately not fixed:** nothing prunes
+        `tree.peers`, `tree.infos` or `bloom.on_tree` when a link dies, so a
+        node keeps a parent it has no link for. Go prunes all of it in
+        `removePeer` (`router.go:147`). Slice 4 makes the stale key tolerable;
+        `a_stale_parent_is_kept_and_the_serve_survives_it` pins the current
+        shape as a tripwire for the router-state lifecycle slice.
+      - `TreeState::send_all_reqs` and `Router::use_response` became
+        `pub(crate)` so a fixture can drive them; counters are wire bytes
+        (`frame::wire_len`) in both directions.
 
 - [ ] **Slice 5 — one task, one `Router`, a command queue.** `client/src/links.rs`
       (`link_id` dedup exactly as Go's `links.add` — duplicate returns

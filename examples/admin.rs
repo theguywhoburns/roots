@@ -313,20 +313,14 @@ async fn main() {
     let our_key = client.key.verifying_key().to_bytes();
     println!("local  addr {}", client.address());
 
-    /// One owned link: the type-erased connection plus the URI it was
-    /// dialed with (for addPeer/removePeer bookkeeping).
-    struct OwnedLink {
-        key: [u8; 32],
-        uri: String,
-        conn: roots::AnyConn,
-    }
-
-    async fn dial_owned(
+    /// Dial one peer and register it, returning the type-erased link plus
+    /// the URI it was dialed with (for addPeer/removePeer bookkeeping).
+    async fn dial_link(
         dial_key: &SigningKey,
         dial_opts: &roots::LinkOptions,
         router: &mut Router,
         uri: &str,
-    ) -> Result<OwnedLink, String> {
+    ) -> Result<([u8; 32], roots::AnyConn), String> {
         // Single scheme-erased path over `connect_any` (see
         // `link::dial_any`); failures surface as Go-style
         // "unable to parse peering URI" / dial errors.
@@ -345,36 +339,28 @@ async fn main() {
             .register(&mut conn, key)
             .await
             .map_err(|e| format!("register failed: {e}"))?;
-        Ok(OwnedLink {
-            key,
-            uri: uri.to_string(),
-            conn,
-        })
+        Ok((key, conn))
     }
 
     let mut router = Router::new(client.key);
-    let first = dial_owned(&dial_key, &dial_opts, &mut router, &peer)
+    let (first_key, first) = dial_link(&dial_key, &dial_opts, &mut router, &peer)
         .await
         .expect("dial public peer");
     // Configured peers redial with backoff while configured, like Go's
     // persistent links (removal drops immediately and forgets, unlike Go
     // which only stops redialing). State lives in the lib supervisor
     // (`src/supervisor.rs`), not example-local counters.
-    // Owned links: the set below borrows them, so topology changes
-    // (addPeer/removePeer) rebuild the set afterwards. Fresh clocks on
-    // rebuild only cost one quiet second, well under peer timeouts.
-    let mut owned = vec![first];
-    // (key, uri) mirror for admin arms: `owned` is mutably borrowed by
-    // the link set during serve, so reads go here instead.
-    let mut uris = vec![(owned[0].key, peer.clone())];
+    // The set owns its links for the whole run: adding is `links.add`,
+    // removal is `links.remove`, and nothing is ever rebuilt (rebuilding
+    // would reset the per-link send clocks the keepalive logic needs).
+    let mut links = roots::LinkSet::new();
+    links.add(first);
+    // (key, uri) mirror for admin arms: the set keeps no URIs, so reads
+    // (and removePeer lookups) go here.
+    let mut uris = vec![(first_key, peer.clone())];
     let mut configured: Vec<roots::SupervisedPeer> = Vec::new();
     configured.push(roots::SupervisedPeer::new(peer.clone()));
     let mut no_out = Vec::new();
-    // One set for the whole run (see main loop below).
-    let mut links = roots::LinkSet::new();
-    for o in owned.iter_mut() {
-        links.add(o.key, &mut o.conn);
-    }
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {
         router
@@ -391,9 +377,8 @@ async fn main() {
     let mut outbox: Vec<([u8; 32], Vec<u8>)> = Vec::new();
     let table = handlers();
     let mut pending: Vec<PendingRemote> = Vec::new();
-    // A topology request (addPeer/removePeer) can't mutate `owned` while
-    // the set borrows it, so it is staged here and applied below, after
-    // the set is dropped. The set is rebuilt only on change.
+    // A topology request arrives while the serve future holds `links`
+    // mutably, so it is staged here and applied after the inner loop.
     enum Topo {
         Add {
             sock: tokio::net::TcpStream,
@@ -409,15 +394,14 @@ async fn main() {
     loop {
         // Redial configured peers missing a live link (Go persistent
         // links; failures back off per URI via the lib supervisor).
-        // Runs before the set is built so fresh clocks start clean.
-        let live_uris: Vec<String> = owned.iter().map(|o| o.uri.clone()).collect();
+        let live_uris: Vec<String> = uris.iter().map(|(_, u)| u.clone()).collect();
         for i in roots::due_indices(&configured, Instant::now(), &live_uris) {
             let uri = configured[i].uri.clone();
-            match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
-                Ok(link) => {
+            match dial_link(&dial_key, &dial_opts, &mut router, &uri).await {
+                Ok((key, conn)) => {
                     configured[i].record_success();
-                    uris.push((link.key, uri));
-                    owned.push(link);
+                    uris.push((key, uri));
+                    links.add(conn);
                 }
                 Err(e) => {
                     eprintln!("redial {uri}: {e}");
@@ -425,16 +409,13 @@ async fn main() {
                 }
             }
         }
-        let mut links = roots::LinkSet::new();
-        for o in owned.iter_mut() {
-            links.add(o.key, &mut o.conn);
-        }
-        // Keys the set was built with: if eviction drops one mid-loop,
-        // break out so the outer loop redials the missing peer.
+        // Keys the set holds: if eviction drops one mid-loop, break out so
+        // the outer loop redials the missing peer.
         let want: Vec<[u8; 32]> = links.peers();
         // Deferred init: only topology requests break the serve loop,
         // always carrying their staged change.
         let mut topo: Option<Topo> = None;
+        let mut all_dead = false;
         loop {
             tokio::select! {
                 r = router.serve(&mut links, Some(Duration::from_millis(250)), &mut outbox) => {
@@ -443,7 +424,7 @@ async fn main() {
                         // write failed: drop everything suspect and let
                         // the outer loop redial with backoff.
                         eprintln!("serve error, redialing: {e}");
-                        owned.clear();
+                        all_dead = true;
                         uris.clear();
                         tokio::time::sleep(Duration::from_secs(1)).await;
                         break;
@@ -525,7 +506,12 @@ async fn main() {
                 break;
             }
         }
-        // Set dropped: safe to mutate the owned links.
+        // Nothing borrows the set here: safe to change its topology.
+        if all_dead {
+            for k in links.peers() {
+                let _ = links.remove(&k);
+            }
+        }
         if let Some(topo) = topo {
             match topo {
                 Topo::Add { sock, echo, uri } => {
@@ -539,11 +525,11 @@ async fn main() {
                         )
                         .await;
                     } else {
-                        match dial_owned(&dial_key, &dial_opts, &mut router, &uri).await {
-                            Ok(link) => {
-                                uris.push((link.key, uri.clone()));
-                                owned.push(link);
+                        match dial_link(&dial_key, &dial_opts, &mut router, &uri).await {
+                            Ok((key, conn)) => {
+                                uris.push((key, uri.clone()));
                                 configured.push(roots::SupervisedPeer::new(uri));
+                                links.add(conn);
                                 write_admin_response(sock, &echo, "success", "", json!({})).await;
                             }
                             Err(e) => {
@@ -555,7 +541,14 @@ async fn main() {
                 Topo::Remove { sock, echo, uri } => {
                     if configured.iter().any(|c| c.uri == uri) {
                         configured.retain(|c| c.uri != uri);
-                        owned.retain(|o| o.uri != uri);
+                        let gone: Vec<[u8; 32]> = uris
+                            .iter()
+                            .filter(|(_, u)| *u == uri)
+                            .map(|(k, _)| *k)
+                            .collect();
+                        for k in gone {
+                            let _ = links.remove(&k);
+                        }
                         uris.retain(|(_, u)| *u != uri);
                         write_admin_response(sock, &echo, "success", "", json!({})).await;
                     } else {
@@ -588,7 +581,7 @@ fn remote_kind(name: &str) -> Option<RemoteKind> {
 /// match fresh mesh replies to waiters, time out the stale.
 async fn service_pending(
     router: &mut Router,
-    links: &mut roots::LinkSet<'_>,
+    links: &mut roots::LinkSet,
     peer_key: [u8; 32],
     pending: &mut Vec<PendingRemote>,
 ) {

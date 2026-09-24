@@ -27,7 +27,7 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 1 — three-node loopback mesh test (the outstanding prerequisite; the refactor safety net) — DONE 2026-09-24, `tests/mesh3.rs`, 2.3 s, 5/5 clean runs
 - [x] Slice 2 — capture harness + first Go `meta` bytes (12/22 → 14/22) — DONE 2026-09-24, `examples/go_capture.rs` + `tests/go_vectors.rs` (3 tests), `docs/protocol/10-envelope.md` + `20-handshake.md`
 - [x] Slice 3 — workspace split; `run_peer`/`drive` evicted from `Client` — DONE 2026-09-24, `client/` member (`roots-client`, bin `roots`), `client/src/node.rs`, `client/tests/reconnect.rs`; the lib builds no `Router` outside `#[cfg(test)]`
-- [ ] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert
+- [x] Slice 4 — `LinkSet` owns `AnyConn`; hard/soft sends; frame-kind const assert — DONE 2026-09-24, see the "Done 2026-09-24" block under Slice 4 in `04-slices.md` for the mutation-attribution table
 - [ ] Slice 5 — one-task node loop + `link_id` dedup command queue
 - [ ] Slice 6 — Go-shaped config (proven by Go's own binary parsing it)
 - [ ] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings
@@ -178,3 +178,33 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
   - `client/src/lib.rs` exists solely so `client/tests/reconnect.rs` can call
     `roots_client::node::run_peer`; it is one `pub mod node;`. When Slices 5–7
     add `config`/`links`/`admin` modules they go in that list.
+- **Slice 4 findings — the liveness half is proven by reverting it, not by mesh3.**
+  - Every behaviour the slice changed was reverted **one at a time** and the
+    test that then failed was named; the full table is in `04-slices.md`. Two of
+    the three router-state liveness fixes (`send_all_reqs` iterating the live
+    set, bloom maintenance using a soft send) are pinned **only** by
+    `router_books_can_name_a_peer_with_no_link`, and the `_fix` parent-liveness
+    guard only by `fix_refuses_a_parent_with_no_link`. `tests/mesh3.rs` passes
+    under all three reversions — it is the safety net for link death, not for
+    these. Do not delete those two tests as "redundant with mesh3".
+  - **`fix`'s guarded branch is unreachable in a converged loopback star.** The
+    client is the largest key, so `root_and_dists(self)` never offers a root
+    better than self and the candidate scan skips its own children (Go
+    `router.go:607-628` does the same). Any future parent-liveness test has to
+    be hand-built the way `fix_refuses_a_parent_with_no_link` is; no socket
+    timing produces the scenario.
+  - **Found and deliberately NOT fixed:** nothing prunes `tree.peers` /
+    `tree.infos` / `bloom.on_tree` when a link dies, where Go's `removePeer`
+    (`router.go:147`) prunes peers/sent/ports/requests/responses/resSeqs/ancs/
+    cache plus bloom info. The slice's rule is that stale books may name a key
+    with no link, so every send addressed from router state must be soft
+    (`write_via`) or iterate the live set. `a_stale_parent_is_kept_and_the_serve_
+    survives_it` is the tripwire for that; real pruning belongs to the
+    router-state lifecycle (hardening) slice, not here.
+  - Test-fixture mechanics worth keeping: assert write failure with
+    `tokio::io::duplex` and drop the far half — a real loopback socket absorbs a
+    512-byte write and returns `Ok`, which made the first version flaky.
+    `Transport::Stream: 'static` is required so `AnyConn` can own it.
+  - CI trio green at 81 unit + 6 integration tests (~14 s): `cargo fmt --check`,
+    `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+    `cargo test --workspace --locked`.

@@ -40,19 +40,19 @@ fn report(router: &Router) {
 
 async fn run(
     client: Client,
-    mut conn: impl roots::Link,
+    mut conn: roots::AnyConn,
     hold: Option<std::time::Duration>,
     resolve: Option<roots::address::Address>,
 ) {
-    show("remote", &conn.remote_key());
-    let peer_key = conn.remote_key();
+    show("remote", &conn.remote_key);
+    let peer_key = conn.remote_key;
     let mut router = Router::new(client.key);
     let mut no_out = Vec::new();
     if let Err(e) = router.register(&mut conn, peer_key).await {
         eprintln!("register failed: {e}");
         std::process::exit(1);
     }
-    let mut links = roots::LinkSet::single(peer_key, &mut conn);
+    let mut links = roots::LinkSet::single(conn);
     // Converge first so resolve/session have a tree to work with.
     let end = std::time::Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && std::time::Instant::now() < end {

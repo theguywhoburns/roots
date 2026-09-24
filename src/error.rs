@@ -25,6 +25,8 @@ pub enum Error {
     BadSubprotocol,
     #[error("handshake timed out")]
     Timeout,
+    #[error("no open link to this peer")]
+    NoLink,
     #[error("io: {0}")]
     Io(#[from] io::Error),
 }

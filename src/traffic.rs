@@ -60,15 +60,15 @@ impl crate::router::Router {
     /// addressed to us, or report the path broken (Go `router.handleTraffic`).
     pub(crate) async fn handle_inbound_traffic(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         tr: &Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
         if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
-            return links
-                .write(next, crate::frame::FrameType::Traffic, &buf)
+            return self
+                .write_via(links, next, crate::frame::FrameType::Traffic, &buf)
                 .await;
         }
         if tr.dest == self.pubkey {

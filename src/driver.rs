@@ -108,7 +108,7 @@ impl Router {
     /// [`Error::Timeout`].
     pub async fn resolve(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         addr: &crate::address::Address,
         timeout: Duration,
@@ -128,10 +128,7 @@ impl Router {
             }
             let remaining = end.saturating_duration_since(tokio::time::Instant::now());
             let wait = remaining.min(Duration::from_secs(2));
-            let frame = match links.get(&conn_peer) {
-                Some(link) => tokio::time::timeout(wait, link.read_frame()).await,
-                None => continue,
-            };
+            let frame = tokio::time::timeout(wait, links.read_frame(&conn_peer)).await;
             match frame {
                 Ok(Ok((ftype, payload))) => {
                     self.frames[ftype as usize] += 1;
@@ -167,7 +164,7 @@ impl Router {
     /// One maintenance tick: expire, fix parent, send announces.
     pub async fn maintain(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer_key: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         self.expire();
@@ -216,7 +213,7 @@ impl Router {
     /// so per-frame replies would be pure chatter.
     async fn keepalive_if_idle(
         &self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         peer: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         if links.idle_for(&peer) >= KEEPALIVE_DELAY {
@@ -225,11 +222,40 @@ impl Router {
         Ok(())
     }
 
+    /// Soft send through the set to a next hop we may have no link for.
+    /// Go drops those frames in silence (`router.go` `peers[key]` lookup); we
+    /// drop them too, but count it, because a forwarding hole nobody can see
+    /// is indistinguishable from a working mesh.
+    pub(crate) async fn write_via(
+        &mut self,
+        links: &mut LinkSet,
+        next: [u8; KEY_LEN],
+        ftype: FrameType,
+        buf: &[u8],
+    ) -> Result<(), Error> {
+        if !links.write_via(next, ftype, buf).await? {
+            self.dropped_no_link += 1;
+        }
+        Ok(())
+    }
+
+    /// Must a failed serve step abort the whole serve? No, if it was one
+    /// link's socket: `LinkSet::send` retires a link that refuses a frame,
+    /// so a link error only means the set shrank, and the survivors keep
+    /// serving. It is fatal when nothing is left to serve — that preserves
+    /// the single-link `serve` contract callers redial on. Anything else
+    /// (a protocol violation, a bad signature) stays fatal. Go needs no such
+    /// rule: every peer owns a reader goroutine (`peers.go:228`), so a dead
+    /// link cannot abort a live one.
+    pub(crate) fn fatal_link_error(links: &LinkSet, e: &Error) -> bool {
+        !matches!(e, Error::Io(_) | Error::NoLink) || links.is_empty()
+    }
+
     /// Handle one inbound frame: router protocol plus a lazy keepalive
     /// reply for every non-keepalive type (Go `peerMonitor` semantics).
     pub(crate) async fn dispatch_frame(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         conn_peer: [u8; KEY_LEN],
         ftype: FrameType,
         payload: &[u8],
@@ -317,7 +343,7 @@ impl Router {
     /// silently stop keepalives and get the link killed.
     pub async fn serve(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
     ) -> Result<(), Error> {
@@ -330,7 +356,7 @@ impl Router {
     /// register each link once, then slice this.
     pub async fn serve_links(
         &mut self,
-        links: &mut LinkSet<'_>,
+        links: &mut LinkSet,
         hold_for: Option<Duration>,
         outgoing: &mut Vec<([u8; KEY_LEN], Vec<u8>)>,
     ) -> Result<(), Error> {
@@ -339,7 +365,12 @@ impl Router {
         let end = hold_for.map(|h| tokio::time::Instant::now() + h);
         let mut last_maintain = tokio::time::Instant::now();
         for peer in links.peers() {
-            self.maintain(links, peer).await?;
+            if let Err(e) = self.maintain(links, peer).await {
+                if Self::fatal_link_error(links, &e) {
+                    return Err(e);
+                }
+                break;
+            }
         }
         loop {
             let now = tokio::time::Instant::now();
@@ -362,12 +393,24 @@ impl Router {
                 // Outbox sends are link-agnostic (pathfinder routes); the
                 // first peer key only scopes per-link state refreshes.
                 let peer = links.peers().into_iter().next().unwrap_or(self.pubkey);
-                self.session_send(links, peer, dest, msg).await?;
+                if let Err(e) = self.session_send(links, peer, dest, msg).await {
+                    if Self::fatal_link_error(links, &e) {
+                        return Err(e);
+                    }
+                    // `session_send_inner` already put the payload back in
+                    // `resend`, so the next slice retries it on a survivor.
+                    break;
+                }
             }
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
                 for peer in links.peers() {
-                    self.maintain(links, peer).await?;
+                    if let Err(e) = self.maintain(links, peer).await {
+                        if Self::fatal_link_error(links, &e) {
+                            return Err(e);
+                        }
+                        break;
+                    }
                 }
             }
             // Drain every link. A single link blocks for the whole budget
@@ -379,21 +422,28 @@ impl Router {
                 timeout
             };
             for peer in links.peers() {
-                let frame = match links.get(&peer) {
-                    Some(link) => tokio::time::timeout(slice, link.read_frame()).await,
-                    None => continue,
-                };
+                let frame = tokio::time::timeout(slice, links.read_frame(&peer)).await;
                 match frame {
                     Ok(Ok((ftype, payload))) => {
                         self.frames[ftype as usize] += 1;
-                        self.dispatch_frame(links, peer, ftype, &payload).await?;
+                        if let Err(e) = self.dispatch_frame(links, peer, ftype, &payload).await {
+                            if Self::fatal_link_error(links, &e) {
+                                return Err(e);
+                            }
+                            // A reply this frame provoked hit a dead link:
+                            // that link is gone, abandon the rest of this
+                            // slice and re-plan from the survivors.
+                            break;
+                        }
                     }
                     // A dead link is evicted, not fatal: remaining links
                     // keep serving (single-link callers see an empty set
                     // below and get the last error, preserving the old
                     // `serve` contract).
                     Ok(Err(e)) => {
-                        links.remove(&peer);
+                        // The removed link is dropped here, which closes its
+                        // socket; the caller owns nothing left to reclaim.
+                        let _ = links.remove(&peer);
                         if links.is_empty() {
                             return Err(e);
                         }
@@ -403,7 +453,14 @@ impl Router {
                     // no frames arrive to answer (Go sends on the same
                     // 1s timer instead of per-frame).
                     Err(_) => {
-                        self.keepalive_if_idle(links, peer).await?;
+                        if let Err(e) = self.keepalive_if_idle(links, peer).await {
+                            if Self::fatal_link_error(links, &e) {
+                                return Err(e);
+                            }
+                            // The link vanished between the snapshot and the
+                            // keepalive; the next slice works off the set.
+                            continue;
+                        }
                     }
                 }
             }
