@@ -14,6 +14,7 @@ pub mod error;
 pub mod frame;
 pub mod handshake;
 pub mod link;
+pub mod multicast;
 pub mod pathfind;
 pub mod peer;
 pub mod proto;
