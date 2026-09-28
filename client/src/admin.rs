@@ -198,7 +198,9 @@ fn remote_body(what: RemoteQuery, body: &[u8]) -> Result<Value, String> {
         // (`proto.go:300-315`, `:343-358`).
         RemoteQuery::Peers | RemoteQuery::Tree => {
             let keys: Vec<Value> = body
-                .as_chunks::<KEY_SIZE>().0.iter()
+                .as_chunks::<KEY_SIZE>()
+                .0
+                .iter()
                 .map(|c| Value::String(hex::encode(c)))
                 .collect();
             let mut m = serde_json::Map::new();

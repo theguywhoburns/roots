@@ -207,7 +207,12 @@ async fn admin_unix_socket_matches_tcp() {
     );
     let body: Value = serde_json::from_slice(&one).expect("one value");
     assert_eq!(body["status"], "success");
-    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(8));
+    // Twelve since Slice 9 added `getNodeInfo` and the three `debug_remoteGet*`
+    // (`core/api.go:239-259`). Go's own fourteen are `getTun`
+    // (`tun/admin.go:31`) and `getMulticastInterfaces`
+    // (`multicast/admin.go:50`), which need a kernel interface and multicast
+    // socket state and arrive with Slices 14 and 11.
+    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(12));
 
     // Go's `os.Chmod(path, 0660)` (`admin.go:118`).
     let mode = std::fs::metadata(unix.host())

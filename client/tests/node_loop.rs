@@ -4,8 +4,10 @@
 //! Three claims, all loopback and all of them Go's:
 //! 1. a duplicate dial is deduped by `link_id` (URI minus query), so the far
 //!    side sees one connection, not two;
-//! 2. `Drop` stops the redial but keeps the link that is already up
-//!    (`core/api.go:207-211`);
+//! 2. `Drop` is Go's `removePeer`: it stops the redial **and closes the
+//!    connection** (`core/link.go:433-438`), so the row leaves `getPeers` with
+//!    the link. Slice 5 asserted the opposite, on the strength of the comment at
+//!    `core/api.go:207-211`, which describes nothing that happens;
 //! 3. when one peer's link dies, the node survives it and the other peer keeps
 //!    carrying traffic — the single-task loop does not stop.
 
@@ -119,7 +121,7 @@ async fn node_loop_two_peers_dedup_drop_and_survival() {
         format!("tcp://{}", lc.local_addr().unwrap()),
     );
     let stop = Instant::now() + Duration::from_secs(30);
-    let (db_tx, db_rx) = mpsc::channel(4);
+    let (_db_tx, db_rx) = mpsc::channel(4);
     let (dc_tx, dc_rx) = mpsc::channel(4);
     let sb = Arc::new(Mutex::new(PeerState::default()));
     let sc = Arc::new(Mutex::new(PeerState::default()));
@@ -192,49 +194,50 @@ async fn node_loop_two_peers_dedup_drop_and_survival() {
     )
     .await;
 
-    // Go's `removePeer`: stop redialling, keep what is up. The link has to carry
-    // traffic *after* the drop, which is the part that surprises people.
+    // Go's `removePeer`: stop redialling **and close the connection**.
+    //
+    // This block used to assert the opposite — that the link kept carrying
+    // traffic after the drop — on the strength of the comment at
+    // `core/api.go:207-211` ("the peer is not disconnected immediately"). Reading
+    // Go rather than its comment showed `link.go:438` is a `conn.Close()`, so
+    // Slice 9 took Go's behaviour. The new claim is that the payload sent after
+    // the drop does **not** arrive, and that the peer sees the link go: a drop
+    // that quietly left the socket open would be a divergence, not a feature.
     tx.send(Cmd::Drop {
         uri: uri_b.clone(),
         sintf: String::new(),
         respond: None,
     })
     .unwrap();
+    wait_for(
+        "the peer's link is closed by the drop",
+        || snapshot(&sb).links == 0,
+        Duration::from_secs(10),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     tx.send(Cmd::Send {
         dest: b_pub,
         bytes: b"after-drop".to_vec(),
     })
     .unwrap();
-    wait_for(
-        "the dropped peer's live link still carries traffic",
-        || got(&sb, b"after-drop"),
-        Duration::from_secs(15),
-    )
-    .await;
-    assert_eq!(
-        snapshot(&sb).links,
-        1,
-        "Drop cancels the redial loop, it does not close the socket"
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !got(&sb, b"after-drop"),
+        "the socket is closed, so a payload sent after removePeer does not arrive"
     );
 
-    // Now the link really dies — remote close, node's view. With the peer
-    // dropped there must be no redial, while the other peer keeps working.
-    db_tx.try_send(()).unwrap();
-    wait_for(
-        "the node lost the dropped peer",
-        || snapshot(&sb).links == 0,
-        Duration::from_secs(10),
-    )
-    .await;
     // Longer than the first backoff step (1s), so a redial would have arrived.
     tokio::time::sleep(Duration::from_millis(3500)).await;
     assert_eq!(
         snapshot(&sb).accepted,
         1,
-        "a dropped peer must not be dialled again"
+        "a removed peer must not be dialled again"
     );
 
+    // The surviving peer is untouched: closing one row's link is not
+    // "disconnect everything", which is the failure mode this ordering would
+    // have if `removePeer` cleared the set instead of one entry.
     tx.send(Cmd::Send {
         dest: c_pub,
         bytes: b"survivor".to_vec(),
@@ -246,7 +249,6 @@ async fn node_loop_two_peers_dedup_drop_and_survival() {
         Duration::from_secs(15),
     )
     .await;
-
     dc_tx.try_send(()).unwrap();
     tx.send(Cmd::Quit).unwrap();
     tokio::time::timeout(Duration::from_secs(5), handle)

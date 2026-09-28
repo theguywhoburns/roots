@@ -653,9 +653,19 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
         max_backoff: None,
     };
     for pair in query.split('&').filter(|s| !s.is_empty()) {
+        // `u.Query()` unescapes the value, and a pair Go cannot unescape is
+        // dropped whole — so its option reads as absent rather than as an error
+        // (`link.go:178-212` reads every option through `u.Query().Get`).
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(v) = query_unescape(v) else {
+            continue;
+        };
+        let v = v.as_str();
         match k {
             "password" => {
+                // Go checks the length on the *decoded* string
+                // (`if len(p) > blake2b.Size`, `link.go:201`), so an escape
+                // that makes it longer is refused here too.
                 if v.len() > crate::handshake::MAX_PASSWORD_LEN {
                     return Err(Error::PasswordInvalid);
                 }
@@ -686,7 +696,47 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     }
     Ok((scheme, out))
 }
-
+/// Go's `url.QueryUnescape` (`net/url/url.go:925-950`), with Go's error
+/// behaviour rather than ours.
+///
+/// A peering URI is a `url.URL`, so `?password=` arrives percent-encoded: Go
+/// writes it with `url.Values.Encode` (`multicast.go:328`, and any operator
+/// following its docs) and reads it with `u.Query().Get` (`link.go:200-205`),
+/// which unescapes. Taking the raw bytes made a password containing a space, `&`,
+/// `=`, `/` or `%` reach the handshake escaped, where it silently failed the
+/// keyed hash against the peer — a link that connects and then goes nowhere.
+///
+/// The difference from a normal unescape is what happens on a bad escape. Go's
+/// `ParseQuery` drops the offending pair and keeps the rest, and `Values.Get`
+/// then reports the key as absent — so a malformed `?password=%zz` is *no
+/// password*, not an error. `None` here means the same thing.
+fn query_unescape(s: &str) -> Option<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'+' => {
+                out.push(b' ');
+                at += 1;
+            }
+            b'%' => {
+                let hex = bytes.get(at + 1..at + 3)?;
+                let pair = std::str::from_utf8(hex).ok()?;
+                let b = u8::from_str_radix(pair, 16).ok()?;
+                out.push(b);
+                at += 3;
+            }
+            b => {
+                out.push(b);
+                at += 1;
+            }
+        }
+    }
+    // The bytes came from a `&str` and every escape produced a byte, so this
+    // only fails on a lone surrogate-ish sequence, which cannot occur.
+    String::from_utf8(out).ok()
+}
 /// Parse a `tcp://` peer URI (rejects other schemes).
 pub fn parse_peer_uri(uri: &str) -> Result<PeerUri, Error> {
     match parse_link_uri(uri)? {
@@ -980,6 +1030,86 @@ mod tests {
         assert_eq!(u.pinned_key, Some([0xaa; KEY_LEN]));
         assert!(parse_peer_uri("tls://h:1").is_err());
         assert!(parse_peer_uri("tcp://").is_err());
+    }
+
+    /// A peering URI is a `url.URL`, so `?password=` is percent-encoded on the
+    /// way out (`url.Values.Encode`, `multicast.go:328`) and unescaped on the
+    /// way in (`u.Query().Get`, `link.go:200-205`). Taking the raw bytes made a
+    /// password with a space or an `&` in it reach the handshake escaped, where
+    /// it fails the keyed hash against the peer: a link that connects and then
+    /// goes nowhere.
+    #[test]
+    fn a_password_needing_escapes_survives_the_round_trip() {
+        for plain in [
+            "simple",
+            "with space",
+            "amp&and=equals",
+            "slash/and?question",
+            "percent%25sign",
+            "unicode-æøå",
+        ] {
+            let uri = format!("tcp://h:1?password={}", go_query_escape(plain));
+            let parsed = parse_peer_uri(&uri).expect("a valid URI");
+            assert_eq!(
+                String::from_utf8(parsed.password).unwrap(),
+                plain,
+                "{uri:?} should carry {plain:?}"
+            );
+        }
+    }
+
+    /// Go checks the length on the *decoded* string
+    /// (`if len(p) > blake2b.Size`, `link.go:201`), so an escape that makes the
+    /// password longer than 64 bytes is refused.
+    #[test]
+    fn the_password_length_is_checked_after_unescaping() {
+        let long = "a".repeat(70);
+        let uri = format!("tcp://h:1?password={}", go_query_escape(&long));
+        assert!(
+            parse_peer_uri(&uri).is_err(),
+            "70 bytes is over blake2b.Size"
+        );
+        // 60 escapes expand to 70 bytes, so the raw form would have been under
+        // the limit and slipped through.
+        let escapes = "%61".repeat(20);
+        let uri = format!("tcp://h:1?password={escapes}");
+        assert_eq!(
+            parse_peer_uri(&uri)
+                .expect("20 escapes is 20 bytes")
+                .password
+                .len(),
+            20
+        );
+    }
+
+    /// Go's `ParseQuery` drops a pair it cannot unescape and keeps the rest, so
+    /// `u.Query().Get` reports the key as absent rather than erroring
+    /// (`link.go:178-212` reads every option that way). A malformed password is
+    /// therefore *no password*, and the other options still apply.
+    #[test]
+    fn a_malformed_escape_reads_as_an_absent_option() {
+        let u = parse_peer_uri("tcp://h:1?password=%zz&priority=3").unwrap();
+        assert!(
+            u.password.is_empty(),
+            "an unescapable pair is dropped, not rejected"
+        );
+        assert_eq!(u.priority, 3, "and the rest of the query survives");
+    }
+
+    /// Go's `url.QueryEscape`, written out so the round trip is a real one
+    /// rather than a restatement of the unescaper.
+    fn go_query_escape(s: &str) -> String {
+        let mut out = String::new();
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+                out.push(b as char);
+            } else if b == b' ' {
+                out.push('+');
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
     }
 
     #[test]

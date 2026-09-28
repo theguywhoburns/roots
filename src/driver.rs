@@ -11,6 +11,17 @@ use crate::peer::PeerState;
 use crate::router::{MAINTENANCE_INTERVAL, Router, UNKNOWN_LATENCY};
 use crate::tree::{Announce, SigReq, SigRes};
 
+/// What a payload handed to [`Router::send_or_resolve`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Left now: we already knew the key that owns the address and held a
+    /// live path to it, so the payload went out without a lookup.
+    Sent,
+    /// Held: a lookup is out and this destination's one payload waits for the
+    /// notify that names the key.
+    Queued,
+}
+
 impl Router {
     /// Register a peer after the link handshake: open SigReq, bloom, and
     /// replay of already-sent announces (Go `addPeer`). Call ONCE per link
@@ -175,6 +186,91 @@ impl Router {
             }
         }
         Err(Error::Timeout)
+    }
+
+    /// Send `payload` for `dest` now, or hold it until a DHT notify names the
+    /// key that owns that address.
+    ///
+    /// This is resolve-and-hold, the library half: a caller with a packet to
+    /// hand over never waits for a lookup, so a device write cannot block the
+    /// loop. Go's keyStore keeps the held copy per address or subnet
+    /// (`ipv6rwc.go:84-102` for a node address, `ipv6rwc.go:112-130` for a
+    /// subnet) and writes it out from the path-notify callback
+    /// (`ipv6rwc.go:66-68` → `update`, `ipv6rwc.go:149-162`). Ironwood keeps
+    /// its own single slot per destination, `rumors[xform].traffic`, and
+    /// flushes that in `_handleNotify` (`pathfinder.go:145-149` then
+    /// `pathfinder.go:154-159`). We use the ironwood slot, which
+    /// [`Router::handle_notify`] already drains (`pathfind.rs:453-461`), so
+    /// each destination has one held copy and one flush, never two.
+    ///
+    /// `dest` is a node address or a routed subnet, and
+    /// [`crate::address::lookup_key_for_addr`] picks the lossy key for each —
+    /// Go's split at `ipv6rwc.go:306-311`, where an address that validates
+    /// goes to `sendToAddress` and one that only validates as a subnet goes to
+    /// `sendToSubnet`.
+    ///
+    /// `via` must name a live link. The lookup does not leave on it: Go floods
+    /// a lookup over the bloom's on-tree set and names no connection
+    /// (`_sendLookup`, `pathfinder.go:27-42`), so `via` is the caller's
+    /// liveness check, the same one [`Router::resolve`] makes before it reads
+    /// a frame. The payload that follows the notify picks its own next hop
+    /// through the pathfinder.
+    pub async fn send_or_resolve(
+        &mut self,
+        links: &mut LinkSet,
+        via: crate::link::LinkId,
+        dest: &crate::address::Address,
+        payload: Vec<u8>,
+    ) -> Result<Route, Error> {
+        if links.peer_of(via).is_none() {
+            return Err(Error::NoLink);
+        }
+        let known = self.key_for_addr(dest);
+        // A usable path, not merely a key: `_handleTraffic` takes the path
+        // branch only when the entry exists, and a broken one sends a
+        // `PathBroken` and re-looks-up instead (`pathfinder.go:196-210`).
+        let routed = known
+            .and_then(|k| self.path.entries.get(&k))
+            .is_some_and(|e| !e.broken);
+        // A queued lookup always carries the lossy key the address gives, never
+        // a full one: Go's keyStore only learns a key from a notify, and by
+        // then it has a path and writes rather than looking up
+        // (`ipv6rwc.go:79-82`).
+        let key = match (routed, known) {
+            (true, Some(k)) => k,
+            _ => crate::address::lookup_key_for_addr(dest),
+        };
+        // `_handleTraffic` (pathfinder.go:194-224): attach the learned path, or
+        // start a lookup and hold the payload in that destination's one slot,
+        // overwriting whatever was held there (`pathfinder.go:211-222`).
+        self.pathfinder_send(links, key, payload).await?;
+        Ok(if routed { Route::Sent } else { Route::Queued })
+    }
+
+    /// The full key that owns `addr`, from the keys a notify or a session
+    /// taught us. A node address matches a key's whole address and a routed
+    /// subnet matches its /64 prefix, which is the `sendToAddress` /
+    /// `sendToSubnet` split again (`ipv6rwc.go:306-311`).
+    ///
+    /// Go's table is `keyStore.addrToInfo` / `subnetToInfo`, filled by the
+    /// path-notify callback and dropped after `keyStoreTimeout`
+    /// (`ipv6rwc.go:141-157`, `ipv6rwc.go:20`). Ours is `path.entries` plus
+    /// `sess.sessions`: both are keyed by full key, and a session can outlive
+    /// the path entry that opened it.
+    fn key_for_addr(&self, addr: &crate::address::Address) -> Option<[u8; KEY_LEN]> {
+        let want = addr.0;
+        let want_subnet = want[0] == crate::address::NODE_PREFIX | crate::address::SUBNET_BIT;
+        self.path
+            .entries
+            .keys()
+            .chain(self.sess.sessions.keys())
+            .copied()
+            .find(|k| {
+                crate::address::addr_for_key(k).0 == want
+                    || (want_subnet
+                        && crate::address::subnet_for_key(k).0
+                            == want[..crate::address::SUBNET_LEN])
+            })
     }
 
     /// One maintenance tick: expire, fix parent, send announces.
