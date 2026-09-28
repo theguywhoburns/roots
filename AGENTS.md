@@ -1,136 +1,171 @@
 # AGENTS.md
 
-Rust client for the Yggdrasil encrypted IPv6 mesh, interoperable with the Go
-implementation. Two-package workspace: the root `roots` package is the library
-(the product) — its `examples/` and `tests/` are demo scaffolding — and
-`client/` (`roots-client`, bin `roots`) is the runnable node that mirrors Go's
-binary. No release process; CI covers static checks plus loopback tests only.
+Rust client for the Yggdrasil encrypted IPv6 mesh, wire-interoperable with the
+Go implementation. Two packages: root `roots` (lib = the product) and `client/`
+(`roots-client`, bin `roots` = the node). Goals are interop and a *documented*
+wire; there is no release process, and CI is three local commands.
 
-## Toolchain
+## Read these instead of this file
 
-- Nightly Rust pinned in `rust-toolchain.toml` (`channel = "nightly"`, edition 2024). Do not downgrade or add a separate toolchain file.
-- Toolchain is provisioned by devenv (`devenv.nix`: `languages.rust` with `toolchainFile`). Enter it via `direnv allow` / `devenv shell`; plain `cargo` works once inside.
-- Components available: `rustfmt`, `clippy` (`profile = "minimal"` — anything else needs `rustup component add`).
-- No `python3` on PATH; use `perl` for one-off text munging. Go reference source lives in-repo as submodules under `reference/` (see Reference material) — no `/tmp` clones anymore.
-- **No Go toolchain is installed** (`go` is off PATH and `devenv.nix` provisions none), so building a Go oracle node or regenerating wire vectors requires adding `languages.go` to `devenv.nix` first. `yggdrasil-go` `develop` declares `go 1.25.0`.
+- `docs/architecture-map.md` — current module graph, state ownership, frame
+  dispatch table, and **the invariant list ("things that break silently")**.
+  Read it before editing anything in `src/`.
+- `docs/plans/go-client-parity/00-status.md` — the live plan: slice checklist,
+  resume point, and the findings of every finished slice. `04-slices.md` holds
+  the next slice's spec and each slice's proof. `docs/plans/rust-client/` is the
+  closed library plan.
+- `docs/protocol/README.md` — which of the 22 wire formats have a page and which
+  only a vector. **Change a codec and you change its page in the same commit.**
+- `TODO.md` — three open questions, each with the measurement behind it.
+- `docs/plans/*/02-architecture.md` are frozen approval records and are stale.
 
-## Layout
+## Toolchain and environment
 
-- `src/lib.rs` — library root (`Client`: identity + dial/accept per scheme, re-exports). The lib owns no node loop: it never constructs a `Router` outside `#[cfg(test)]`.
-- `src/address.rs` — key→IPv6 derivation, and `Address`/`Subnet` `Display` in **Go's text form** (`net.IP.String()` / `net.IPNet.String()`: no leading zeros, longest run of ≥2 zero groups collapsed to `::`, `/64` suffix). `src/handshake.rs` — link `meta` codec. `src/link.rs` — `Transport` trait + TCP dial/listen/handshake, backoff + Go's five URI options (`?password=`/`?priority=`/`?key=`/`?sni=`/`?maxbackoff=`, read in `links.add` at `link.go:179-224`; `tls://`+`quic://` also take `?sni=`, and a **listener** reads only `?priority=`/`?password=` at `link.go:484-497` — `?key=` is dial-side pinning, compared in the shared `handler` at `link.go:666`, never an inbound allowlist; the inbound allowlist is the config's `AllowedPublicKeys`, checked at `link.go:672-680` for non-local links only; one deviation: Go collects repeated `?key=` into a set, we pin a single key and last value wins); `Link` trait + type-erased `AnyConn` + `LinkSet`, which **owns** its connections (no lifetime parameter, `Transport::Stream: 'static`) — one set per link-collection, reused across slices, because per-link send clocks live in the set. `src/tls.rs` — `Tls` transport (rustls/ring, NoVerify like Go InsecureSkipVerify, rcgen self-signed listener). `src/ws.rs` — `Ws`/`Wss` transports (`ygg-ws` subprotocol, one binary message per flush, byte-stream reads; WSS layers WS on the TLS connector). `src/frame.rs` — ironwood link framing + uvarint/path helpers, plus `FRAME_KINDS`/`FrameType::ALL`/`wire_len` (byte counts for link stats; `frame_kinds_match_table_len` keeps the dispatch table and the count honest). `src/quic.rs` — `Quic` transport (quinn, one bidi stream per link, Go's 60s-idle/20s-keepalive timeouts; stream keeps endpoint+conn handles alive).
-- `src/link.rs` API (Slices 4 + 8): `LinkSet::single`/`add`/`remove`/`peers`/`get`/`len`/`is_empty`, `stats(&id) -> Option<LinkStats>` (by `LinkId`, not by key), `idle_for(&peer)`, `update_rates()`. `add` replaces by remote node key and **keeps the send clock** through it; every other field belongs to the new link, including its `LinkId`, and the displaced `AnyConn` comes back out of `add` for the caller to drop — which closes that socket (see the crossed-peering gotcha). `LinkStats { up, rx_bytes, tx_bytes, rx_rate, tx_rate, inbound }` feeds the node's `getPeers`; rates are the bytes since the last shared one-second window (`RATE_WINDOW`, Go's `_updateAverages` `link.go:106-129`), so a link that came up mid-window reports its whole life and a quiet one reports exactly 0, never an average; the per-link `LinkEntry` (conn + `up`/`rx`/`tx`/rates) stays private. `write` and `write_via` share a private `send` that **retires** the entry whose `write_frame` fails (a link we cannot write is dead whatever the read side thinks). Counters use `frame::wire_len()` both ways, so they count what the peer's NIC saw.
-- `src/router.rs` — facade: `Router` struct composing the tables below + `new`/`next_init_seq`/`peer_kind`/`announces_*` accessors. `src/driver.rs` — link I/O orchestration (`register`/`resolve`/`maintain`/`dispatch_frame`/`serve`/`serve_links`, dead-link eviction, empty-set sleep, `fatal_link_error`) — the two send strengths live on `LinkSet` (`write` hard / `write_via` soft) and the counter they bump lives on `Router` (`dropped_no_link`). `src/views.rs` — read-only snapshots (`parent`/`dump`/`get_paths`/…​) + `Snapshot` trait impl (`src/traits.rs`). `src/tree.rs:TreeState`, `src/pathfind.rs:PathState`, `src/bloom.rs:BloomState`, `src/session.rs:SessionState`, `src/proto.rs:ProtoState` — per-algorithm tables owning their own maps. `src/peer.rs` — `PeerKind` (Go vs roots via vendor TLV) + `PeerState`. `src/supervisor.rs` — persistent redial (`SupervisedPeer::due`/`record_success`/`record_failure` + `backoff_cap`). `src/link.rs` — `Transport`/`Link` (with `remote_key`)/`AnyConn`/`LinkSet` + `complete_dial`/`complete_accept` templates + `dial_any` (single scheme match).
-- `src/router.rs` API notes: `register()` is once per LINK, `serve()`/`serve_links()` drive slices of it over a caller-owned persistent `LinkSet` (single link or many, mixed transports via `&mut dyn Link` + type-erased `AnyConn`); `resolve()` maps IPv6 addr→node key over DHT (also over the caller's set); `session_send` wraps the `typeSessionTraffic` byte, inbox strips it; `proto_send`/`request_nodeinfo`/`request_debug` frame `typeSessionProto` (replies land in `proto_inbox`); `set_nodeinfo` advertises JSON (≤16384 B); `has_path`/`has_session`/`path_details`/`get_paths`/`get_sessions`/`link_peers`/`dropped_no_link`/`tree_entries` + `dump()` (returns `String`, never prints) are diagnostics; link byte counters come from `links.stats(&peer)` on the caller's set, not from the `Router`. Sends come in two strengths and the choice is load-bearing: **hard** `write()` returns `Err(Error::NoLink)` for a missing peer (use it when the caller addressed a link it just held), **soft** `write_via()` returns `Ok(false)` and increments `dropped_no_link()` (use it for anything addressed from router state — see the stale-books gotcha).
-- `src/traffic.rs` — `Traffic` header codec (`path + from + source + dest + watermark + payload`) and the inbound forward/deliver/PathBroken decision. `src/error.rs` — `Error` enum (thiserror) plus `Error::is_link()`, the one "this link is gone" vs "this node is broken" test the client loop needs without matching variants outside the crate. `src/traits.rs` — `Snapshot` trait, implemented in `views.rs`.
-- `examples/` (dev-deps only, lib never sees them): `common/` (shared smoltcp `MeshPhy` bridge + `new_iface`/`new_tcp_socket`/`smol_now`, used by all TCP examples and `tests/tcp_loopback.rs` via `#[path]`), `http_fetch` (smoltcp TCP GET), `mesh_tcp` (bilateral TCP, both ends ours), `irc_watch` (smoltcp IRC: register/LIST/JOIN #ru, verified live — first user message caught 2026-09-06), `proto_probe` (nodeinfo/debug exchange with a Go node, verified live), `tun_ping` (kernel TUN↔mesh ICMP round trip, needs TUN privs), `ping6`, `listen_ping`, `oracle_probe` (one payload + ticks), `tcp_proxy` (logging MITM proxy), `hs_answer` (cross-impl handshake helper), `go_capture` (the wire oracle: starts the installed Go 0.5.14 binary from a JSON config, dials its listener, asserts our `meta` is byte-identical to Go's, prints hex for `tests/go_vectors.rs`; needs `unshare -Un --map-root-user`, no Go compiler).
-- `tests/`: `mesh_ping.rs` (`#[ignore]`, A↔B ICMPv6 via public peer), `mesh3.rs` (three-node loopback mesh A—B—C: tree convergence, cross-hop DHT resolve, transit forwarding, dead-link eviction, session surviving the eviction — the refactor safety net, ~2.3s), `tcp_loopback.rs` (pure smoltcp driver check, no mesh), `go_vectors.rs` (Go-captured `meta` + envelope frames, pure hex, no privileges — this is what makes the handshake wire claim testable).
-- `client/` — the `roots-client` package (workspace member): `src/main.rs` (bin `roots`: Go-shaped flag parsing → `-genconf`/`-useconf`/`-useconffile` with `-address`/`-subnet`/`-publickey` prints, and `boot()` which runs the node from the config it read — Go's startup order: identity lines, admin socket, listeners, persistent dials, then the node task; an undefined flag is Go's exit 2), `src/config.rs` (the Go-shaped `Config`: Go's `NodeConfig` key names and field order, `defaults()` mirroring `src/config/defaults_linux.go`, `generate`/`load`/`from_json`, `signing_key`/`address`/`subnet`/`link_options`, plus `Flags` + `ConfigSource` + `USAGE`; JSON only — no HJSON writer, so `-json` is accepted and means nothing), `src/node.rs` (`Cmd` + `Node`: **the** single-task node loop — one task owns `Router` + `LinkSet` + the mailbox, `Cmd::{Dial,Drop,Accept,Send,Report,Quit}` drained between `DEFAULT_TICK` (50 ms) serve slices, a link error is only fatal when `!Error::is_link()`; `Cmd::Report` answers with a `Snapshot`, which is how the admin socket sees the node), `src/links.rs` (the link manager: `link_id`/`Info` dedup exactly as Go's `links.add`, `LinkKind::{Persistent,Ephemeral}`, per-URI `SupervisedPeer` backoff, `LinkError` carrying Go's verbatim strings, dial tasks reporting back over a package-private `LinkEvent`), `src/admin.rs` (Go's `src/admin` framing: `bind_admin` for `tcp://`/`unix://`/bare host:port — `""`/`none` disables, a unix path is stat-probed, removed, bound and chmod `0660` like `admin.go:91-121` — plus `serve_admin`, a JSON value stream answered one reply per request with `keepalive` deciding whether the loop runs again, the request echoed back in `reply.request`, and Go's four protocol error strings verbatim; `arguments` is type-checked against the command's own Go request struct **before dispatch** (`decode_args`/`go_kind`, `admin.go:162-169`) so a wrongly-typed one answers in `encoding/json`'s words and never reaches the link layer, and `null` args stay a no-op success; every body is a `struct`, never a `json!` map, so `encoding/json`'s struct field order survives to the wire; `getPeers` emits Go's full 16-field `PeerEntry` in Go's order and honours Go's three `sort` modes with its own `sort_stable` insertion sort, because Go's comparator truncates float differences to 0 and Rust's `sort_by` would panic on it), `src/listen.rs` (`spawn_listeners`: Go's `StartupListeners` + one accept loop per URI, binding fatal and a failed handshake not), `src/lib.rs` (declares the modules so `client/tests/` can reach them), `tests/reconnect.rs` (drop→redial delivery driven through `Node`, ~13s loopback), `tests/node_loop.rs` (two peers over `Cmd`: `link_id` dedup, `Drop` keeps the live link, the loop survives a dead peer, ~5.5s), `tests/allowlist.rs` (`AllowedPublicKeys` end to end: gates inbound only, refuses without telling the peer, empty list admits everyone), `tests/admin_loopback.rs` (the framing parity tests: identical `list` bytes over tcp and unix with the socket-mode check, Go's struct field order in every body, `keepalive` holding a connection open across a second request and a *failed* one, the error-string table including the `arguments` echo, and a live peering polled until all 16 `getPeers` keys have appeared — each measured field bounded by its own total, so a field that is present but never filled fails), `tests/peer_rows.rs` (the `getPeers` **row set** over two in-process nodes: an accepted link gets its own row named by its socket and carrying the operator's `?priority=`, a dead dial keeps its row and reads down, two directions to one peer are two rows with exactly one live). `run_peer` is deleted — there is exactly one redial path in the tree. `examples/admin.rs` is deleted too: the node's own socket replaced it, so the byte-for-byte framing lives where the answer comes from. Multicast and the TUN arrive with their own slices, and each of them must talk to the node over `Cmd` rather than reach in.
-- `reference/` — git submodules holding the Go source of truth (`yggdrasil-go`, `ironwood`); read-only, never edit, see Reference material.
-- Build artifacts in `/target` (gitignored). Do not commit.
-
-## Boundary: library vs node client
-
-- **Library (`src/`, lib target)** talks wires and owns state: key/address
-  derivation, `meta` handshake, `Transport` impls (`Tcp`/`Tls`/`Ws`/`Wss`/
-  `Quic`), frame codec, spanning-tree router, pathfinder/DHT,
-  sessions, nodeinfo/debug proto, backoff primitives, plus read-only query
-  snapshots (`parent`, `has_path`, `has_session`, `path_details`, `dump`).
-  The lib never prints, never opens TUN, never serves admin, and never builds
-  a `Router` for a caller — no redial loop, no listener task, no config.
-- **`client/` (`roots-client`)** is the node: the `roots` binary plus the
-  policy that decides what to do with the library — the `Node` task loop, its
-  `Links` manager, the config loader, the inbound listeners and the admin socket
-  (`node.rs`/`links.rs`/`config.rs`/`listen.rs`/`admin.rs`) today, the TUN and
-  multicast slices to come. Nothing in it is importable product surface, but
-  it is the only place a `Router` is driven: one task, no locks.
-- **Root `examples/` + `tests/`** stay demo/debug scaffolding around the lib:
-  smoltcp bridges (`examples/common/`), app demos (`http_fetch`, `mesh_tcp`,
-  `irc_watch`, `proto_probe`), tools (`ping6`, `listen_ping`, `oracle_probe`,
-  `tcp_proxy`, `hs_answer`, `go_capture`, `tun_ping`). As slices 4–14
-  land, the ones that are really node behaviour move into `client/src/` and the
-  example is deleted (`examples/admin.rs` went that way in Slice 7);
-  until then `tun` must stay in the root `[dev-dependencies]` for
-  them (the approved plan's "move to the client" completes slice by slice).
-
-## Reference material (executable truth, in order)
-
-- `docs/plans/rust-client/` — gate docs + `00-status.md` (slice checklist, resume here).
-- `docs/protocol/` — the wire reference, one page per format, written from captured Go bytes with offsets and `file:line` citations (`README.md` lists which of the 22 formats have a page). If you change a codec, change its page in the same commit; if a page has no vector behind it, say so on the page.
-- `docs/architecture-map.md` — current module graph, `Router` state ownership, frame dispatch table, and the invariant list. `02-architecture.md` is a frozen Slice 1–2 record and is stale; read the map.
-- `reference/yggdrasil-go` (submodule, HEAD `422836e` = tag `v0.5.14`, branch `develop`) — Go node impl: `src/core/` link transports (`link_tcp.go`, `link_tls.go`, `link_ws.go`, `link_quic.go`), `src/core/version.go` (`meta` handshake TLVs + signature), `src/address/address.go` (key→IPv6).
-- `reference/ironwood` (submodule, HEAD `d50055b`) — routing/session impl: `network/router.go` (spanning tree, SigReq/SigRes/Announce), `network/pathfinder.go` (DHT lookup/notify/broken), `network/bloomfilter.go`, `network/traffic.go`, `network/peers.go` + `network/wire.go` (link framing), `encrypted/session.go` + `encrypted/crypto.go`. Its commit is exactly what `yggdrasil-go` pins in `go.mod`, so the two always agree — trust the pair over any doc.
-- Both are shallow (`--depth 1`) clones. Fresh checkout: `git submodule update --init --depth 1`. Never edit or commit inside them; bump a gitlink instead.
-- Golden wire vectors live **in the Rust tests** as hex constants: `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `bloom_vector_matches_go`, `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go`, `traffic_vector_matches_go`. The old `vectors.txt` and the `/tmp/opencode/vecgen-ironwood` harness are gone; `TestZZVectors`/`TestZZReplay`/`TestZZHandshake` were local patches, NOT upstream in ironwood (which ships only `TestBloom`/`TestSign`/`TestVerify`/`TestEdX`/`TestTwoNodes`/`TestLineNetwork`/`TestRandomTreeNetwork`/`TestSessionInitPasswordAuth`). Regenerating or adding vectors needs a Go toolchain plus re-adding that harness — **except** for the bytes the capture harness below produces, which need no compiler at all.
-- `tests/go_vectors.rs` is a different kind of evidence: hex **captured from the installed Go 0.5.14 binary** (`meta` with both password branches, plus real `SigReq`/`BloomFilter`/`Announce` envelope frames), not transcribed from Go tests — and since Slice 6 also **address/subnet text** vectors, i.e. a captured Go private key next to the exact `-address` and `-subnet` strings Go prints for it. Re-capture with `unshare -Un --map-root-user cargo run -q --example go_capture -- --frames` (see `docs/protocol/20-handshake.md`); it needs the binary and the namespace, never a Go compiler, and never runs in CI. The prose that grows from it is `docs/protocol/` — byte-offset specs with `file:line` citations and a table of which of the 22 formats has a page and which has only a vector.
-- Scratch Go oracle nodes are gone: the 127.0.0.1:18233/18234/18235/18236 pair (admin 19001–19004) died with the `/tmp` clones — but the **installed 0.5.14 binaries are enough** for an admin-socket diff, no compiler needed: `yggdrasil -useconf -conf <(…) -adminsocket tcp://127.0.0.1:19100` next to `./target/debug/roots -useconffile …` and `yggdrasilctl -admin_socket=…` against either answers byte-comparable JSON (that is how Slice 7 proved its framing). A second, longer run lives in the plan's Done block. Rebuild-from-source is only needed for a Go version other than the installed one.
-- The host's own Yggdrasil **service** node is live (NixOS service, 0.5.14, `Listen: []`, no admin socket — a traffic carrier, not a queryable peer). `tun0` is up and owns the `200::/7` route; its address this session (2026-09-24) was `200:a319:38e3:5833:d91e:70da:4c0c:71f0` — re-read it with `ip -6 addr show dev tun0`, never hardcode. It carries `curl -g`/`ping6` cross-checks, and it means any `tun_ping` run must claim its own interface name rather than `tun0`.
-- Protocol rule: docs never override wire code. When porting, mirror the Go function (including its quirks) and cite `file:line` in a comment.
-
-## Gotchas
-
-- Config parity has three rules that are easy to break from the Rust side, all in
-  `client/src/config.rs`: Go prints an address through `net.IP.String()` (no
-  leading zeros, longest run of ≥2 zero groups collapsed to `::`), so `Display`
-  goes through `Ipv6Addr` rather than formatting byte pairs; a JSON `null` means
-  **absent** at every depth because Go's decoder leaves the destination
-  untouched, hence the recursive `strip_nulls` before deserialising; and defaults
-  come from parsing *on top of* a generated config (`config.go:114-119`), which is
-  struct-level `#[serde(default = "defaults")]`, not per-field defaults. Also
-  `-genconf` blanks `AdminListen` before marshalling (`main.go:121`) so the
-  `omitempty` tag drops the key — a generated config that carries it has a
-  different key set from Go's.
-- `AllowedPublicKeys` gates the **inbound** side only (`is_inbound` in
-  `run_handshake`, `src/link.rs:580-585`; Go's comment: "This does not affect
-  outgoing peerings"), and an empty list admits everyone — a default that locked
-  the node would take down every upgrade. A refusal is invisible to the peer that
-  caused it: Go's check runs *after* the listener wrote its own `meta`, so the
-  dialer's handshake succeeds and the link only dies on its next read.
-  `client/tests/allowlist.rs` pins both halves.
-- Capturing from the Go oracle has three traps, all handled inside
-  `examples/go_capture.rs`: the node **panics** unless it may create a TUN (so
-  run it under `unshare -Un --map-root-user`), a fresh netns has **`lo` down**
-  (the harness raises it), and a link whose `meta` carries the **listener's own
-  key** is accepted, then closed silently (`ErrLinkToSelf`, `core/link.go:158`,
-  checked at :662) — dial with a second identity when you need frames. A frame
-  window that yields nothing is that bug, not a dead protocol.
-- Announces carry **ancestry only** (Go `network/router.go:321`, mirrored at
-  `tree.rs:524`): a node learns its own line to the root and nothing else. In a
-  line A—B—C the two ends never learn each other from the tree — so
-  `known_nodes()` is not network size, and a query that must reach a
-  non-relative goes through the DHT/blooms (`tests/mesh3.rs` pins this).
-- `register()` once per link, `serve()` per slice over ONE caller-owned `LinkSet` reused across slices. Rebuilding the set per slice resets per-link send clocks → lazy keepalives never fire → the peer read-times-out the link at ~4s (caught live; the set must outlive slices, like the conn does). Registering per slice re-sends SigReq + replays announces every 250ms (~800 dupes/run) and the peer answers each one — looks exactly like a protocol storm in frame counters.
-- The client's `Node` loop is the only place that touches `Router`/`LinkSet`, so it needs no locks — which also means **nothing off-task may**. Dialling is the one exception and earns it by touching no router state: `Links::start_due` spawns `connect_any`, and the task returns a `LinkEvent` carrying the token it was handed. A result whose token matches no entry is dropped on the floor (Go's "if a peering has come up in this time, abort this one", `link.go:366-373`). `Cmd::Drop` cancels the redial and **leaves the live link up** — a divergence we own rather than Go's semantics: Go's `remove` cancels the dial context *and* closes the connection (`link.go:433-438`), so its row vanishes with the link, and the "not disconnected immediately" comment at `api.go:203` describes nothing that happens (measured on two Go nodes; ours is pinned by `node_loop_two_peers_dedup_drop_and_survival`, and Slice 9 owns the comparison). The dedup key is URI-minus-query + `sintf` (`link.go:54-57`, `766-769`), so a re-add with different options is a kick returning `AlreadyConfigured`, not a second connection. Our kick reschedules for the next tick instead of interrupting a backoff sleep.
-- `serve()` answers keepalive lazily (Go `peerMonitor` semantics: only after a full idle tick with no sends, plus a top-up on quiet read slices); the link drops in ~4s without it. (Old code replied eagerly to every frame — pure chatter.)
-- `serve_links` slices reads (100ms) ONLY when multiplexing 2+ links; a single link blocks for the whole budget (exact old `serve` timing). Slicing a single link flaked `resolve_loopback` to ~50/50 (convergence starved — mechanism unclear, rule stands).
-- `SigRes.psig` and announce `sig` cover node + parent + req + **port** — signing the bare req bytes verifies against nothing (caught by `announce_chain_verifies`).
-- Session payloads need the `typeSessionTraffic` (1) leading byte (`Core.WriteTo` adds it, `Core.ReadFrom` dispatches on it) — Go silently drops anything else, including valid IPv6 starting with 0x60. Wrap in `session_send`, strip on inbox delivery (live-fetch outage, guarded by `packet_type_constants_match_go`). Same framing for `typeSessionProto` (2): `proto_send` wraps, `handle_proto_bytes` dispatches.
-- Crossed simultaneous session opens collide on `seq` (unix seconds in Go) and drop as stale — deadlocking fast crossed opens. Fixed via per-router monotonic `next_init_seq` (wire-compatible: peers only require `seq` greater than last seen) + fresh `next` keys in `apply_update` like Go `_handleUpdate` (we recycled; loopback-symmetric but hygiene-divergent). First-flight payloads on an exact cross may still drop (each side's ack advances key expectations ahead of the other's flushed payload — inherent to the protocol, same in Go); sessions converge and the next flight delivers. Regression test: `crossed_session_open_delivers_both_ways`.
-- Pre-session send buffer is a SINGLE slot, last write wins — Go `_bufferAndInit` does `buf.data = msg` unconditionally. Queueing 4 proto requests before the session opens delivers only the last; stagger behind `has_session` (caught live by `proto_probe`: only GETTREE arrived).
-- Bloom hashes must be bit-identical Murmur3-x64-128 `sum256` (`bloom.rs`), not any standard murmur3 crate default — verified by `bloom_vector_matches_go`.
-- DHT rumors rendezvous by TRANSFORMED key (`xkey`), not dest key — a notify from the full key must match a lookup for a partial key. Keying rumors by dest silently drops all resolutions.
-- QUIC links: `QuicStream` keeps the endpoint + connection handles alive (dropping either tears the connection down mid-link); no TCP-style graceful FIN exists, so tests linger the server side instead of asserting post-close reads.
-- WS links REQUIRE the `ygg-ws` subprotocol both ways (Go closes violators); binary messages are a byte stream, one message per `flush`. (Known deviation: Go answers `GET /health` with 200 OK; we only upgrade WebSocket on that port.)
-- Go has no `wss://` listener ("use WS behind a reverse proxy"); we serve one anyway (same code path as `ws://` over our TLS acceptor), so stock Go can only ever *dial* wss — verify via admin `addPeer`, never via a Go listener.
-- One `Router` serves any number of links through a `LinkSet` (`serve_links`; `serve` is the one-entry case). The set owns the conns, so callers keep it across await points and hand it to a task without locks. Dead links are evicted, not fatal — survivors keep serving; the set empties only when the last link dies (preserves the old single-link `serve` contract), and `Router::fatal_link_error(links, e)` is the single gate on that: an I/O or `NoLink` error kills only the link that caused it, anything else is a bug and aborts the serve. `prio`/`order` tiebreaks are recorded per link for the multi-peer future.
-- **A peering dialled both ways never settles: the two directions trade closures.** `LinkSet` keeps one slot per **node key**, so `add` displaces the incumbent and both node call sites drop the link it returns, closing that socket (`node.rs:324,357`). Measured 2026-09-25 with two of our own nodes whose configs dial each other, and with a Go node: exactly one direction is up at any instant, which one flips every couple of seconds, and Go's log reads `Connected inbound` / `Disconnected outbound` on repeat. Go keys its link map by URI and ironwood keeps several links per key (`peers.go:47-62`), so it can hold both. Two rules follow for callers: never assume a `LinkId` you were handed stays live, and never read `stats(id) == None` as "the peer is gone" — it means "this row lost the slot". The fix (multi-link-per-key, or refusing a newcomer the way Go refuses a duplicate URI at `link.go:544-548`) is a recorded TODO, not a parity slice.
-- **Stale router books can name a key with no link, and that is the rule to design against** (Slice 4). Nothing prunes `tree.peers`/`tree.infos`/`bloom.on_tree` when a link dies — Go prunes them in `removePeer` (`router.go:147`) and we deliberately do not yet (that is the router-state-lifecycle hardening slice; `a_stale_parent_is_kept_and_the_serve_survives_it` is the tripwire). Consequence: every send addressed **from router state** must be `write_via` (soft) or iterate `links.peers()`, never a hard `write` to a key a book remembered — `_sendReqs` (Go `router.go:189`), the bloom fan-out guard (Go `bloomfilter.go:277`) and `_fix`'s parent check (Go `router.go:229`) all ask the live map, and each of those three has a test that only fails when it is reverted (`router_books_can_name_a_peer_with_no_link`, `fix_refuses_a_parent_with_no_link`). `tests/mesh3.rs` passes under all three reversions; do not treat it as coverage.
-- `fix`'s parent-liveness branch is **unreachable in a converged loopback star**: the client is the largest key, so `root_and_dists(self)` never offers a root better than self and the candidate scan skips its own children (same in Go, `router.go:607-628`). Any test of that guard must be built by hand out of `tree.infos`/`responses`/`peers`, like `fix_refuses_a_parent_with_no_link` — no socket timing produces it.
-- Assert a failing write with `tokio::io::duplex` and drop the far half. A real loopback socket absorbs a 512-byte write and returns `Ok`, so `a_failed_write_retires_the_link` was flaky until it stopped using one.
-- One `cargo test` at a time. A backgrounded suite racing a foreground one starves `mesh3`'s convergence long enough to fail it (~2.3 s of 50 ms ticks against a shared scheduler) — and a proof script that runs `cargo build` while a suite is in flight does the same thing. The failure is the machine, not the code: re-run it alone before believing it.
-- Live-test peers: `tcp://bode.theender.net:42069` (reliable); `yggdrasil.su:62486` throttled us after heavy dialing. Stagger dials; `dial_retry` in the mesh test.
-- Env-gated debug tap: `ROOTS_DBG_DUMP` in `client/src/main.rs` prints `Router::dump()` (a `String`; the lib never writes to stderr — fatal `connect/register/link` errors in binaries are the only `eprintln!` paths).
+- Nightly Rust is pinned in `rust-toolchain.toml` (edition 2024) and provisioned
+  by devenv (`devenv.nix` → `direnv allow`). Only `rustfmt` + `clippy` are
+  installed (profile `minimal`); anything else needs `rustup component add`.
+- **No `python3`** on PATH (use `perl`) and **no `go`**. The installed Go 0.5.14
+  binaries (`/run/current-system/sw/bin/yggdrasil`, `yggdrasilctl`) are how wire
+  bytes get *captured*; regenerating vectors from Go source needs
+  `languages.go` added to `devenv.nix` first (yggdrasil-go wants go ≥ 1.25).
+- `reference/yggdrasil-go` (v0.5.14, `422836e`) and `reference/ironwood`
+  (`d50055b`, exactly what the Go node pins) are shallow, read-only submodules
+  and the executable source of truth — trust them over any doc, including this
+  file. `git submodule update --init --depth 1` on a fresh checkout; bump the
+  gitlink, never edit or commit inside them.
+- Rule when porting: mirror the Go function including its quirks, and cite
+  `file:line` in the comment. Docs never override wire code.
+- The Go node **panics at startup without TUN privilege**, a fresh netns has
+  **`lo` down**, and a link dialled with the **listener's own key** is accepted
+  then silently closed (`ErrLinkToSelf`). Every capture and proof therefore runs
+  under `unshare -Un --map-root-user`; `examples/go_capture.rs` handles all
+  three internally (it dials with a second identity to get frames).
+- The host's own yggdrasil **service** node is live (0.5.14, no admin socket) and
+  `tun0` owns `200::/7`; re-read its address with `ip -6 addr show dev tun0`,
+  never hardcode. It is useful as a traffic carrier, and any `tun_ping` run must
+  claim its own interface name.
 
 ## Commands
 
-- `cargo build --workspace` / `cargo run -q -p roots-client -- <peer-uri> [hold_secs]` (`cargo run` alone picks the lib package, which has no bin)
-- `cargo run -q --example http_fetch -- <ipv6> [peer-uri]` (page fetch demo, needs internet)
-- `cargo test --workspace` (unit + loopback integration; live tests excluded)
-- `cargo test --test mesh_ping -- --ignored --nocapture` (live, ~3 min, needs internet)
-- `cargo test -p roots-client --test reconnect -- --nocapture` (~13s, loopback, drives the `Node` loop)
-- `cargo test -p roots-client --test node_loop -- --nocapture` (~5.5s, loopback: `link_id` dedup, `Drop` keeps the live link, the loop survives a dead peer)
-- `unshare -Un --map-root-user cargo run -q --example go_capture -- --frames` (re-capture the Go vectors; no Go compiler needed, ~5 s; prints hex to paste into `tests/go_vectors.rs`)
-- Config interop proof, unprivileged and offline (`cargo build -p roots-client` first): `./target/debug/roots -genconf | yggdrasil -useconf -address` and `yggdrasil -genconf -json | ./target/debug/roots -useconf -address`. For a fixed identity, feed the same `{"PrivateKey":…}` (the fixture in `client/src/config.rs`) to both `-useconf` and compare `-address`/`-subnet`/`-publickey` — Go and ours print the same three strings.
-- Admin parity proofs, each in its own netns and each **rebuilding the binary first** (a stale `target/debug/roots` answers with the bytes of a version that no longer exists — it has already faked a green run twice): `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/7-admin.sh` (installed Go 0.5.14 + `yggdrasilctl` as the client, six commands side by side, then our socket through stock `yggdrasilctl` in table mode — use `-endpoint`, there is no `-admin_socket`), `…/7-admin-raw.sh` (22 byte-exact protocol-error and argument-type cases, each side answering its own socket), `…/7-admin-inbound.sh` (Go's accepted-link row against our empty `getPeers`, which is the deviation Slice 8 owns). They need the binary and the namespace, never a Go compiler, and never run in CI.
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- `cargo fmt` before finishing (`cargo fmt --check` must pass — from the root it already walks every workspace member)
-- CI (`.github/workflows/ci.yml`, added 2026-09-24) runs exactly `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` on `ubuntu-latest` with the pinned nightly. No Go, no network peers, no submodule checkout — so anything a slice needs verified must be reproducible by those three. Locally as of writing: all green, 111 unit + 20 integration tests (`mesh3`, `tcp_loopback`, `go_vectors` in the lib; `admin_loopback`, `allowlist`, `node_loop`, `peer_rows`, `reconnect` in the client; `mesh_ping` stays `#[ignore]`d), ~35 s.
+- `cargo build --workspace`; run the node: `cargo run -q -p roots-client -- [peer-uri] [hold_secs] [resolve-ipv6]`
+  (plain `cargo run` from the root **fails**: that package is lib-only).
+- `cargo test --workspace` — ~35 s, 111 unit + 20 integration, loopback only.
+  Narrow it: `cargo test -p roots --lib <filter>`, `cargo test -p roots --test mesh3`,
+  `cargo test -p roots-client --test peer_rows -- --nocapture`.
+- `cargo test -p roots --test mesh_ping -- --ignored --nocapture` — live, needs
+  internet, ~3 min, dials `tcp://bode.theender.net:42069`.
+- `cargo run -q --example http_fetch -- <ipv6> [peer-uri]` (and the other demos
+  in `examples/`); `ROOTS_DBG_DUMP=1` makes the probe path print `Router::dump()`
+  (the library never writes to stderr itself).
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`, then
+  `cargo fmt` — those plus the test command are exactly what CI runs
+  (`.github/workflows/ci.yml`: fmt, clippy, test, on `ubuntu-latest`, pinned
+  nightly, no Go, no peers, no submodules). Anything a slice needs proven must be
+  reproducible by those three.
+- Re-capture the Go vectors: `unshare -Un --map-root-user cargo run -q --example go_capture -- --frames`
+  (needs the Go binary + the namespace, never a Go compiler, never CI); paste the
+  hex into `tests/go_vectors.rs` and update `docs/protocol/20-handshake.md`.
+- Config interop proof, unprivileged and offline: `./target/debug/roots -genconf | yggdrasil -useconf -address`
+  and `yggdrasil -genconf -json | ./target/debug/roots -useconf -address`; for a
+  fixed identity feed the same `{"PrivateKey": …}` to both and compare
+  `-address`, `-subnet`, `-publickey` (one flag per run — the first wins).
+- Admin/`getPeers` proofs, each in its own netns and each **rebuilding the binary
+  first** (a stale `target/debug/roots` fakes a green run): `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/{7-admin,7-admin-raw,8-getpeers}.sh`.
+  `yggdrasilctl` selects the socket with `-endpoint` (no `-admin_socket`; with
+  none set it talks to the host's service node).
+
+## Boundaries
+
+- The **library** talks wire and owns state: crypto, `meta`, the five
+  transports, framing, tree/DHT/bloom/session/proto, read-only snapshots. It
+  never prints, never opens a TUN, never serves admin, and **never builds a
+  `Router` for a caller**. Check that mechanically:
+  `grep -n "mod tests" src/*.rs` (every `Router::new` in `src/` must sit
+  *below* its file's test module) and `cargo tree -p roots -e normal` (must
+  list no `smoltcp`, `tun` or `serde_json`).
+- **`client/`** is the only package that drives a `Router`. `Node::run` in
+  `client/src/node.rs` is the one production loop: it owns `Router` + `LinkSet` +
+  the mailbox, so there are no locks — and therefore **nothing off-task may
+  touch them**. Listeners, the admin socket, and future multicast/TUN code send
+  a `Cmd`; redial has exactly one owner (`Links::start_due`). Dialling is the
+  sole off-task exception and earns it by reading no router state.
+  `client/src/main.rs` builds one too, but only in the demo probe (no config).
+- Cargo forbids `[[bin]]` from using `[dev-dependencies]`, which is why the
+  workspace exists. `tun`/`smoltcp` stay in the root manifest while
+  `examples/tun_ping.rs` and `examples/common/` still need them.
+- Root `examples/` and `tests/` are demo/debug scaffolding around the lib. When
+  one turns out to be node behaviour it **moves into `client/src/` and the
+  example is deleted** (Slice 7 deleted `examples/admin.rs`; `tun_ping` is next,
+  and only then can `tun` leave the root manifest).
+
+## Silent-failure traps
+
+Full statements, with the Go line each mirrors, are in the architecture map.
+
+- **One `LinkSet` per link collection, reused across `serve` slices.** Rebuild
+  it per slice and the per-link send clocks reset: lazy keepalives never fire and
+  the peer read-times-out the link at ~4 s. `register()` is once per link;
+  per-slice registration replays SigReq + announces every tick, which the peer
+  answers as a protocol storm.
+- Every `dispatch_frame` arm ends with `keepalive_if_idle`; a new arm without it
+  kills its link in ~4 s. `serve_links` slices reads to 100 ms **only** when it
+  multiplexes 2+ links — a single link blocks for the whole slice budget.
+- **Router books outlive links.** Nothing prunes `tree.peers`/`tree.infos`/
+  `bloom.on_tree` on link death (Go's `removePeer` does), so any send addressed
+  *from router state* must be soft `write_via` or iterate `links.peers()`; hard
+  `write` is only for a link the caller just held.
+- `LinkSet` is one slot per **node key**, so a peering dialled both ways never
+  settles — the directions trade closures, measured, on ours and on Go. Never
+  assume a `LinkId` you hold stays live; `stats(id) == None` means "this row lost
+  the slot", not "the peer is gone". (`TODO.md`, not a parity slice.)
+- Session and proto payloads need their leading type byte (1 = traffic, 2 =
+  proto); Go silently drops anything else, IPv6 included. The pre-session send
+  buffer is a **single slot, last write wins** — stagger behind `has_session`.
+- Announces carry **ancestry only**, so `known_nodes()` is not network size and
+  `tree.infos` cannot find a non-relative (DHT/blooms must).
+- Byte-exactness: bloom hash is Murmur3-x64-128 `sum256` (not a stock crate
+  default); DHT rumors key by the **transformed** key; `SigRes.psig` and the
+  announce `sig` cover node + parent + req + **port**; link counters use
+  `frame::wire_len()` in both directions.
+- `ws://` requires the `ygg-ws` subprotocol both ways, and a `QuicStream` must
+  hold its endpoint + connection handles or the link dies mid-flight.
+- Admin: every body is a `struct`, never `json!` (`serde_json::Map` is a
+  `BTreeMap`, so a map body prints alphabetically where Go prints declaration
+  order); erase the types with the closed `enum Body` — `Box<dyn Serialize>` is
+  not object-safe; validate `arguments` before dispatch; sort with the local
+  `sort_stable`, never `sort_by` (Go's comparator truncates floats and is not a
+  total order, so `sort_by` panics on large row counts).
+- The admin socket is deliberately **8 of Go's 14 commands**: `getNodeInfo`,
+  the three `debug_remote*`, `getTun` and `getMulticastInterfaces` need mesh
+  round trips, a TUN and multicast state (Slices 9, 14, 11). An unknown action
+  must answer Go's verbatim `unknown action '…', try 'list' for help`.
+- Config is a wire format: Go's key set *and order*, struct-level
+  `#[serde(default = "defaults")]` (Go parses the document on top of a generated
+  config), a recursive `strip_nulls` (a JSON `null` is an absent key at every
+  depth), `-genconf` blanks `AdminListen` so `omitempty` drops it, and addresses
+  print through `Ipv6Addr` because that is Go's text form.
+- `AllowedPublicKeys` gates **inbound only**, an empty list admits everyone, and
+  a refusal is invisible to the peer (Go checks after writing its own `meta`, so
+  the dialer's handshake "succeeds").
+- `Cmd::Drop` cancels the redial but **keeps** the live link — a divergence we
+  own, not Go's behaviour (Go closes the connection); Slice 9 owns the decision.
+- To assert a failing write use `tokio::io::duplex` and drop the far half: a real
+  loopback socket absorbs a 512-byte write and returns `Ok`.
+
+## Testing notes
+
+- `tests/mesh3.rs` (A—B—C loopback, ~2.3 s) is the refactor safety net, but it
+  passes under reversions of the soft-send and parent-liveness guards. Their only
+  coverage is `router_books_can_name_a_peer_with_no_link` and
+  `fix_refuses_a_parent_with_no_link` — do not delete them as redundant. `fix`'s
+  parent-liveness branch is unreachable in a converged loopback star (the client
+  is the largest key), so such a test must be hand-built from `tree.infos` /
+  `responses` / `peers`; no socket timing produces it.
+- **One `cargo test` at a time.** A second suite, or a proof script that runs
+  `cargo build`, starves `mesh3`'s 50 ms-tick convergence and fails it. Re-run
+  alone before believing a failure.
+- Most client tests are mutation-pinned (the reverts and the test each one killed
+  are tabulated per slice in `docs/plans/go-client-parity/04-slices.md`). Prefer
+  adding a revert-and-run step to a new behaviour over asserting it by review.
+- Live peers: `tcp://bode.theender.net:42069` is reliable; `yggdrasil.su:62486`
+  throttled us. Live tests are `#[ignore]`d and never run in CI.
