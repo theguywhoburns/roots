@@ -425,7 +425,7 @@ mod tests {
         let mut links = LinkSet::single(conn);
         m.note_liveness(&links);
         assert_eq!(m.len(), 2, "both rows hold the link, so both stay");
-        drop(links.remove(&key));
+        drop(links.remove(id));
         m.note_liveness(&links);
         assert_eq!(m.len(), 1, "the inbound row is deleted with its link");
         assert_eq!(m.entries[0].uri, "tcp://127.0.0.1:9001");
@@ -437,9 +437,9 @@ mod tests {
 
     #[tokio::test]
     async fn liveness_is_asked_of_the_link_a_row_holds() {
-        // The set keeps one slot per node key, so "is any link to this key up"
-        // is the wrong question — asked that way, a dial whose link an accepted
-        // link displaced keeps reporting itself up.
+        // The set holds one entry per **link**, so a row must be asked about the
+        // connection it holds and not about the node. Asking per node key would
+        // report a dead row as up because the peer has some other connection.
         let (mut m, _rx) = manager();
         let held = live_link().await;
         let lost = live_link().await;
@@ -450,13 +450,25 @@ mod tests {
         m.add("tcp://127.0.0.1:9001", "", LinkKind::Persistent)
             .unwrap();
         m.entries[0].live = Some((lost.id, held.remote_key));
-        let links = LinkSet::single(held);
-        assert!(
-            links.stats(lost.id).is_none(),
-            "the set holds a different connection to that key"
-        );
+        // Both links are in the set now, which is what ironwood does
+        // (`peers map[publicKey]map[*peer]struct{}`, `peers.go:32`).
+        let mut links = LinkSet::single(held);
+        let lost_id = lost.id;
+        links.add(lost);
         m.note_liveness(&links);
-        assert_eq!(m.entries[0].live, None, "so the row is down");
+        assert!(
+            m.entries[0].live.is_some(),
+            "the row's own link is up, so the row is up"
+        );
+        // Drop that link and the row must notice, even though the peer still has
+        // the other one in the set.
+        assert_eq!(links.ids().len(), 2, "two links to one node, both live");
+        let _ = links.remove(lost_id);
+        m.note_liveness(&links);
+        assert_eq!(
+            m.entries[0].live, None,
+            "its own link is gone, so the row is down even though the peer has another"
+        );
         assert_eq!(m.len(), 1, "and a persistent row is not forgotten");
     }
 

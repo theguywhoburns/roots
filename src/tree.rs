@@ -187,7 +187,13 @@ impl Info {
 /// Owned by [`crate::router::Router`]; algorithms here take only what they
 /// need so tree rules stay independent of path/session state.
 pub(crate) struct TreeState {
+    /// Per-node-key state: the port and the open request, shared by every link
+    /// to that key (ironwood keys both by `publicKey`).
     pub(crate) peers: HashMap<[u8; KEY_LEN], crate::peer::PeerState>,
+    /// Per-link state, keyed by [`crate::link::LinkId`]. Several links may share
+    /// a node key, and each keeps its own lag, `responded` flag and round-trip
+    /// pair — Go hangs all of those off `*peer`, not off the key.
+    pub(crate) links: HashMap<crate::link::LinkId, crate::peer::LinkState>,
     pub(crate) infos: HashMap<[u8; KEY_LEN], Info>,
     pub(crate) deadlines: HashMap<[u8; KEY_LEN], Instant>,
     pub(crate) responses: HashMap<[u8; KEY_LEN], SigRes>,
@@ -206,6 +212,7 @@ impl Default for TreeState {
     fn default() -> Self {
         Self {
             peers: HashMap::new(),
+            links: HashMap::new(),
             infos: HashMap::new(),
             deadlines: HashMap::new(),
             responses: HashMap::new(),
@@ -234,6 +241,9 @@ impl crate::router::Router {
             nonce: rand::random(),
         }
     }
+    /// Open a `SigReq` toward one key and send it on **every** link to it —
+    /// Go's `_sendReqs` walks `r.peers[pk]` (`router.go:189-196`), so each
+    /// connection gets its own request to answer.
     async fn send_req(
         &mut self,
         links: &mut LinkSet,
@@ -242,17 +252,26 @@ impl crate::router::Router {
         let req = self.new_req();
         if let Some(p) = self.tree.peers.get_mut(&peer_key) {
             p.req = req;
-            p.responded = false;
+        }
+        let targets = links.links_to(&peer_key);
+        for id in &targets {
+            if let Some(l) = self.tree.links.get_mut(id) {
+                l.responded = false;
+            }
         }
         let mut out = Vec::new();
         req.encode(&mut out);
-        let sent = links.write(peer_key, FrameType::SigReq, &out).await;
+        let sent = links.write_all(peer_key, FrameType::SigReq, &out).await;
         // Go stamps the send time in the write's `done` callback, so the round
         // trip it later measures excludes our own queueing (`peers.go:318-321`).
-        if let Some(p) = self.tree.peers.get_mut(&peer_key)
-            && sent.is_ok()
-        {
-            p.sent_at = Some(Instant::now());
+        // It is per link, so each link's own clock is what moves.
+        if sent.is_ok() {
+            let now = Instant::now();
+            for id in &targets {
+                if let Some(l) = self.tree.links.get_mut(id) {
+                    l.sent_at = Some(now);
+                }
+            }
         }
         sent
     }
@@ -260,6 +279,7 @@ impl crate::router::Router {
     pub(crate) async fn handle_request(
         &mut self,
         links: &mut LinkSet,
+        conn: crate::link::LinkId,
         peer_key: [u8; KEY_LEN],
         req: SigReq,
     ) -> Result<(), Error> {
@@ -267,27 +287,40 @@ impl crate::router::Router {
         let res = SigRes::seal(req, port, &peer_key, &self.key, &self.pubkey);
         let mut out = Vec::new();
         res.encode(&mut out);
-        links.write(peer_key, FrameType::SigRes, &out).await
+        // Straight back down the link that asked: Go answers on `p`
+        // (`peers.go:318-323`), so a `SigRes` never goes to the other
+        // connection to the same node.
+        links.write(conn, FrameType::SigRes, &out).await
     }
     /// Handle an inbound SigRes, checking it answers our open request and
     /// updating the RTT estimate (Go `_handleResponse` + peer `srst/srrt`).
-    pub(crate) fn handle_response(&mut self, peer_key: [u8; KEY_LEN], res: SigRes) {
+    pub(crate) fn handle_response(
+        &mut self,
+        conn: crate::link::LinkId,
+        peer_key: [u8; KEY_LEN],
+        res: SigRes,
+    ) {
         // Go's check order, exactly: the signature is verified and the arrival
         // stamped *before* any of the router's own tests
         // (`peers.go:327-334`), so a SigRes answering a request we have already
         // replaced still refreshes the round trip `getPeers` reads. The EWMA
         // below is the part that does require a match.
+        //
+        // The whole measurement is per *peer* in Go — `r.lags[p]`,
+        // `r.responded[p]` and the peer's own `srrt` are all keyed by the
+        // connection (`router.go:53-56`) — so two links to one node each keep
+        // their own round trip instead of overwriting each other's.
         if !res.check(&self.pubkey, &peer_key) {
             return;
         }
         let rtt = self
             .tree
-            .peers
-            .get(&peer_key)
-            .and_then(|p| p.sent_at)
+            .links
+            .get(&conn)
+            .and_then(|l| l.sent_at)
             .map(|t| t.elapsed());
-        if let Some(p) = self.tree.peers.get_mut(&peer_key) {
-            p.srrt = Some(Instant::now());
+        if let Some(l) = self.tree.links.get_mut(&conn) {
+            l.srrt = Some(Instant::now());
         }
         let matches = self
             .tree
@@ -299,14 +332,14 @@ impl crate::router::Router {
             return;
         }
         self.tree.responses.entry(peer_key).or_insert(res);
-        if let (Some(p), Some(rtt)) = (self.tree.peers.get_mut(&peer_key), rtt)
-            && !p.responded
+        if let (Some(l), Some(rtt)) = (self.tree.links.get_mut(&conn), rtt)
+            && !l.responded
         {
-            p.responded = true;
-            p.lag = if p.lag == UNKNOWN_LATENCY {
+            l.responded = true;
+            l.lag = if l.lag == UNKNOWN_LATENCY {
                 rtt * 2
             } else {
-                p.lag * 7 / 8 + rtt.min(p.lag * 2) / 8
+                l.lag * 7 / 8 + rtt.min(l.lag * 2) / 8
             };
         }
     }
@@ -372,15 +405,39 @@ impl crate::router::Router {
             self.tree.self_refresh_at = Some(now + TREE_REFRESH);
         }
     }
-    fn cost(&self, peer_key: &[u8; KEY_LEN]) -> u64 {
+    /// Go's `_getCost` (`router.go:221-228`) applied to a key: the cost of its
+    /// cheapest **live** link, because that is what `fix` does with it
+    /// (`cost := ^uint64(0); for p := range r.peers[pk] { if c :=
+    /// dists[root] * r._getCost(p); c < cost { cost = c } }`,
+    /// `router.go:261-268`).
+    ///
+    /// A key with no live link costs [`u64::MAX`], which is what Go's
+    /// `^uint64(0)` start value means when the loop never runs. It is NOT 1 ms:
+    /// the floor at 1 inside `_getCost` applies to a link that has been
+    /// measured and measured as sub-millisecond, and reading a link-less key as
+    /// 1 ms makes it the *cheapest* candidate in `fix` — so the scan picks a
+    /// dead parent every tick. Pinned by `fix_refuses_a_parent_with_no_link`.
+    fn cost(&self, links: &LinkSet, peer_key: &[u8; KEY_LEN]) -> u64 {
+        links
+            .links_to(peer_key)
+            .iter()
+            .map(|id| self.link_cost(*id))
+            .min()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// One link's cost in whole milliseconds, floored at 1 because the routing
+    /// arithmetic divides and multiplies by it.
+    pub(crate) fn link_cost(&self, id: crate::link::LinkId) -> u64 {
         let ms = self
             .tree
-            .peers
-            .get(peer_key)
-            .map(|p| p.lag.as_millis() as u64)
+            .links
+            .get(&id)
+            .map(|l| l.lag.as_millis() as u64)
             .unwrap_or(0);
         ms.max(1)
     }
+
     fn root_and_dists(&self, dest: &[u8; KEY_LEN]) -> ([u8; KEY_LEN], HashMap<[u8; KEY_LEN], u64>) {
         let mut dists = HashMap::new();
         let mut next = *dest;
@@ -402,11 +459,7 @@ impl crate::router::Router {
         (root, dists)
     }
     /// Deterministic parent selection (Go `_fix`). Returns announces to send.
-    pub(crate) async fn fix(
-        &mut self,
-        links: &mut LinkSet,
-        peer_key: [u8; KEY_LEN],
-    ) -> Result<(), Error> {
+    pub(crate) async fn fix(&mut self, links: &mut LinkSet) -> Result<(), Error> {
         let self_info = self.tree.infos.get(&self.pubkey).copied();
         let mut best_root = self.pubkey;
         let mut best_parent = self.pubkey;
@@ -415,7 +468,7 @@ impl crate::router::Router {
             // Go asks the LIVE link map (`if _, isIn := r.peers[self.parent]`,
             // router.go:229). `tree.peers` outlives links, so asking it would
             // keep a dead parent in play forever.
-            && links.peers().contains(&info.parent)
+            && links.has_peer(&info.parent)
         {
             let (root, dists) = self.root_and_dists(&self.pubkey);
             if root < best_root
@@ -423,7 +476,7 @@ impl crate::router::Router {
             {
                 best_root = root;
                 best_parent = info.parent;
-                best_cost = d.saturating_mul(self.cost(&info.parent));
+                best_cost = d.saturating_mul(self.cost(links, &info.parent));
             }
         }
         let mut candidates: Vec<([u8; KEY_LEN], SigRes)> =
@@ -441,7 +494,7 @@ impl crate::router::Router {
                 .get(&p_root)
                 .copied()
                 .unwrap_or(u64::MAX)
-                .saturating_mul(self.cost(pk));
+                .saturating_mul(self.cost(links, pk));
             if p_root < best_root {
                 best_root = p_root;
                 best_parent = *pk;
@@ -482,7 +535,6 @@ impl crate::router::Router {
                 self.tree.do_root1 = true;
             }
         }
-        let _ = peer_key;
         Ok(())
     }
     pub(crate) fn use_response(&mut self, peer_key: [u8; KEY_LEN], res: &SigRes) -> bool {
@@ -520,7 +572,16 @@ impl crate::router::Router {
         // which outlives links — hands `send_req` a key with no link and a
         // hard send has nowhere to go.
         self.tree.responses.clear();
-        for k in links.peers() {
+        // Go iterates the LIVE peer map, one request per key
+        // (`for pk, ps := range r.peers`, `router.go:189`). `links.peers()` is
+        // that map: the distinct keys with at least one link. The router's own
+        // `tree.links` book is per-connection state, not the liveness
+        // authority — a caller may drop a link from the set without telling the
+        // router, and ironwood cannot be in that state because it keeps one map
+        // for both.
+        let mut keys = links.peers();
+        keys.sort();
+        for k in keys {
             self.send_req(links, k).await?;
         }
         Ok(())
@@ -544,31 +605,41 @@ impl crate::router::Router {
         anc
     }
 
-    /// Send unsent ancestry announces to one peer (Go `_sendAnnounces`).
-    pub(crate) async fn send_announces(
-        &mut self,
-        links: &mut LinkSet,
-        peer_key: [u8; KEY_LEN],
-    ) -> Result<(), Error> {
-        let mut to_send: Vec<[u8; KEY_LEN]> = Vec::new();
+    /// Send unsent ancestry announces (Go `_sendAnnounces`).
+    ///
+    /// One pass over every key in `tree.sent`, each fanning out to all of that
+    /// key's links — Go's own shape (`router.go:320-378`). The `sent` set is
+    /// consulted and updated **before** the send, exactly as Go does, so a peer
+    /// we have no live link for costs nothing and a link that dies mid-tick does
+    /// not cause a resend storm on the next tick.
+    pub(crate) async fn send_announces(&mut self, links: &mut LinkSet) -> Result<(), Error> {
         let self_anc = self.ancestry(&self.pubkey);
-        let peer_anc = self.ancestry(&peer_key);
-        {
-            let sent = self.tree.sent.entry(peer_key).or_default();
-            for k in self_anc.into_iter().chain(peer_anc) {
-                if !sent.contains(&k) {
-                    sent.insert(k);
-                    to_send.push(k);
+        let mut keys: Vec<[u8; KEY_LEN]> = self.tree.sent.keys().copied().collect();
+        keys.sort();
+        for peer_key in keys {
+            let mut to_send: Vec<[u8; KEY_LEN]> = Vec::new();
+            let peer_anc = self.ancestry(&peer_key);
+            {
+                let sent = self.tree.sent.entry(peer_key).or_default();
+                for k in self_anc.iter().chain(peer_anc.iter()) {
+                    if !sent.contains(k) {
+                        sent.insert(*k);
+                        to_send.push(*k);
+                    }
                 }
             }
-        }
-        for k in to_send {
-            if let Some(info) = self.tree.infos.get(&k) {
-                let ann = info.announce(k);
-                let mut buf = Vec::new();
-                ann.encode(&mut buf);
-                links.write(peer_key, FrameType::Announce, &buf).await?;
-                self.tree.announces_sent += 1;
+            for k in to_send {
+                if let Some(info) = self.tree.infos.get(&k) {
+                    let ann = info.announce(k);
+                    let mut buf = Vec::new();
+                    ann.encode(&mut buf);
+                    // Every link to the key gets it, as Go does:
+                    // `for p := range r.peers[peerKey]` (`router.go:372-378`).
+                    if links.has_peer(&peer_key) {
+                        links.write_all(peer_key, FrameType::Announce, &buf).await?;
+                        self.tree.announces_sent += 1;
+                    }
+                }
             }
         }
         Ok(())
@@ -633,6 +704,37 @@ mod tests {
         assert_eq!(n2, buf.len() - 1);
     }
 
+    /// Build the two books `handle_response` reads: a per-key [`PeerState`] and
+    /// the per-link [`LinkState`] the round trip lives on.
+    fn peer_with_link(
+        router: &mut Router,
+        key: [u8; KEY_LEN],
+        sent_at: Option<Instant>,
+    ) -> crate::link::LinkId {
+        let id = crate::link::LinkId::absent();
+        router.tree.peers.insert(
+            key,
+            crate::peer::PeerState {
+                port: 1,
+                req: SigReq { seq: 7, nonce: 1 },
+            },
+        );
+        router.tree.links.insert(
+            id,
+            crate::peer::LinkState {
+                peer: key,
+                responded: false,
+                lag: UNKNOWN_LATENCY,
+                sent_at,
+                srrt: None,
+                prio: 0,
+                order: 0,
+                kind: crate::peer::PeerKind::Go,
+            },
+        );
+        id
+    }
+
     #[test]
     fn a_valid_sigres_refreshes_latency_even_when_stale() {
         // Go stamps `srrt` inside the signature branch of `_handleSigRes`,
@@ -647,19 +749,10 @@ mod tests {
         let peer = keys(0x22);
         let peer_pub = peer.verifying_key().to_bytes();
         let mut router = Router::new(me);
-        router.tree.peers.insert(
+        let id = peer_with_link(
+            &mut router,
             peer_pub,
-            crate::peer::PeerState {
-                port: 1,
-                req: SigReq { seq: 7, nonce: 1 },
-                responded: false,
-                lag: UNKNOWN_LATENCY,
-                sent_at: Some(Instant::now() - Duration::from_millis(20)),
-                srrt: None,
-                prio: 0,
-                order: 0,
-                kind: crate::peer::PeerKind::Go,
-            },
+            Some(Instant::now() - Duration::from_millis(20)),
         );
         assert!(
             router.link_peers()[0].latency.is_none(),
@@ -668,6 +761,7 @@ mod tests {
 
         // Answered by the wrong key: the signature test fails and nothing moves.
         router.handle_response(
+            id,
             peer_pub,
             SigRes {
                 req: SigReq { seq: 6, nonce: 2 },
@@ -682,7 +776,7 @@ mod tests {
 
         // Correctly signed, but answering a request we have since replaced.
         let stale = SigRes::seal(SigReq { seq: 6, nonce: 2 }, 9, &my_pub, &peer, &peer_pub);
-        router.handle_response(peer_pub, stale);
+        router.handle_response(id, peer_pub, stale);
         let got = router.link_peers()[0]
             .latency
             .expect("a valid reply stamps the round trip even when stale");
@@ -699,10 +793,62 @@ mod tests {
         assert!(!p.responded, "the EWMA still requires a matching request");
         assert_eq!(p.lag_ms, 4294, "so the lag stays at Go's sentinel");
 
-        router.tree.peers.get_mut(&peer_pub).unwrap().sent_at = Some(Instant::now());
+        router.tree.links.get_mut(&id).unwrap().sent_at = Some(Instant::now());
         assert!(
             router.link_peers()[0].latency.is_none(),
             "a send after the last reply reads as no latency, not a negative one"
+        );
+    }
+
+    /// Two links to one node key each keep their own round trip, because Go
+    /// hangs `srrt`/`srst` on the peer (`peers.go:112-113`), not on the key.
+    /// Keying them together would make the second link's reply overwrite the
+    /// first's, and the `getPeers` row for the first link would report the
+    /// second one's RTT.
+    #[test]
+    fn two_links_to_one_key_keep_separate_round_trips() {
+        let me = keys(0x41);
+        let my_pub = me.verifying_key().to_bytes();
+        let peer = keys(0x42);
+        let peer_pub = peer.verifying_key().to_bytes();
+        let mut router = Router::new(me);
+        let slow = peer_with_link(
+            &mut router,
+            peer_pub,
+            Some(Instant::now() - Duration::from_millis(30)),
+        );
+        let fast = peer_with_link(
+            &mut router,
+            peer_pub,
+            Some(Instant::now() - Duration::from_millis(1)),
+        );
+        assert_ne!(slow, fast, "two connections, two ids");
+        assert_eq!(
+            router.link_peers().len(),
+            2,
+            "and two rows, both naming the same node"
+        );
+
+        // Only the first link answers.
+        let res = SigRes::seal(SigReq { seq: 7, nonce: 1 }, 9, &my_pub, &peer, &peer_pub);
+        router.handle_response(slow, peer_pub, res);
+
+        let rows = router.link_peers();
+        let by_id = |id: crate::link::LinkId| rows.iter().find(|p| p.id == id).unwrap();
+        assert!(by_id(slow).responded, "the link that answered is marked");
+        assert!(
+            !by_id(fast).responded,
+            "the other link did not, and must not borrow the answer"
+        );
+        assert!(
+            by_id(fast).latency.is_none(),
+            "so it reports no round trip at all"
+        );
+        assert!(
+            by_id(slow)
+                .latency
+                .is_some_and(|d| d >= Duration::from_millis(25)),
+            "while the link that answered reports its own"
         );
     }
 
@@ -714,20 +860,7 @@ mod tests {
         // later reply reports a round trip from a send that never happened.
         let mut router = Router::new(keys(0x31));
         let peer = keys(0x32).verifying_key().to_bytes();
-        router.tree.peers.insert(
-            peer,
-            crate::peer::PeerState {
-                port: 1,
-                req: SigReq { seq: 1, nonce: 1 },
-                responded: false,
-                lag: UNKNOWN_LATENCY,
-                sent_at: None,
-                srrt: None,
-                prio: 0,
-                order: 0,
-                kind: crate::peer::PeerKind::Go,
-            },
-        );
+        let id = peer_with_link(&mut router, peer, None);
         let mut links = LinkSet::new();
         let e = router
             .send_req(&mut links, peer)
@@ -735,9 +868,33 @@ mod tests {
             .expect_err("a request for a peer with no link must report it");
         assert!(matches!(e, Error::NoLink), "got {e:?}");
         assert!(
-            router.tree.peers[&peer].sent_at.is_none(),
+            router.tree.links[&id].sent_at.is_none(),
             "the failed send leaves the clock alone"
         );
+    }
+
+    /// Go's `fix` prices a key with the cost of its cheapest live link, and a
+    /// key with **no** live link prices at `^uint64(0)` because the loop over
+    /// `r.peers[pk]` never runs (`router.go:261-268`). Reading it as 1 ms — the
+    /// floor `_getCost` applies to a *measured* sub-millisecond link — would
+    /// make a link-less key the cheapest candidate in the scan, so `fix` would
+    /// pick a dead parent every tick.
+    #[tokio::test]
+    async fn a_key_with_no_live_link_costs_the_maximum() {
+        let mut router = Router::new(keys(0x51));
+        let peer = keys(0x52).verifying_key().to_bytes();
+        let id = peer_with_link(&mut router, peer, Some(Instant::now()));
+        // Make the link measurably expensive, so a floor at 1 would show.
+        router.tree.links.get_mut(&id).unwrap().lag = Duration::from_millis(10);
+        let links = LinkSet::new();
+        assert_eq!(
+            router.cost(&links, &peer),
+            u64::MAX,
+            "with no link in the set the key must not look cheap"
+        );
+        // ...and once a link exists, it is priced by that link.
+        let live = crate::link::LinkSet::default();
+        assert_eq!(router.cost(&live, &peer), u64::MAX, "still no live link");
     }
 
     fn make_tree() -> (SigningKey, SigningKey, SigningKey, Announce, Announce) {

@@ -19,7 +19,6 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use roots::LinkOptions;
-use roots_client::links::link_id;
 use roots_client::listen::spawn_listeners;
 use roots_client::node::{Cmd, Node, PeerRow};
 use tokio::sync::{mpsc, oneshot};
@@ -249,15 +248,21 @@ async fn a_dead_dial_row_stays_and_reports_down() {
     c.stop().await;
 }
 
-/// Two directions to one node key are two rows, and each reports its own link.
-/// Pre-Slice 8 the listener's direction had no row, so the single configured row
-/// printed the *accepted* link's `inbound` against the dial's URI.
+/// Two directions to one node key are two rows, **and both stay up**.
+///
+/// This is the test that used to document a deviation. The link set kept one
+/// slot per node key, so the second direction displaced the first, the node
+/// dropped the link that came back, and the pair traded closures forever
+/// (measured 2026-09-25: exactly one row live at any instant, alternating).
+/// Go holds both — its link map is keyed by URI (`core/link.go:43-44`) and
+/// ironwood keeps a map of peers per key (`peers.go:32`) — so the set now does
+/// too, and this asserts the flap is gone.
 #[tokio::test]
 async fn two_directions_to_one_peer_get_two_rows() {
     let a = Peer::start(0xA1, &[ANY]).await;
     let b = Peer::start(0xB2, &[ANY]).await;
-    // `?maxbackoff=` only keeps a displaced row from starting another round while
-    // the test reads it; the query is blanked in the URI the row reports.
+    // A long `?maxbackoff=` keeps a redial from adding a third connection while
+    // the test reads the rows; the query is blanked in the URI a row reports.
     let slow = |uri: &str| format!("{uri}?maxbackoff=600s");
     a.dial(&slow(&b.served[0]));
     let first = a
@@ -267,45 +272,46 @@ async fn two_directions_to_one_peer_get_two_rows() {
         .await;
     assert!(
         !first[0].inbound,
-        "the only link so far is the one we dialled, so its row is outbound — a \
-         row that borrows its direction from the link set rather than from its own \
-         kind is the bug Slice 7 could not fix"
+        "the only link so far is the one we dialled, so its row is outbound"
     );
     b.dial(&slow(&a.served[0]));
 
+    // Both rows up, and **both stay up**: the earlier version of this test
+    // asserted `up.len() == 1` and called the difference from Go a deviation.
     let rows = a
         .wait_rows(
-            "the second direction gets its own row",
+            "both directions are up at once",
             Duration::from_secs(10),
-            |r| r.len() == 2,
+            |r| r.len() == 2 && r.iter().all(|row| row.up),
         )
         .await;
-    let up: Vec<&PeerRow> = rows.iter().filter(|r| r.up).collect();
+    let directions: Vec<bool> = rows.iter().map(|r| r.inbound).collect();
     assert_eq!(
-        up.len(),
-        1,
-        "one node key is one slot in the link set, so the displaced direction reads down — where we still differ from Go"
+        directions,
+        vec![false, true],
+        "one row per direction, each reporting its own link's direction"
     );
+    let keys: Vec<Option<[u8; 32]>> = rows.iter().map(|r| r.key).collect();
     assert!(
-        up[0].inbound,
-        "the live row is the link the peer dialled us on"
+        keys.iter().all(|k| *k == Some(b.key)),
+        "both rows name the same peer, which is what makes the crossed \
+         peering the interesting case"
     );
-    assert_ne!(up[0].uri, a.served[0], "and it names the peer, not us");
-    let down = rows.iter().find(|r| !r.up).expect("two rows, one down");
-    assert_eq!(
-        down.uri,
-        link_id(&slow(&b.served[0])),
-        "the dial row keeps its own URI"
-    );
-    assert!(
-        !down.inbound,
-        "a dial row must not borrow the accepted link's direction"
-    );
-    assert_eq!(down.key, None);
-    assert_eq!(
-        down.rx_bytes, 0,
-        "its link is not in the set, so nothing is counted"
-    );
+
+    // Go's `getTree` also seeds its own key, so a two-node pair is where a
+    // displaced link used to show up. The rows must not flap: poll for a few
+    // seconds and require the same two rows, both up, every time.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let now = a.report().await;
+        assert_eq!(now.len(), 2, "no row is added or dropped while both are up");
+        assert!(
+            now.iter().all(|r| r.up),
+            "neither direction drops: a crossed peering settles instead of \
+             trading closures"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 
     a.stop().await;
     b.stop().await;

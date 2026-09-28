@@ -257,7 +257,18 @@ impl crate::router::Router {
 
     /// Greedy next hop toward tree-space `path` (Go `_lookup`), updating the
     /// watermark to our distance when we forward.
-    pub(crate) fn greedy_next(&self, path: &[u64], watermark: &mut u64) -> Option<[u8; KEY_LEN]> {
+    ///
+    /// Returns a [`LinkId`], not a key, because Go returns a `*peer`: the
+    /// candidate set is one entry per *connection* (`for k, ps := range
+    /// r.peers { for p := range ps { candidates = append(candidates, p) } }`,
+    /// `router.go:702-707`) and the same-key priority rule only exists because
+    /// two connections to one node can both be candidates.
+    pub(crate) fn greedy_next(
+        &self,
+        links: &LinkSet,
+        path: &[u64],
+        watermark: &mut u64,
+    ) -> Option<crate::link::LinkId> {
         let mut best_dist = u64::MAX;
         if let Some(sp) = self.root_path() {
             let d = Self::coords_dist(path, &sp);
@@ -268,37 +279,50 @@ impl crate::router::Router {
                 return None;
             }
         }
-        let mut keys: Vec<[u8; KEY_LEN]> = self.tree.peers.keys().copied().collect();
+        // First pass: which *nodes* take us strictly closer, ignoring cost, so
+        // the next hop is loop-free.
+        let mut keys = links.peers();
         keys.sort();
-        let mut cands: Vec<[u8; KEY_LEN]> = Vec::new();
+        let mut cands: Vec<crate::link::LinkId> = Vec::new();
         for k in &keys {
             if let Some(kp) = self.root_path_for(k)
                 && Self::coords_dist(path, &kp) < best_dist
             {
-                cands.push(*k);
+                cands.extend(links.links_to(k));
             }
         }
-        // Single link per key here, so the same-key priority rule never
-        // triggers; the cost/distance/order rules below are verbatim.
-        let mut best: Option<[u8; KEY_LEN]> = None;
+        // Second pass: the best candidate, minimising cost x remaining distance
+        // and breaking ties in Go's order — same key, then distance, then cost,
+        // then age (`router.go:715-757`).
+        let mut best: Option<crate::link::LinkId> = None;
         let mut best_cost = u64::MAX;
         let mut best_d = u64::MAX;
-        for k in cands {
-            let p = &self.tree.peers[&k];
-            let dist = Self::coords_dist(path, &self.root_path_for(&k).unwrap_or_default());
-            let cost = (p.lag.as_millis() as u64).max(1);
-            let take = match best {
+        for id in cands {
+            let Some(l) = self.tree.links.get(&id) else {
+                continue;
+            };
+            let (peer, prio, order) = (l.peer, l.prio, l.order);
+            let dist = Self::coords_dist(path, &self.root_path_for(&peer).unwrap_or_default());
+            let cost = self.link_cost(id);
+            let take = match best.and_then(|b| self.tree.links.get(&b)) {
                 None => true,
+                Some(b) if peer == b.peer && prio < b.prio => true,
+                // Same node, higher priority: a lower-priority link to the same
+                // node is a better route, so this one is dropped outright.
+                Some(b) if peer == b.peer => false,
                 _ if cost.saturating_mul(dist) < best_cost.saturating_mul(best_d) => true,
                 _ if cost.saturating_mul(dist) > best_cost.saturating_mul(best_d) => false,
                 _ if dist < best_d => true,
                 _ if dist > best_d => false,
                 _ if cost < best_cost => true,
                 _ if cost > best_cost => false,
-                _ => p.order < self.tree.peers[&best.unwrap()].order,
+                _ => match best.and_then(|b| self.tree.links.get(&b)) {
+                    Some(b) => order < b.order,
+                    None => false,
+                },
             };
             if take {
-                best = Some(k);
+                best = Some(id);
                 best_cost = cost;
                 best_d = dist;
             }
@@ -307,10 +331,13 @@ impl crate::router::Router {
     }
 
     /// Originate a lookup (Go `_sendLookup` + `_handleLookup` for self).
+    ///
+    /// Takes no peer: Go's `_sendLookup(dest)` floods over the bloom's on-tree
+    /// set (`pathfinder.go:27-42`) and names itself as the source, so nothing
+    /// here addresses a particular connection.
     pub(crate) async fn send_lookup(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         if let Some(e) = self.path.entries.get_mut(&dest) {
@@ -321,16 +348,19 @@ impl crate::router::Router {
             dest,
             from: self.root_path().unwrap_or_default(),
         };
-        self.handle_lookup(links, conn_peer, self.pubkey, &lookup)
-            .await
+        self.handle_lookup(links, self.pubkey, &lookup).await
     }
 
     /// Handle a lookup from `from` (Go `_handleLookup`): multicast onwards,
     /// then answer directly on a transformed-key match.
+    ///
+    /// `conn_peer` is the key of the link the lookup arrived on, which is Go's
+    /// `fromKey` (`pathfinder.go:44-51`). It is only a routing input, never a
+    /// link to write to: the reply goes out through `_handleNotify`, which picks
+    /// its own next hop.
     pub(crate) async fn handle_lookup(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         lookup: &PathLookup,
     ) -> Result<(), Error> {
@@ -360,7 +390,7 @@ impl crate::router::Router {
             dest: lookup.source,
             info,
         };
-        self.handle_notify(links, conn_peer, &notify).await
+        self.handle_notify(links, &notify).await
     }
 
     /// Handle a notify: forward toward its path, or accept it when we are
@@ -368,11 +398,10 @@ impl crate::router::Router {
     pub(crate) async fn handle_notify(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         notify: &PathNotify,
     ) -> Result<(), Error> {
         let mut fwd = notify.clone();
-        if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
+        if let Some(next) = self.greedy_next(links, &fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
             return self
@@ -428,7 +457,7 @@ impl crate::router::Router {
             .and_then(|r| r.pending.take())
         {
             let dest = notify.source;
-            self.pathfinder_send(links, conn_peer, dest, data).await?;
+            self.pathfinder_send(links, dest, data).await?;
         }
         Ok(())
     }
@@ -437,11 +466,10 @@ impl crate::router::Router {
     pub(crate) async fn handle_broken(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         broken: &PathBroken,
     ) -> Result<(), Error> {
         let mut fwd = broken.clone();
-        if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
+        if let Some(next) = self.greedy_next(links, &fwd.path, &mut fwd.watermark) {
             let mut buf = Vec::new();
             fwd.encode(&mut buf);
             return self
@@ -456,7 +484,7 @@ impl crate::router::Router {
                 e.broken = true;
             }
             let dest = broken.dest;
-            self.rumor_lookup(links, conn_peer, dest).await?;
+            self.rumor_lookup(links, dest).await?;
         }
         Ok(())
     }
@@ -467,7 +495,6 @@ impl crate::router::Router {
     pub(crate) async fn rumor_lookup(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
         let now = std::time::Instant::now();
@@ -491,7 +518,7 @@ impl crate::router::Router {
         e.send_at = Some(now);
         e.deadline = now + PATH_TIMEOUT;
         // Boxed: the lookup/notify/send graph is mutually recursive.
-        Box::pin(self.send_lookup(links, conn_peer, dest)).await
+        Box::pin(self.send_lookup(links, dest)).await
     }
 
     /// Send a network-layer payload, attaching the learned path or
@@ -499,7 +526,6 @@ impl crate::router::Router {
     pub(crate) async fn pathfinder_send(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
     ) -> Result<(), Error> {
@@ -520,7 +546,7 @@ impl crate::router::Router {
             };
             return self.route_traffic(links, &tr).await;
         }
-        self.rumor_lookup(links, conn_peer, dest).await?;
+        self.rumor_lookup(links, dest).await?;
         if let Some(r) = self.path.rumors.get_mut(&crate::bloom::xkey(&dest)) {
             r.pending = Some(payload);
         }
@@ -535,7 +561,7 @@ impl crate::router::Router {
         tr: &crate::traffic::Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
-        if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
+        if let Some(next) = self.greedy_next(links, &fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
             return self.write_via(links, next, FrameType::Traffic, &buf).await;
         }

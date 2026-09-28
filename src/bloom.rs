@@ -345,12 +345,25 @@ impl crate::router::Router {
                 self.bloom.send.insert(pk, b.clone());
                 self.bloom.dirty.insert(pk, false);
                 let bytes = b.encode();
-                // Soft send: the destination comes from router state (the
-                // on-tree list), not from the link being served, so a peer
-                // whose link just died is a skip — Go guards with
-                // `if ps, isIn := r.peers[k]; isIn` (`bloomfilter.go:277`).
-                self.write_via(links, pk, crate::frame::FrameType::BloomFilter, &bytes)
-                    .await?;
+                // Every link to the key gets it, as Go does: `if ps, isIn :=
+                // bs.router.peers[k]; isIn { for p := range ps { p.sendBloom
+                // (...) } }` (`bloomfilter.go:277-281`).
+                //
+                // Go panics if the key has no live link there, because it
+                // prunes `blooms` and `peers` together in `removePeer`. We
+                // deliberately do not prune `bloom.on_tree` when a link dies,
+                // so this is where a stale book entry surfaces — as a counted
+                // skip, never as an error. The counter is the point: a bloom
+                // that silently stops reaching a peer is indistinguishable from
+                // a node that has nothing to say.
+                match links.links_to(&pk).first() {
+                    Some(_) => {
+                        links
+                            .write_all(pk, crate::frame::FrameType::BloomFilter, &bytes)
+                            .await?
+                    }
+                    None => self.dropped_no_link += 1,
+                }
             }
         }
         Ok(())
@@ -368,7 +381,27 @@ impl crate::router::Router {
         Ok(())
     }
 
+    /// The lowest-priority link to a key, breaking ties by age. Go's
+    /// multicast fan-out picks one peer per key this way
+    /// (`bloomfilter.go:317-323`); lower priority wins, and among equals the
+    /// older connection, which is the same order the next-hop scan uses.
+    pub(crate) fn best_link(
+        &self,
+        links: &LinkSet,
+        key: &[u8; KEY_LEN],
+    ) -> Option<crate::link::LinkId> {
+        links.links_to(key).into_iter().min_by_key(|id| {
+            let l = &self.tree.links[id];
+            (l.prio, l.order)
+        })
+    }
+
     /// Forward a multicast packet along the tree (Go `_sendMulticast`).
+    ///
+    /// One packet per interested **key**, sent on that key's lowest-priority
+    /// link: Go picks `bestPeer` by `p.prio` over `bs.router.peers[k]`
+    /// (`bloomfilter.go:317-323`) and sends there only, so a node with two
+    /// connections receives the packet once.
     pub(crate) async fn multicast(
         &mut self,
         links: &mut LinkSet,
@@ -394,7 +427,9 @@ impl crate::router::Router {
             if !interested {
                 continue;
             }
-            self.write_via(links, k, ftype, payload).await?;
+            if let Some(id) = self.best_link(links, &k) {
+                self.write_via(links, id, ftype, payload).await?;
+            }
         }
         Ok(())
     }

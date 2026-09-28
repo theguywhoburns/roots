@@ -61,11 +61,10 @@ impl crate::router::Router {
     pub(crate) async fn handle_inbound_traffic(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         tr: &Traffic,
     ) -> Result<(), Error> {
         let mut fwd = tr.clone();
-        if let Some(next) = self.greedy_next(&fwd.path, &mut fwd.watermark) {
+        if let Some(next) = self.greedy_next(links, &fwd.path, &mut fwd.watermark) {
             let buf = fwd.encode();
             return self
                 .write_via(links, next, crate::frame::FrameType::Traffic, &buf)
@@ -73,7 +72,7 @@ impl crate::router::Router {
         }
         if tr.dest == self.pubkey {
             return self
-                .handle_session_bytes(links, conn_peer, tr.source, &tr.payload)
+                .handle_session_bytes(links, tr.source, &tr.payload)
                 .await;
         }
         let broken = crate::pathfind::PathBroken {
@@ -82,7 +81,7 @@ impl crate::router::Router {
             source: tr.source,
             dest: tr.dest,
         };
-        self.handle_broken(links, conn_peer, &broken).await
+        self.handle_broken(links, &broken).await
     }
 }
 

@@ -113,12 +113,12 @@ where
                 Cmd::Resolve { addr, reply } => {
                     // A resolve owns the link until it answers, like an app
                     // request would; the first link stands in for "our peer".
-                    let Some(peer) = links.peers().first().copied() else {
+                    let Some(id) = links.ids().first().copied() else {
                         let _ = reply.send(None);
                         continue;
                     };
                     let got = router
-                        .resolve(&mut links, peer, &addr, Duration::from_secs(30))
+                        .resolve(&mut links, id, &addr, Duration::from_secs(30))
                         .await
                         .ok();
                     let _ = reply.send(got);
@@ -157,19 +157,22 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
     let b_task = {
         let (sk, opts, rx, stop) = (b_sk.clone(), opts.clone(), b_rx, stop_b.clone());
         tokio::spawn(async move {
-            let mut ab = roots::link::accept(&listener, &sk, &opts)
+            let ab = roots::link::accept(&listener, &sk, &opts)
                 .await
                 .expect("B accepts A");
             let a_peer = ab.remote_key;
-            let mut cb = roots::link::accept(&listener, &sk, &opts)
+            let cb = roots::link::accept(&listener, &sk, &opts)
                 .await
                 .expect("B accepts C");
             let c_peer = cb.remote_key;
             let mut router = Router::new(sk);
-            router.register(&mut ab, a_peer).await.expect("B A");
-            router.register(&mut cb, c_peer).await.expect("B C");
-            let mut links = LinkSet::single(roots::link::AnyConn::new(ab));
-            links.add(roots::link::AnyConn::new(cb));
+            let mut ab = roots::link::AnyConn::new(ab);
+            let mut cb = roots::link::AnyConn::new(cb);
+            let (a_id, c_id) = (ab.id, cb.id);
+            router.register(&mut ab, a_peer, a_id).await.expect("B A");
+            router.register(&mut cb, c_peer, c_id).await.expect("B C");
+            let mut links = LinkSet::single(ab);
+            links.add(cb);
             drive(router, links, rx, stop, |_, l| l.peers()).await
         })
     };
@@ -183,20 +186,15 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
             stop_a.clone(),
         );
         tokio::spawn(async move {
-            let mut conn = roots::link::dial(&uri, &sk, &opts)
+            let conn = roots::link::dial(&uri, &sk, &opts)
                 .await
                 .expect("A dials B");
             let peer = conn.remote_key;
             let mut router = Router::new(sk);
-            router.register(&mut conn, peer).await.expect("A reg");
-            drive(
-                router,
-                LinkSet::single(roots::link::AnyConn::new(conn)),
-                rx,
-                stop,
-                |_, _| (),
-            )
-            .await
+            let mut conn = roots::link::AnyConn::new(conn);
+            let id = conn.id;
+            router.register(&mut conn, peer, id).await.expect("A reg");
+            drive(router, LinkSet::single(conn), rx, stop, |_, _| ()).await
         })
     };
 
@@ -209,20 +207,15 @@ async fn three_node_mesh_routes_resolves_and_survives_a_dead_link() {
             stop_c.clone(),
         );
         tokio::spawn(async move {
-            let mut conn = roots::link::dial(&uri, &sk, &opts)
+            let conn = roots::link::dial(&uri, &sk, &opts)
                 .await
                 .expect("C dials B");
             let peer = conn.remote_key;
             let mut router = Router::new(sk);
-            router.register(&mut conn, peer).await.expect("C reg");
-            drive(
-                router,
-                LinkSet::single(roots::link::AnyConn::new(conn)),
-                rx,
-                stop,
-                |_, _| (),
-            )
-            .await
+            let mut conn = roots::link::AnyConn::new(conn);
+            let id = conn.id;
+            router.register(&mut conn, peer, id).await.expect("C reg");
+            drive(router, LinkSet::single(conn), rx, stop, |_, _| ()).await
         })
     };
 

@@ -20,15 +20,17 @@ async fn main() {
     let mut rng = rand::thread_rng();
     let client = Client::new(SigningKey::generate(&mut rng));
     println!("local  addr {}", client.address());
-    let mut conn = client.connect(&uri).await.expect("dial");
+    let conn = client.connect(&uri).await.expect("dial");
     let peer_key = conn.remote_key;
+    let mut conn = roots::link::AnyConn::new(conn);
+    let id = conn.id;
     let mut router = roots::Router::new(client.key);
     router
-        .register(&mut conn, peer_key)
+        .register(&mut conn, peer_key, id)
         .await
         .expect("register");
     // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+    let mut links = roots::LinkSet::single(conn);
     let mut outbox = vec![(go_key, b"hello-oracle".to_vec())];
     for i in 0..120 {
         if let Err(e) = router

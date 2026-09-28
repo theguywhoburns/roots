@@ -159,6 +159,15 @@ impl LinkId {
     fn next() -> Self {
         Self(NEXT_LINK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
+
+    /// An id no link will ever be given, for a caller that needs to ask about a
+    /// link that is not there — "is this id still live", "what happens if I
+    /// write to a link that died". A production caller has a real id and should
+    /// use it; this exists so the question can be put, and so a test can build
+    /// the stale case without reaching for a real socket.
+    pub fn absent() -> Self {
+        Self::next()
+    }
 }
 
 /// Type-erased authenticated peer connection: same shape as
@@ -229,6 +238,10 @@ impl Link for AnyConn {
 }
 
 /// One link the set owns: the conn plus what the set measures about it.
+///
+/// Several entries may share a `peer` key. That is ironwood's shape
+/// (`peers.go:32`, `map[publicKey]map[*peer]struct{}`) and what lets a peering
+/// that both sides dialled settle instead of trading closures.
 struct LinkEntry {
     peer: [u8; KEY_LEN],
     link: AnyConn,
@@ -262,21 +275,32 @@ pub struct LinkStats {
 /// for every link at once, and a rate is simply the bytes since that tick.
 const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// The multi-peer connection map (Slice 10b): one entry per link keyed
-/// by the peer's node key. The set **owns** its links, so it is `'static`
-/// and a caller can keep it across await points or hand it to a queue; all
-/// router I/O goes through it, so mixed transports share one code path and
-/// every byte is counted.
+/// The multi-peer connection map: **one entry per link**, with several
+/// entries allowed to share a node key. The set **owns** its links, so it is
+/// `'static` and a caller can keep it across await points or hand it to a
+/// queue; all router I/O goes through this, so mixed transports share one code
+/// path and every byte is counted.
 ///
-/// Two send calls, deliberately different (Gate 2's silent-failure audit):
-/// [`LinkSet::write`] is hard — the caller named a link it is serving, so a
-/// missing entry is a bug and says so. [`LinkSet::write_via`] is soft — a next
-/// hop the pathfinder picked may simply have no link, which Go drops silently
-/// (`router.go` `peers[key]` lookup); we report it so the caller can count it.
+/// Several links per key is ironwood's shape, and it is what makes a peering
+/// dialled both ways settle. One slot per key made `add` displace the
+/// incumbent and the node drop what came back, so each side closed the other's
+/// connection, redialled, and repeated forever. Go does not flap here: its link
+/// map is keyed by URI (`core/link.go:43-44`) and its router keeps both peers.
+///
+/// A [`LinkId`] therefore names a link and a node key no longer does, so every
+/// method that touches one link takes the id.
+///
+/// Three send calls, deliberately different (Gate 2's silent-failure audit):
+/// [`LinkSet::write`] is hard and reaches one link the caller is serving, so a
+/// missing entry is a bug and says so. [`LinkSet::write_all`] is hard and
+/// reaches **every** link to a key, which is what Go's per-key sends do
+/// (`for p := range r.peers[peerKey]`, `router.go:373`). [`LinkSet::write_via`]
+/// is soft: a next hop the pathfinder picked may have no link, which Go drops
+/// silently, and we report it so the caller can count it.
 #[derive(Default)]
 pub struct LinkSet {
     entries: Vec<LinkEntry>,
-    last_write: std::collections::HashMap<[u8; KEY_LEN], std::time::Instant>,
+    last_write: std::collections::HashMap<LinkId, std::time::Instant>,
     /// When the byte rates were last differenced. Go keeps this in the actor's
     /// own timer; we are called from the node's tick, so the set carries the
     /// phase and a caller may call as often as it likes.
@@ -295,28 +319,15 @@ impl LinkSet {
         set
     }
 
-    /// Insert (or replace, keyed by remote) a link, returning the displaced
-    /// one. The send clock survives a replace — it is the keepalive state the
-    /// next slice depends on — everything else belongs to the new link,
-    /// including its [`LinkId`]: a row that pointed at the displaced connection
-    /// must stop matching, which is the whole reason an id exists.
-    pub fn add(&mut self, conn: AnyConn) -> Option<AnyConn> {
+    /// Add a link, returning its [`LinkId`] — the handle every other method
+    /// takes. Nothing is displaced: a second link to a peer the set already
+    /// holds is a separate connection Go would keep, so keeping it is what
+    /// stops the crossed-peering flap.
+    pub fn add(&mut self, conn: AnyConn) -> LinkId {
         let peer = conn.remote_key;
-        self.last_write
-            .entry(peer)
-            .or_insert_with(std::time::Instant::now);
+        let id = conn.id;
         let now = std::time::Instant::now();
-        if let Some(slot) = self.entries.iter_mut().find(|e| e.peer == peer) {
-            let displaced = std::mem::replace(&mut slot.link, conn);
-            slot.up = now;
-            slot.rx = 0;
-            slot.tx = 0;
-            slot.lastrx = 0;
-            slot.lasttx = 0;
-            slot.rxrate = 0;
-            slot.txrate = 0;
-            return Some(displaced);
-        }
+        self.last_write.entry(id).or_insert(now);
         self.entries.push(LinkEntry {
             peer,
             link: conn,
@@ -328,26 +339,63 @@ impl LinkSet {
             rxrate: 0,
             txrate: 0,
         });
-        None
+        id
     }
 
-    /// Peer keys currently in the set (for per-link maintain loops).
+    /// Every live link's id, in insertion order. The driver reads and keeps
+    /// alive one link at a time, so this is the set's unit of work.
+    pub fn ids(&self) -> Vec<LinkId> {
+        self.entries.iter().map(|e| e.link.id).collect()
+    }
+
+    /// Distinct peer keys, each once, in first-seen order. This is the node-key
+    /// view: per-key state (a tree peer, a bloom filter) belongs to the key
+    /// while the links behind it are separate.
     pub fn peers(&self) -> Vec<[u8; KEY_LEN]> {
-        self.entries.iter().map(|e| e.peer).collect()
+        let mut out: Vec<[u8; KEY_LEN]> = Vec::new();
+        for e in &self.entries {
+            if !out.contains(&e.peer) {
+                out.push(e.peer);
+            }
+        }
+        out
+    }
+
+    /// Every link to one node key, in insertion order.
+    pub fn links_to(&self, peer: &[u8; KEY_LEN]) -> Vec<LinkId> {
+        self.entries
+            .iter()
+            .filter(|e| &e.peer == peer)
+            .map(|e| e.link.id)
+            .collect()
+    }
+
+    /// The node key behind a link, for a caller holding only an id.
+    pub fn peer_of(&self, id: LinkId) -> Option<[u8; KEY_LEN]> {
+        self.entries
+            .iter()
+            .find(|e| e.link.id == id)
+            .map(|e| e.peer)
+    }
+
+    /// True when at least one link to this key is up. Go's `r.peers[parent]`
+    /// existence test, which asks about a node rather than a connection.
+    pub fn has_peer(&self, peer: &[u8; KEY_LEN]) -> bool {
+        self.entries.iter().any(|e| &e.peer == peer)
     }
 
     /// Direct access to one link, for I/O the set itself does not mediate.
-    pub fn get(&mut self, peer: &[u8; KEY_LEN]) -> Option<&mut AnyConn> {
+    pub fn get(&mut self, id: LinkId) -> Option<&mut AnyConn> {
         self.entries
             .iter_mut()
-            .find(|e| &e.peer == peer)
+            .find(|e| e.link.id == id)
             .map(|e| &mut e.link)
     }
 
-    /// Take a link out of the set (dead links, or handing ownership back to
+    /// Take one link out of the set (dead links, or handing ownership back to
     /// the caller). Send clocks for remaining links are untouched.
-    pub fn remove(&mut self, peer: &[u8; KEY_LEN]) -> Option<AnyConn> {
-        let at = self.entries.iter().position(|e| &e.peer == peer)?;
+    pub fn remove(&mut self, id: LinkId) -> Option<AnyConn> {
+        let at = self.entries.iter().position(|e| e.link.id == id)?;
         Some(self.entries.remove(at).link)
     }
 
@@ -360,11 +408,11 @@ impl LinkSet {
         self.entries.len()
     }
 
-    /// Counters for one *identified* link, or `None` once that connection is no
-    /// longer live. Keyed by [`LinkId`] rather than by node key on purpose: two
-    /// links to one node are one slot in this set, and a caller that asks by key
-    /// gets the other link's direction and counters — which is how Slice 7 came
-    /// to report an accepted link's `inbound: true` against a dial URI.
+    /// Counters for one identified link, or `None` once that connection is no
+    /// longer live. Keyed by [`LinkId`] because two links to one node are two
+    /// entries: a caller asking by key would get the other link's direction and
+    /// counters, which is how Slice 7 came to report an accepted link's
+    /// `inbound: true` against a dial URI.
     pub fn stats(&self, id: LinkId) -> Option<LinkStats> {
         self.entries
             .iter()
@@ -402,13 +450,13 @@ impl LinkSet {
         }
     }
 
-    /// Hard send: `target` is a link the caller believes it is serving, so a
-    /// missing entry is [`Error::NoLink`] rather than a silent drop. Stamps
-    /// the send time, which drives Go-style lazy keepalives: a keepalive goes
-    /// out only after a full idle tick with no sends.
+    /// Hard send to one link the caller is serving. A missing entry is
+    /// [`Error::NoLink`] rather than a silent drop. Stamps the send time, which
+    /// drives Go-style lazy keepalives: a keepalive goes out only after a full
+    /// idle tick with no sends.
     pub async fn write(
         &mut self,
-        target: [u8; KEY_LEN],
+        target: LinkId,
         ftype: FrameType,
         payload: &[u8],
     ) -> Result<(), Error> {
@@ -419,13 +467,33 @@ impl LinkSet {
         }
     }
 
-    /// Soft send: `Ok(false)` means "no link to that next hop" — normal while
-    /// the DHT converges, and the frame was discarded. The caller counts it
+    /// Hard send to **every** link to a node key, because that is what Go's
+    /// per-key sends do: announces fan out over `r.peers[peerKey]`
+    /// (`router.go:373`) and `SigReq` over `r.peers[pk]` (`router.go:193`).
+    /// A key with no live link is [`Error::NoLink`].
+    pub async fn write_all(
+        &mut self,
+        peer: [u8; KEY_LEN],
+        ftype: FrameType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let targets = self.links_to(&peer);
+        if targets.is_empty() {
+            return Err(Error::NoLink);
+        }
+        for id in targets {
+            self.write(id, ftype, payload).await?;
+        }
+        Ok(())
+    }
+
+    /// Soft send to a next hop we may have no link for: `Ok(false)` means the
+    /// link is gone and the frame was discarded. The caller counts it
     /// (`Router::dropped_no_link`), because a drop nobody can see is the bug
     /// this split exists to fix.
     pub async fn write_via(
         &mut self,
-        target: [u8; KEY_LEN],
+        target: LinkId,
         ftype: FrameType,
         payload: &[u8],
     ) -> Result<bool, Error> {
@@ -434,11 +502,11 @@ impl LinkSet {
 
     async fn send(
         &mut self,
-        target: [u8; KEY_LEN],
+        target: LinkId,
         ftype: FrameType,
         payload: &[u8],
     ) -> Result<bool, Error> {
-        let Some(at) = self.entries.iter().position(|e| e.peer == target) else {
+        let Some(at) = self.entries.iter().position(|e| e.link.id == target) else {
             return Ok(false);
         };
         match self.entries[at].link.write_frame(ftype, payload).await {
@@ -461,26 +529,23 @@ impl LinkSet {
     }
 
     /// The set's only read path, so `rx` cannot be bypassed. Times out and
-    /// errors exactly like [`Link::read_frame`] on the inner link; no entry
-    /// for `peer` is [`Error::NoLink`].
-    pub async fn read_frame(
-        &mut self,
-        peer: &[u8; KEY_LEN],
-    ) -> Result<(FrameType, Vec<u8>), Error> {
+    /// errors exactly like [`Link::read_frame`] on the inner link; no entry for
+    /// `id` is [`Error::NoLink`].
+    pub async fn read_frame(&mut self, id: LinkId) -> Result<(FrameType, Vec<u8>), Error> {
         let entry = self
             .entries
             .iter_mut()
-            .find(|e| &e.peer == peer)
+            .find(|e| e.link.id == id)
             .ok_or(Error::NoLink)?;
         let (ftype, payload) = entry.link.read_frame().await?;
         entry.rx += frame::wire_len(payload.len());
         Ok((ftype, payload))
     }
 
-    /// Time since the last frame sent to `peer` (zero for unknown links).
-    pub fn idle_for(&self, peer: &[u8; KEY_LEN]) -> Duration {
+    /// Time since the last frame sent to one link (zero for unknown links).
+    pub fn idle_for(&self, id: LinkId) -> Duration {
         self.last_write
-            .get(peer)
+            .get(&id)
             .map(|t| t.elapsed())
             .unwrap_or(Duration::ZERO)
     }
@@ -1070,7 +1135,12 @@ mod tests {
         // The two send calls disagree on purpose (Gate 2's silent-failure
         // audit): naming a link we believe we serve is a bug, picking a next
         // hop that has no link is normal.
-        let absent = [7u8; KEY_LEN];
+        //
+        // Both are addressed by `LinkId`, so "absent" has to be an id the set
+        // never issued. A freshly minted one is that, and a stale one is too:
+        // a removed link's id stops matching, which is the property the client's
+        // `LinkId`-keyed rows depend on.
+        let absent = LinkId::next();
         let mut links = LinkSet::new();
         assert!(
             matches!(
@@ -1087,8 +1157,15 @@ mod tests {
             "soft send must report the drop without failing"
         );
         assert!(
-            matches!(links.read_frame(&absent).await, Err(Error::NoLink)),
+            matches!(links.read_frame(absent).await, Err(Error::NoLink)),
             "the set's only read path reports a missing link too"
+        );
+        assert!(
+            links
+                .write_all([7u8; KEY_LEN], FrameType::KeepAlive, &[])
+                .await
+                .is_err(),
+            "a per-key send to a key with no link is the same failure"
         );
         assert!(
             links.is_empty(),
@@ -1137,7 +1214,7 @@ mod tests {
             conn.remote_addr, None,
             "a dialled link is named by its URI, not its socket"
         );
-        let peer = conn.remote_key;
+        let _peer = conn.remote_key;
         let any = AnyConn::new(conn);
         let id = any.id;
         let mut links = LinkSet::single(any);
@@ -1157,27 +1234,32 @@ mod tests {
         // `add` takes it again, while the send clock — the keepalive state the
         // next slice's queue depends on — survives. The id survives too, because
         // it is the same connection.
-        let idle_before = links.idle_for(&peer);
-        let back = links.remove(&peer).unwrap();
+        let idle_before = links.idle_for(id);
+        let back = links.remove(id).unwrap();
         assert!(!back.inbound, "handed-back link keeps its direction");
         assert_eq!(back.id, id, "an id belongs to a connection, not a slot");
         assert!(links.is_empty() && links.stats(id).is_none());
-        assert!(links.add(back).is_none(), "fresh slot displaces nothing");
+        let readded = links.add(back);
+        assert_eq!(readded, id, "the same connection, so the same id");
         assert_eq!(links.len(), 1);
         assert!(!links.stats(id).unwrap().inbound);
         assert!(
-            links.idle_for(&peer) >= idle_before,
+            links.idle_for(id) >= idle_before,
             "re-adding must not reset the send clock"
         );
         assert!(server.await.unwrap(), "erased inbound link reports inbound");
     }
 
     #[tokio::test]
-    async fn link_identity_stops_matching_when_displaced() {
-        // The one-link-per-node-key slot is the reason a `getPeers` row may not
-        // ask "is any link to this key up": when an accepted link replaces the
-        // dial to the same node, the dial's row must read as down, not borrow
-        // the newcomer's counters and direction.
+    async fn two_links_to_one_key_both_stay_live() {
+        // The set holds one entry per **link**, not one slot per node key
+        // (ironwood's `peers map[publicKey]map[*peer]struct{}`, `peers.go:32`).
+        // A second connection to the same node is therefore not a displacement:
+        // it is a second peer, and both must keep reporting their own counters.
+        //
+        // This used to be the crossed-peering bug — one slot per key meant the
+        // second link displaced the first and the node dropped the one that came
+        // back, so two nodes that dialled each other traded closures forever.
         let a_sk = SigningKey::from_bytes(&[51; 32]);
         let b_sk = SigningKey::from_bytes(&[52; 32]);
         let listener = listen("tcp://127.0.0.1:0").await.unwrap();
@@ -1196,25 +1278,89 @@ mod tests {
             .unwrap();
         let peer = dial_one.remote_key;
         let mut links = LinkSet::single(AnyConn::new(dial_one));
-        // A second connection to the same node key takes the slot.
+        let old_id = links.ids()[0];
+        // A second connection to the same node key joins the set.
         let dial_two = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
             .await
             .unwrap();
-        let newcomer = AnyConn::new(dial_two);
-        let new_id = newcomer.id;
-        let displaced = links.add(newcomer).expect("the first link is displaced");
-        let old_id = displaced.id;
-        assert_eq!(links.len(), 1, "one slot per node key");
-        assert_eq!(links.peers(), vec![peer]);
+        let new_id = links.add(AnyConn::new(dial_two));
+        assert_ne!(new_id, old_id, "each connection mints its own id");
+        assert_eq!(links.len(), 2, "two links, one entry each");
+        assert_eq!(
+            links.peers(),
+            vec![peer],
+            "but one node key: the per-key view is not duplicated"
+        );
+        assert_eq!(
+            links.links_to(&peer),
+            vec![old_id, new_id],
+            "both links answer to the key, in insertion order"
+        );
+        assert!(
+            links.stats(old_id).is_some() && links.stats(new_id).is_some(),
+            "both connections report, and each reports its own counters"
+        );
+        assert!(links.has_peer(&peer));
+
+        // Dropping one leaves the other, and the dropped one's id stops
+        // matching — which is what a `getPeers` row keyed by id depends on.
+        assert!(links.remove(old_id).is_some());
         assert!(
             links.stats(old_id).is_none(),
-            "the displaced link's id must stop matching"
+            "a removed link's id must stop matching"
         );
         assert!(
             links.stats(new_id).is_some(),
-            "the link in the slot is the one that reports"
+            "the surviving link is untouched"
         );
-        drop(displaced);
+        assert!(links.has_peer(&peer), "the key still has a live link");
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn a_removed_links_id_stops_matching_the_key() {
+        // The other half of the same contract: `has_peer` is the liveness
+        // question a `getPeers` row must not ask, because it answers for the
+        // *node*. Once the only link to a key is gone, the key is gone too.
+        let a_sk = SigningKey::from_bytes(&[56; 32]);
+        let b_sk = SigningKey::from_bytes(&[57; 32]);
+        let listener = listen("tcp://127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // One accept per connection the client will make, each held open
+            // long enough for the client to finish with it.
+            for _ in 0..2 {
+                let conn = accept(&listener, &b_sk, &LinkOptions::default())
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                drop(conn);
+            }
+        });
+        // Two real connections to the same node, so the key has two links.
+        let first = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let peer = first.remote_key;
+        let mut links = LinkSet::single(AnyConn::new(first));
+        let second = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
+            .await
+            .unwrap();
+        let second_id = links.add(AnyConn::new(second));
+        assert!(links.has_peer(&peer), "the key has two live links");
+        assert!(links.remove(second_id).is_some(), "one of the two goes");
+        assert!(
+            links.has_peer(&peer),
+            "and the key still has the other, so asking about the key is not \
+             the same question as asking about a row's link"
+        );
+        assert!(
+            links.stats(second_id).is_none(),
+            "its counters are gone too"
+        );
+        let live = links.ids()[0];
+        assert!(links.remove(live).is_some());
+        assert!(!links.has_peer(&peer), "now the key has none");
         let _ = server.await;
     }
 
@@ -1232,12 +1378,12 @@ mod tests {
             let conn = accept(&listener, &b_sk, &LinkOptions::default())
                 .await
                 .unwrap();
-            let peer = conn.remote_key;
+            let _peer = conn.remote_key;
             let any = AnyConn::new(conn);
             let id = any.id;
             let mut links = LinkSet::single(any);
             for _ in 0..4 {
-                links.read_frame(&peer).await.unwrap();
+                links.read_frame(id).await.unwrap();
             }
             links.update_rates();
             links.stats(id).unwrap().rx_rate
@@ -1245,13 +1391,13 @@ mod tests {
         let conn = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
             .await
             .unwrap();
-        let peer = conn.remote_key;
+        let _peer = conn.remote_key;
         let any = AnyConn::new(conn);
         let id = any.id;
         let mut links = LinkSet::single(any);
         // Four frames of three bytes: five wire bytes each, twenty in total.
         for _ in 0..4 {
-            links.write(peer, FrameType::SigReq, &[0; 3]).await.unwrap();
+            links.write(id, FrameType::SigReq, &[0; 3]).await.unwrap();
         }
         links.update_rates();
         let first = links.stats(id).unwrap();
@@ -1291,22 +1437,22 @@ mod tests {
             let conn = accept(&listener, &b_sk, &LinkOptions::default())
                 .await
                 .unwrap();
-            let peer = conn.remote_key;
+            let _peer = conn.remote_key;
             let any = AnyConn::new(conn);
             let id = any.id;
             let mut links = LinkSet::single(any);
-            let (ftype, _payload) = links.read_frame(&peer).await.unwrap();
+            let (ftype, _payload) = links.read_frame(id).await.unwrap();
             (ftype, links.stats(id).unwrap().rx_bytes)
         });
         let conn = dial(&format!("tcp://{addr}"), &a_sk, &LinkOptions::default())
             .await
             .unwrap();
-        let peer = conn.remote_key;
+        let _peer = conn.remote_key;
         let any = AnyConn::new(conn);
         let id = any.id;
         let mut links = LinkSet::single(any);
         links
-            .write(peer, FrameType::SigReq, &[1, 2, 3])
+            .write(id, FrameType::SigReq, &[1, 2, 3])
             .await
             .unwrap();
         let sent = links.stats(id).unwrap().tx_bytes;
@@ -1376,23 +1522,25 @@ mod tests {
         let key = [3u8; KEY_LEN];
         let (mine, theirs) = tokio::io::duplex(64);
         drop(theirs);
-        let mut links = LinkSet::single(AnyConn::new(PeerConn::<Mem> {
+        let conn = AnyConn::new(PeerConn::<Mem> {
             remote_key: key,
             priority: 0,
             kind: crate::peer::PeerKind::Go,
             inbound: false,
             remote_addr: None,
             stream: mine,
-        }));
+        });
+        let id = conn.id;
+        let mut links = LinkSet::single(conn);
         let err = links
-            .write(key, FrameType::KeepAlive, &[7u8; 512])
+            .write(id, FrameType::KeepAlive, &[7u8; 512])
             .await
             .expect_err("a write to a closed link must report the io error");
         assert!(matches!(err, Error::Io(_)), "got {err:?}");
         assert!(links.is_empty(), "the failing link is retired, not kept");
         assert!(
             matches!(
-                links.write(key, FrameType::KeepAlive, &[]).await,
+                links.write(id, FrameType::KeepAlive, &[]).await,
                 Err(Error::NoLink)
             ),
             "the key is gone, so a later send reports it as missing"

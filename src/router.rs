@@ -106,9 +106,10 @@ impl Router {
     /// Gates roots-only behavior fixes; defaults to Go-exact.
     pub fn peer_kind(&self, peer: &[u8; KEY_LEN]) -> crate::peer::PeerKind {
         self.tree
-            .peers
-            .get(peer)
-            .map(|p| p.kind.clone())
+            .links
+            .values()
+            .find(|l| &l.peer == peer)
+            .map(|l| l.kind.clone())
             .unwrap_or(crate::peer::PeerKind::Go)
     }
 
@@ -124,13 +125,48 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::frame::FrameType;
-    use crate::link::{LinkOptions, LinkSet, Tcp};
-    use crate::peer::{PeerKind, PeerState};
+    use crate::link::{LinkId, LinkOptions, LinkSet, Tcp};
+    use crate::peer::{LinkState, PeerKind, PeerState};
     use crate::tree::{Info, SigReq, SigRes};
     use ed25519_dalek::Signer;
 
-    #[test]
-    fn query_snapshots_read_state() {
+    /// In-memory transport, so a test can mint a [`LinkId`] with no socket at
+    /// all: the id is minted inside `AnyConn::new` and `LinkId` has no public
+    /// constructor (`link.rs:153-162`). Same shape as the one in `link.rs`'s
+    /// own tests.
+    #[derive(Clone)]
+    struct Mem;
+
+    impl crate::link::Transport for Mem {
+        type Stream = tokio::io::DuplexStream;
+
+        async fn dial(
+            _addr: &str,
+            _timeout: Duration,
+        ) -> Result<Self::Stream, crate::error::Error> {
+            unreachable!("test links are assembled by hand")
+        }
+    }
+
+    /// A link handle no live link is filed under: builds a link, keeps only
+    /// its id, and drops the connection. The far half of the `duplex` pair is
+    /// dropped with it, so nothing addressed here can carry a frame.
+    fn dangling_link(key: [u8; KEY_LEN]) -> LinkId {
+        let (mine, theirs) = tokio::io::duplex(8);
+        drop(theirs);
+        crate::link::AnyConn::new(crate::link::PeerConn::<Mem> {
+            remote_key: key,
+            priority: 0,
+            kind: PeerKind::Go,
+            inbound: false,
+            remote_addr: None,
+            stream: mine,
+        })
+        .id
+    }
+
+    #[tokio::test]
+    async fn query_snapshots_read_state() {
         // get_paths/get_sessions/link_peers/tree_entries are pure views:
         // empty on a fresh router, sorted and complete once filled.
         let sk = SigningKey::from_bytes(&[0x77; 32]);
@@ -146,6 +182,15 @@ mod tests {
             PeerState {
                 port: 3,
                 req: crate::tree::SigReq { seq: 1, nonce: 1 },
+            },
+        );
+        // The per-connection half of that peer's state lives in its own book
+        // (`tree.links`), keyed by the link rather than the node key.
+        let kb_link = dangling_link(kb);
+        router.tree.links.insert(
+            kb_link,
+            LinkState {
+                peer: kb,
                 responded: true,
                 lag: Duration::from_millis(12),
                 sent_at: None,
@@ -167,6 +212,7 @@ mod tests {
         );
         let peers = router.link_peers();
         assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].id, kb_link, "the row names the link it describes");
         assert_eq!(peers[0].key, kb);
         assert_eq!(peers[0].port, 3);
         assert!(peers[0].responded);
@@ -183,7 +229,7 @@ mod tests {
         // `peers[key]` lookup), which is how a broken next hop hid for slices.
         let mut router = Router::new(SigningKey::from_bytes(&[5; 32]));
         let mut links = LinkSet::new();
-        let absent = [9u8; KEY_LEN];
+        let absent = dangling_link([9u8; KEY_LEN]);
         for _ in 0..2 {
             router
                 .write_via(&mut links, absent, FrameType::KeepAlive, &[])
@@ -227,6 +273,7 @@ mod tests {
             remote_addr: None,
             stream: sock,
         }));
+        let id = *links.ids().first().expect("the one link just added");
         let io = crate::error::Error::Io(std::io::Error::from_raw_os_error(104));
         assert!(
             !Router::fatal_link_error(&links, &io),
@@ -240,7 +287,7 @@ mod tests {
             Router::fatal_link_error(&links, &crate::error::Error::Timeout),
             "a non-link error stays fatal"
         );
-        drop(links.remove(&key));
+        drop(links.remove(id));
         assert!(
             Router::fatal_link_error(&links, &io),
             "an empty set is fatal: the single-link `serve` contract"
@@ -268,7 +315,7 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &s1_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let conn = crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
@@ -277,8 +324,10 @@ mod tests {
                 stream: sock,
             };
             let mut router = Router::new(s1_sk);
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            let mut conn = AnyConn::new(conn);
+            let id = conn.id;
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
@@ -286,20 +335,22 @@ mod tests {
         let ws_listener = crate::ws::ws_listen("ws://127.0.0.1:0").await.unwrap();
         let ws_addr = ws_listener.local_addr().unwrap();
         let srv2 = tokio::spawn(async move {
-            let mut conn = crate::ws::ws_accept(&ws_listener, &s2_sk, &LinkOptions::default())
+            let conn = crate::ws::ws_accept(&ws_listener, &s2_sk, &LinkOptions::default())
                 .await
                 .unwrap();
             let key = conn.remote_key;
             let mut router = Router::new(s2_sk);
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            let mut conn = AnyConn::new(conn);
+            let id = conn.id;
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
                 .await;
         });
 
         let tcp_uri = format!("tcp://{tcp_addr}");
-        let mut tcp_conn = crate::link::dial(&tcp_uri, &c_sk, &LinkOptions::default())
+        let tcp_conn = crate::link::dial(&tcp_uri, &c_sk, &LinkOptions::default())
             .await
             .unwrap();
         let tcp_peer = tcp_conn.remote_key;
@@ -308,15 +359,20 @@ mod tests {
             .await
             .unwrap();
         let ws_peer = ws_conn.remote_key;
+        let mut tcp_conn = AnyConn::new(tcp_conn);
         let mut ws_conn = AnyConn::new(ws_conn);
+        let (tcp_id, ws_id) = (tcp_conn.id, ws_conn.id);
 
         let mut router = Router::new(c_sk);
-        router.register(&mut tcp_conn, tcp_peer).await.unwrap();
-        router.register(&mut ws_conn, ws_peer).await.unwrap();
+        router
+            .register(&mut tcp_conn, tcp_peer, tcp_id)
+            .await
+            .unwrap();
+        router.register(&mut ws_conn, ws_peer, ws_id).await.unwrap();
 
         // One router serves both links through a single set (the 10b
         // shape); TCP stays concrete, WS arrives type-erased.
-        let mut links = LinkSet::single(crate::link::AnyConn::new(tcp_conn));
+        let mut links = LinkSet::single(tcp_conn);
         links.add(ws_conn);
         router
             .serve_links(&mut links, Some(Duration::from_secs(8)), &mut Vec::new())
@@ -327,7 +383,7 @@ mod tests {
 
         // Full stack over the TCP leg through the same set interface.
         router
-            .session_send(&mut links, tcp_peer, s1_pub, vec![0])
+            .session_send(&mut links, s1_pub, vec![0])
             .await
             .unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -335,14 +391,13 @@ mod tests {
             if router.has_session(&s1_pub) {
                 break;
             }
-            router.maintain(&mut links, tcp_peer).await.unwrap();
-            router.maintain(&mut links, ws_peer).await.unwrap();
-            for peer in [tcp_peer, ws_peer] {
+            router.maintain(&mut links).await.unwrap();
+            for id in [tcp_id, ws_id] {
                 if let Ok(Ok((ftype, payload))) =
-                    tokio::time::timeout(Duration::from_millis(100), links.read_frame(&peer)).await
+                    tokio::time::timeout(Duration::from_millis(100), links.read_frame(id)).await
                 {
                     router
-                        .dispatch_frame(&mut links, peer, ftype, &payload)
+                        .dispatch_frame(&mut links, id, ftype, &payload)
                         .await
                         .unwrap();
                 }
@@ -366,7 +421,7 @@ mod tests {
         let (key, _, kind) = crate::link::run_handshake(&mut sock, &sk, &opts, true)
             .await
             .unwrap();
-        let mut conn = crate::link::PeerConn::<Tcp> {
+        let conn = crate::link::PeerConn::<Tcp> {
             remote_key: key,
             priority: 0,
             kind,
@@ -375,13 +430,15 @@ mod tests {
             stream: sock,
         };
         let mut router = Router::new(sk);
-        router.register(&mut conn, key).await.unwrap();
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
+        router.register(&mut conn, key, id).await.unwrap();
         if let Some(d) = die_after {
             // Die abruptly: no FIN handshake, just drop the socket.
             tokio::time::sleep(d).await;
             return;
         }
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        let mut links = LinkSet::single(conn);
         let _ = router
             .serve(&mut links, Some(Duration::from_secs(15)), &mut Vec::new())
             .await;
@@ -418,19 +475,22 @@ mod tests {
         };
         tokio::spawn(run_server(l1, s1_sk, die(1)));
         tokio::spawn(run_server(l2, s2_sk, die(2)));
-        let mut c1 = crate::link::dial(&format!("tcp://{a1}"), &c_sk, &LinkOptions::default())
+        let c1 = crate::link::dial(&format!("tcp://{a1}"), &c_sk, &LinkOptions::default())
             .await
             .unwrap();
         let p1 = c1.remote_key;
-        let mut c2 = crate::link::dial(&format!("tcp://{a2}"), &c_sk, &LinkOptions::default())
+        let c2 = crate::link::dial(&format!("tcp://{a2}"), &c_sk, &LinkOptions::default())
             .await
             .unwrap();
         let p2 = c2.remote_key;
         let mut router = Router::new(c_sk);
-        router.register(&mut c1, p1).await.unwrap();
-        router.register(&mut c2, p2).await.unwrap();
-        let mut links = LinkSet::single(crate::link::AnyConn::new(c1));
-        links.add(crate::link::AnyConn::new(c2));
+        let mut c1 = crate::link::AnyConn::new(c1);
+        let mut c2 = crate::link::AnyConn::new(c2);
+        let (c1_id, c2_id) = (c1.id, c2.id);
+        router.register(&mut c1, p1, c1_id).await.unwrap();
+        router.register(&mut c2, p2, c2_id).await.unwrap();
+        let mut links = LinkSet::single(c1);
+        links.add(c2);
         (router, links, p1, p2)
     }
 
@@ -489,7 +549,14 @@ mod tests {
         let dead = router.parent().expect("parented onto one of the links");
         assert!(dead == p1 || dead == p2, "parent is a live link");
         let live = if dead == p1 { p2 } else { p1 };
-        drop(links.remove(&dead).expect("parent link was in the set"));
+        // One link per key here, so the parent's key names exactly one link.
+        let dead_links = links.links_to(&dead);
+        assert_eq!(dead_links.len(), 1, "one link to the parent");
+        drop(
+            links
+                .remove(dead_links[0])
+                .expect("parent link was in the set"),
+        );
         router
             .serve_links(&mut links, Some(Duration::from_secs(2)), &mut Vec::new())
             .await
@@ -517,12 +584,21 @@ mod tests {
         let (mut router, mut links, p1, p2) = client_over_two_links(0).await;
         converge(&mut router, &mut links, (p1, p2)).await;
         let dead = router.parent().expect("parented onto one of the links");
-        for k in links.peers() {
-            drop(links.remove(&k));
+        // Retire the links the way the driver does on a dead one
+        // (`driver.rs:480-481`): the set AND `tree.links` together, which is
+        // what makes `send_all_reqs` see no live peer. `tree.peers` and
+        // `bloom.on_tree` are deliberately left behind — the divergence.
+        for id in links.ids() {
+            drop(links.remove(id));
+            router.tree.links.remove(&id);
         }
         assert!(
             router.tree.peers.contains_key(&dead),
             "the book outlives the link: that is the divergence being survived"
+        );
+        assert!(
+            !router.tree.links.values().any(|l| l.peer == dead),
+            "the per-link book does NOT outlive the link: `fix` asks it"
         );
         assert!(
             router.bloom.on_tree.contains_key(&dead),
@@ -623,21 +699,14 @@ mod tests {
             remote_addr: None,
             stream: sock,
         }));
+        let live_id = *links.ids().first().expect("the one live link");
         for pk in [l_pub, d_pub] {
-            router.tree.peers.insert(
-                pk,
-                PeerState {
-                    port: 1,
-                    req: open,
-                    responded: true,
-                    lag: Duration::from_millis(10),
-                    sent_at: None,
-                    srrt: None,
-                    prio: 0,
-                    order: 0,
-                    kind: PeerKind::Go,
-                },
-            );
+            // The per-key book, which outlives links: both keys are named
+            // here even though only `live` is reachable.
+            router
+                .tree
+                .peers
+                .insert(pk, PeerState { port: 1, req: open });
             // What `handle_response` would have kept: our own request, signed
             // by the peer that answered it.
             let signer = if pk == l_pub { &live } else { &dead };
@@ -646,10 +715,26 @@ mod tests {
                 .responses
                 .insert(pk, SigRes::seal(open, 5, &c_pub, signer, &pk));
         }
+        // The per-link book, which does NOT outlive links (`driver.rs:481`
+        // prunes it on eviction): only `live` has one, which is exactly what
+        // `fix` asks about.
+        router.tree.links.insert(
+            live_id,
+            LinkState {
+                peer: l_pub,
+                responded: true,
+                lag: Duration::from_millis(10),
+                sent_at: None,
+                srrt: None,
+                prio: 0,
+                order: 0,
+                kind: PeerKind::Go,
+            },
+        );
         assert_eq!(router.parent(), Some(d_pub), "parented onto `dead`");
         assert!(!links.peers().contains(&d_pub), "`dead` has no link");
         router
-            .fix(&mut links, l_pub)
+            .fix(&mut links)
             .await
             .expect("the live peer is reachable");
         assert_eq!(
@@ -675,34 +760,37 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let mut conn = crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
                 inbound: true,
                 remote_addr: None,
                 stream: sock,
-            };
+            });
+            let id = conn.id;
             let mut router = Router::new(b_sk);
             // Either side may close first at the deadline; convergence is
             // what we assert below, not a clean shutdown.
             let mut no_out = Vec::new();
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
                 .await;
             router
         });
         let uri = format!("tcp://{addr}");
-        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+        let conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer_key = conn.remote_key;
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
         let mut router = Router::new(a_sk);
         let mut no_out = Vec::new();
-        router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        router.register(&mut conn, peer_key, id).await.unwrap();
+        let mut links = LinkSet::single(conn);
         let _ = router
             .serve(&mut links, Some(Duration::from_millis(2600)), &mut no_out)
             .await;
@@ -733,33 +821,36 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let mut conn = crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
                 inbound: true,
                 remote_addr: None,
                 stream: sock,
-            };
+            });
+            let id = conn.id;
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(10)), &mut no_out)
                 .await;
             router
         });
         let uri = format!("tcp://{addr}");
-        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+        let conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer_key = conn.remote_key;
         assert_eq!(peer_key, b_pub);
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
         let mut router = Router::new(a_sk);
-        router.register(&mut conn, peer_key).await.unwrap();
+        router.register(&mut conn, peer_key, id).await.unwrap();
         let mut outgoing = vec![(b_pub, b"ping-0".to_vec())];
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        let mut links = LinkSet::single(conn);
         let _ = router
             .serve(&mut links, Some(Duration::from_secs(10)), &mut outgoing)
             .await;
@@ -794,42 +885,45 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let mut conn = crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
                 inbound: true,
                 remote_addr: None,
                 stream: sock,
-            };
+            });
+            let id = conn.id;
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
             router
         });
         let uri = format!("tcp://{addr}");
-        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+        let conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer_key = conn.remote_key;
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
         let mut router = Router::new(a_sk);
-        router.register(&mut conn, peer_key).await.unwrap();
+        router.register(&mut conn, peer_key, id).await.unwrap();
         // Converge first (mirrors serve slices): maintain + dispatch.
         // The set lives across converge and resolve so send clocks persist.
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        let mut links = LinkSet::single(conn);
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
-            router.maintain(&mut links, peer_key).await.unwrap();
+            router.maintain(&mut links).await.unwrap();
             if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
             {
                 router.frames[ftype as usize] += 1;
                 router
-                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .dispatch_frame(&mut links, id, ftype, &payload)
                     .await
                     .unwrap();
             }
@@ -839,7 +933,7 @@ mod tests {
         }
         assert!(router.parent().is_some(), "A converged");
         let found = router
-            .resolve(&mut links, peer_key, &b_addr, Duration::from_secs(5))
+            .resolve(&mut links, id, &b_addr, Duration::from_secs(5))
             .await
             .expect("resolve B addr");
         assert_eq!(found, b_pub);
@@ -867,40 +961,43 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let mut conn = crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
                 inbound: true,
                 remote_addr: None,
                 stream: sock,
-            };
+            });
+            let id = conn.id;
             let mut router = Router::new(b_sk);
             let mut no_out = Vec::new();
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             let _ = router
                 .serve(&mut links, Some(Duration::from_secs(8)), &mut no_out)
                 .await;
             router
         });
         let uri = format!("tcp://{addr}");
-        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+        let conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer_key = conn.remote_key;
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
         let mut router = Router::new(a_sk);
-        router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        router.register(&mut conn, peer_key, id).await.unwrap();
+        let mut links = LinkSet::single(conn);
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
-            router.maintain(&mut links, peer_key).await.unwrap();
+            router.maintain(&mut links).await.unwrap();
             if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
             {
                 router.frames[ftype as usize] += 1;
                 router
-                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .dispatch_frame(&mut links, id, ftype, &payload)
                     .await
                     .unwrap();
             }
@@ -910,7 +1007,7 @@ mod tests {
         }
         assert!(router.parent().is_some(), "A converged");
         let found = router
-            .resolve(&mut links, peer_key, &target, Duration::from_secs(10))
+            .resolve(&mut links, id, &target, Duration::from_secs(10))
             .await;
         let found = found.expect("resolve B subnet addr");
         assert_eq!(found, b_pub);
@@ -940,26 +1037,27 @@ mod tests {
             let (key, _, kind) = crate::link::run_handshake(&mut sock, &b_sk, &opts, true)
                 .await
                 .unwrap();
-            let mut conn = crate::link::PeerConn::<Tcp> {
+            let mut conn = crate::link::AnyConn::new(crate::link::PeerConn::<Tcp> {
                 remote_key: key,
                 priority: 0,
                 kind,
                 inbound: true,
                 remote_addr: None,
                 stream: sock,
-            };
+            });
+            let id = conn.id;
             let mut router = Router::new(b_sk);
-            router.register(&mut conn, key).await.unwrap();
-            let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+            router.register(&mut conn, key, id).await.unwrap();
+            let mut links = LinkSet::single(conn);
             // Converge, then send FIRST (simultaneously with A below).
             let end = tokio::time::Instant::now() + Duration::from_secs(4);
             while tokio::time::Instant::now() < end {
-                router.maintain(&mut links, key).await.unwrap();
+                router.maintain(&mut links).await.unwrap();
                 if let Ok(Ok((ftype, payload))) =
-                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
                 {
                     router
-                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .dispatch_frame(&mut links, id, ftype, &payload)
                         .await
                         .unwrap();
                 }
@@ -968,25 +1066,25 @@ mod tests {
                 }
             }
             router
-                .session_send(&mut links, key, a_pub, b"from-B".to_vec())
+                .session_send(&mut links, a_pub, b"from-B".to_vec())
                 .await
                 .unwrap();
             // First flight may drop (see test doc); pump past it, then
             // assert the second flight lands.
             let end = tokio::time::Instant::now() + Duration::from_secs(8);
             while tokio::time::Instant::now() < end {
-                router.maintain(&mut links, key).await.unwrap();
+                router.maintain(&mut links).await.unwrap();
                 if let Ok(Ok((ftype, payload))) =
-                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
                 {
                     router
-                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .dispatch_frame(&mut links, id, ftype, &payload)
                         .await
                         .unwrap();
                 }
             }
             router
-                .session_send(&mut links, key, a_pub, b"from-B2".to_vec())
+                .session_send(&mut links, a_pub, b"from-B2".to_vec())
                 .await
                 .unwrap();
             let end = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -998,12 +1096,12 @@ mod tests {
                 {
                     break;
                 }
-                router.maintain(&mut links, key).await.unwrap();
+                router.maintain(&mut links).await.unwrap();
                 if let Ok(Ok((ftype, payload))) =
-                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(&key)).await
+                    tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
                 {
                     router
-                        .dispatch_frame(&mut links, key, ftype, &payload)
+                        .dispatch_frame(&mut links, id, ftype, &payload)
                         .await
                         .unwrap();
                 }
@@ -1011,21 +1109,23 @@ mod tests {
             router
         });
         let uri = format!("tcp://{addr}");
-        let mut conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
+        let conn = crate::link::dial(&uri, &a_sk, &LinkOptions::default())
             .await
             .unwrap();
         let peer_key = conn.remote_key;
+        let mut conn = crate::link::AnyConn::new(conn);
+        let id = conn.id;
         let mut router = Router::new(a_sk);
-        router.register(&mut conn, peer_key).await.unwrap();
-        let mut links = LinkSet::single(crate::link::AnyConn::new(conn));
+        router.register(&mut conn, peer_key, id).await.unwrap();
+        let mut links = LinkSet::single(conn);
         let end = tokio::time::Instant::now() + Duration::from_secs(4);
         while tokio::time::Instant::now() < end {
-            router.maintain(&mut links, peer_key).await.unwrap();
+            router.maintain(&mut links).await.unwrap();
             if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
             {
                 router
-                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .dispatch_frame(&mut links, id, ftype, &payload)
                     .await
                     .unwrap();
             }
@@ -1037,23 +1137,23 @@ mod tests {
         // Simultaneous first send (B already sent above); it may drop
         // (see test doc) — the second flight is the real assertion.
         router
-            .session_send(&mut links, peer_key, b_pub, b"from-A".to_vec())
+            .session_send(&mut links, b_pub, b"from-A".to_vec())
             .await
             .unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < end {
-            router.maintain(&mut links, peer_key).await.unwrap();
+            router.maintain(&mut links).await.unwrap();
             if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
             {
                 router
-                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .dispatch_frame(&mut links, id, ftype, &payload)
                     .await
                     .unwrap();
             }
         }
         router
-            .session_send(&mut links, peer_key, b_pub, b"from-A2".to_vec())
+            .session_send(&mut links, b_pub, b"from-A2".to_vec())
             .await
             .unwrap();
         let end = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -1065,12 +1165,12 @@ mod tests {
             {
                 break;
             }
-            router.maintain(&mut links, peer_key).await.unwrap();
+            router.maintain(&mut links).await.unwrap();
             if let Ok(Ok((ftype, payload))) =
-                tokio::time::timeout(Duration::from_millis(300), links.read_frame(&peer_key)).await
+                tokio::time::timeout(Duration::from_millis(300), links.read_frame(id)).await
             {
                 router
-                    .dispatch_frame(&mut links, peer_key, ftype, &payload)
+                    .dispatch_frame(&mut links, id, ftype, &payload)
                     .await
                     .unwrap();
             }

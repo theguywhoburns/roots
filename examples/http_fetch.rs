@@ -36,16 +36,18 @@ async fn main() {
     let client = Client::new(SigningKey::generate(&mut rng));
     println!("local  addr {}", client.address());
     let our_ip = Ipv6Addr::from(client.address().0);
-    let mut conn = client.connect(&peer).await.expect("dial public peer");
+    let conn = client.connect(&peer).await.expect("dial public peer");
     let peer_key = conn.remote_key;
     let mut router = Router::new(client.key);
+    let mut conn = roots::link::AnyConn::new(conn);
+    let link = conn.id;
     router
-        .register(&mut conn, peer_key)
+        .register(&mut conn, peer_key, link)
         .await
         .expect("register");
     // One set for the whole run: per-link send clocks must survive
     // slices, or lazy keepalives never fire and the peer times us out.
-    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+    let mut links = roots::LinkSet::single(conn);
     let mut no_out = Vec::new();
 
     // Converge: short serve slices until we have a parent.
@@ -61,7 +63,7 @@ async fn main() {
 
     // Address -> full node key over the DHT.
     let key = router
-        .resolve(&mut links, peer_key, &target_addr, Duration::from_secs(60))
+        .resolve(&mut links, link, &target_addr, Duration::from_secs(60))
         .await
         .expect("resolve target");
     println!("target key {}", hex::encode(key));

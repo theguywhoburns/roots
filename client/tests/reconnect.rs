@@ -32,15 +32,19 @@ async fn reconnect_delivers_after_drop() {
     let server = tokio::spawn(async move {
         let mut inboxes = Vec::new();
         for hold in [Duration::from_secs(1), Duration::from_secs(10)] {
-            let mut conn = Client::new(server_sk.clone())
+            let conn = Client::new(server_sk.clone())
                 .accept(&listener)
                 .await
                 .expect("accept");
             let peer = conn.remote_key;
             assert_eq!(peer, c_pub);
             let mut router = Router::new(server_sk.clone());
-            router.register(&mut conn, peer).await.expect("register");
-            let mut links = LinkSet::single(AnyConn::new(conn));
+            // Register before the link joins the set, so mint the id first: a
+            // `PeerConn` has none until it is wrapped in an `AnyConn`.
+            let mut any = AnyConn::new(conn);
+            let id = any.id;
+            router.register(&mut any, peer, id).await.expect("register");
+            let mut links = LinkSet::single(any);
             let mut no_out = Vec::new();
             let _ = router.serve(&mut links, Some(hold), &mut no_out).await;
             counter.fetch_add(1, Ordering::SeqCst);

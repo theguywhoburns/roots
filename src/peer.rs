@@ -63,26 +63,51 @@ impl PeerKind {
     }
 }
 
-/// Per-link tree state, one entry per peer key.
+/// Per-node-key tree state: the two fields ironwood keys by `publicKey`
+/// rather than by `*peer`.
+///
+/// Go splits the two halves deliberately (`network/router.go:50-56`): `ports`,
+/// `requests`, `responses`, `sent` and `infos` are per key, while `lags`,
+/// `responded` and a `peer`'s own `srst`/`srrt`/`prio`/`order` are per
+/// connection. Two links to one node therefore share a port and a request, and
+/// nothing else. Keying everything by node key, as this type used to, made the
+/// second link's round trip overwrite the first's.
 pub(crate) struct PeerState {
-    /// Our local port number for this link (we number from 1).
+    /// Our local port number for this key (we number from 1). Shared by every
+    /// link to it, so a reconnect keeps the port a redial does not look new.
     pub(crate) port: u64,
+    /// The open request for this key, shared for the same reason
+    /// (`r.requests[pk]`, `router.go:120-124`).
     pub(crate) req: SigReq,
+}
+
+/// Per-link tree state, one entry per [`crate::link::LinkId`].
+///
+/// Everything Go hangs off `*peer` (`router.go:53-56`): the lag EWMA, whether
+/// this link has answered, the handshake priority, the connection order, the
+/// round-trip pair `getPeers` reports as `latency`, and the peer's vendor tag.
+pub(crate) struct LinkState {
+    /// The node key this link speaks for. Several links may share one.
+    pub(crate) peer: [u8; 32],
+    /// True once this link answered one of our `SigReq`s (`r.responded[p]`).
     pub(crate) responded: bool,
+    /// The lag EWMA: `routerUnknownLatency` until the first round trip, then
+    /// seeded at `rtt*2` and eased 7/8 toward the stored timestamps
+    /// (`router.go:433-441`).
     pub(crate) lag: std::time::Duration,
+    /// When we sent the request we are waiting on, in Go's `srst`
+    /// (`peers.go:112-113`).
     pub(crate) sent_at: Option<std::time::Instant>,
-    /// Link priority from the handshake (lowest wins among same-key links).
+    /// Link priority from the handshake (lowest wins among candidates).
     pub(crate) prio: u8,
     /// Connection order (oldest wins final tiebreaks).
     pub(crate) order: u64,
     /// Which implementation the peer runs (for gating behavior fixes).
     pub(crate) kind: PeerKind,
-    /// When the last `SigRes` that passed its signature check arrived, still in
-    /// Go's own words (`ironwood/network/peers.go:112-113`): `srst` is the send
-    /// time [`Self::sent_at`], `srrt` the receive time. `getPeers`' `latency` is
-    /// `srrt - srst` **re-read at query time** (`debug.go:85`), so it is the last
-    /// round trip as of now, not as of the reply — and grows until the next
-    /// `SigReq` resets the pair.
+    /// When the last `SigRes` that passed its signature check arrived, Go's
+    /// `srrt`. `getPeers`' `latency` is `srrt - srst` **re-read at query time**
+    /// (`debug.go:85`), so it is the last round trip as of now, not as of the
+    /// reply — and grows until the next `SigReq` resets the pair.
     pub(crate) srrt: Option<std::time::Instant>,
 }
 

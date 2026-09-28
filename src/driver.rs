@@ -16,10 +16,16 @@ impl Router {
     /// replay of already-sent announces (Go `addPeer`). Call ONCE per link
     /// (not per serve slice): the peer answers every SigReq and replays
     /// are sent-map-gated, so repeats look like a reconnect storm.
+    ///
+    /// `id` identifies this one connection, because a node key no longer does:
+    /// two links to one key are two peers to Go, each with its own lag and
+    /// round trip (`router.go:135-136`, `peers.go:47-62`). The key-level port
+    /// and open request are shared, which is what ironwood keys by `publicKey`.
     pub async fn register(
         &mut self,
         conn: &mut dyn Link,
         peer_key: [u8; KEY_LEN],
+        id: crate::link::LinkId,
     ) -> Result<(), Error> {
         // Reuse the link port for a known key (Go keeps one port per key
         // across reconnects); only brand-new keys allocate.
@@ -44,29 +50,30 @@ impl Router {
             .get(&peer_key)
             .map(|p| p.req)
             .unwrap_or_else(|| self.new_req());
-        // Keep the RTT estimate across reconnects; everything else is fresh
-        // per link (Go resets per-link state the same way).
-        let lag = self
-            .tree
-            .peers
-            .get(&peer_key)
-            .map(|p| p.lag)
-            .unwrap_or(UNKNOWN_LATENCY);
-        let peer = PeerState {
-            port,
-            req,
+        // A new link starts with no round trip, exactly like Go's fresh `*peer`
+        // (`r.lags[p] = routerUnknownLatency`, `router.go:136`). Carrying the
+        // old estimate over to the new connection would report a dead socket's
+        // latency as this one's.
+        let link = crate::peer::LinkState {
+            peer: peer_key,
             responded: false,
-            lag,
+            lag: UNKNOWN_LATENCY,
             sent_at: Some(Instant::now()),
             srrt: None,
             prio: conn.priority(),
             order,
             kind: conn.peer_kind(),
         };
+        // Whether the key was already known decides the replay: Go replays
+        // `r.sent[pk]` only on the `else` branch of "is this key in r.peers"
+        // (`router.go:120-130`), so a first link to a node has nothing to
+        // replay and must not be sent the announces we have not made yet.
+        let known = self.tree.peers.contains_key(&peer_key);
         // One registration per link (callers register once, then serve in
         // slices): open SigReq, bloom, and replay of already-sent announces
         // for a known key (Go `addPeer` replays to new links the same way).
-        self.tree.peers.insert(peer_key, peer);
+        self.tree.peers.insert(peer_key, PeerState { port, req });
+        self.tree.links.insert(id, link);
         self.tree.sent.entry(peer_key).or_default();
         self.bloom_add_peer(peer_key);
         // Advertise our (initially empty) bloom immediately, like Go.
@@ -82,16 +89,19 @@ impl Router {
         req.encode(&mut out);
         conn.write_frame(FrameType::SigReq, &out).await?;
         // Replay anything already announced to this key over older links.
-        let replay: Vec<Announce> = self
-            .tree
-            .sent
-            .get(&peer_key)
-            .map(|s| {
-                s.iter()
-                    .filter_map(|k| self.tree.infos.get(k).map(|i| i.announce(*k)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let replay: Vec<Announce> = if known {
+            self.tree
+                .sent
+                .get(&peer_key)
+                .map(|s| {
+                    s.iter()
+                        .filter_map(|k| self.tree.infos.get(k).map(|i| i.announce(*k)))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         for ann in replay {
             let mut buf = Vec::new();
             ann.encode(&mut buf);
@@ -110,36 +120,41 @@ impl Router {
     pub async fn resolve(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
+        conn: crate::link::LinkId,
         addr: &crate::address::Address,
         timeout: Duration,
     ) -> Result<[u8; KEY_LEN], Error> {
+        // A frame can only arrive on a live link, so `conn` must be in the set.
+        // Checking it here turns a stale handle into a clear error instead of a
+        // panic in the read below.
+        if links.peer_of(conn).is_none() {
+            return Err(Error::NoLink);
+        }
         let partial = crate::address::lookup_key_for_addr(addr);
         let end = tokio::time::Instant::now() + timeout;
         let mut last_maintain = tokio::time::Instant::now();
         while tokio::time::Instant::now() < end {
             // Via the rumor path (creates the pending entry that lets us
             // accept the arriving notify), like Go's `SendLookup`.
-            self.rumor_lookup(links, conn_peer, partial).await?;
+            self.rumor_lookup(links, partial).await?;
             // Keep the tree alive while resolving (same tick as serve).
             let now = tokio::time::Instant::now();
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
-                self.maintain(links, conn_peer).await?;
+                self.maintain(links).await?;
             }
             let remaining = end.saturating_duration_since(tokio::time::Instant::now());
             let wait = remaining.min(Duration::from_secs(2));
-            let frame = tokio::time::timeout(wait, links.read_frame(&conn_peer)).await;
+            let frame = tokio::time::timeout(wait, links.read_frame(conn)).await;
             match frame {
                 Ok(Ok((ftype, payload))) => {
                     self.frames[ftype as usize] += 1;
-                    self.dispatch_frame(links, conn_peer, ftype, &payload)
-                        .await?;
+                    self.dispatch_frame(links, conn, ftype, &payload).await?;
                 }
                 Ok(Err(e)) => return Err(e),
                 // Quiet slice: keep the link alive for long lookups.
                 Err(_) => {
-                    self.keepalive_if_idle(links, conn_peer).await?;
+                    self.keepalive_if_idle(links, conn).await?;
                 }
             }
             let want = addr.0;
@@ -163,14 +178,17 @@ impl Router {
     }
 
     /// One maintenance tick: expire, fix parent, send announces.
-    pub async fn maintain(
-        &mut self,
-        links: &mut LinkSet,
-        peer_key: [u8; KEY_LEN],
-    ) -> Result<(), Error> {
+    ///
+    /// Takes no peer: Go's `_doMaintenance` is a single global tick
+    /// (`router.go:89-100`), and the two sends it drives iterate the whole peer
+    /// table themselves — `_sendAnnounces` walks `r.sent` and fans out to every
+    /// link of each key (`router.go:320-378`), `_sendReqs` walks `r.peers`
+    /// (`router.go:186-197`). Calling this per link, as an earlier version did,
+    /// sent each announce once per connection.
+    pub async fn maintain(&mut self, links: &mut LinkSet) -> Result<(), Error> {
         self.expire();
-        self.fix(links, peer_key).await?;
-        self.send_announces(links, peer_key).await?;
+        self.fix(links).await?;
+        self.send_announces(links).await?;
         self.bloom_maintenance(links).await?;
         self.expire_ephemeral();
         // Re-drive lookups for still-pending rumors (a lookup sent before
@@ -192,7 +210,7 @@ impl Router {
             .map(|(_, r)| r.dest)
             .collect();
         for dest in pending {
-            self.rumor_lookup(links, peer_key, dest).await?;
+            self.rumor_lookup(links, dest).await?;
         }
         Ok(())
     }
@@ -212,13 +230,17 @@ impl Router {
     /// when we sent nothing to this link for a full tick. Any outbound
     /// frame (announce, SigRes, session data) already proves liveness,
     /// so per-frame replies would be pure chatter.
+    ///
+    /// Per **link**, because the send clock is: Go's keepalive timer lives on
+    /// `peer` (`peers.go:117-137`), so a busy second connection never makes an
+    /// idle first one look answered.
     async fn keepalive_if_idle(
         &self,
         links: &mut LinkSet,
-        peer: [u8; KEY_LEN],
+        conn: crate::link::LinkId,
     ) -> Result<(), Error> {
-        if links.idle_for(&peer) >= KEEPALIVE_DELAY {
-            links.write(peer, FrameType::KeepAlive, &[]).await?;
+        if links.idle_for(conn) >= KEEPALIVE_DELAY {
+            links.write(conn, FrameType::KeepAlive, &[]).await?;
         }
         Ok(())
     }
@@ -230,13 +252,15 @@ impl Router {
     pub(crate) async fn write_via(
         &mut self,
         links: &mut LinkSet,
-        next: [u8; KEY_LEN],
+        next: crate::link::LinkId,
         ftype: FrameType,
         buf: &[u8],
     ) -> Result<(), Error> {
-        if !links.write_via(next, ftype, buf).await? {
+        if links.peer_of(next).is_none() {
             self.dropped_no_link += 1;
+            return Ok(());
         }
+        links.write_via(next, ftype, buf).await?;
         Ok(())
     }
 
@@ -254,31 +278,43 @@ impl Router {
 
     /// Handle one inbound frame: router protocol plus a lazy keepalive
     /// reply for every non-keepalive type (Go `peerMonitor` semantics).
+    ///
+    /// `conn` is the link the frame arrived on. Go threads the `*peer` through
+    /// this whole path (`handleRequest(from, p, req)`, `peers.go:318`), and the
+    /// distinction is load-bearing: a `SigRes` goes back down the link that
+    /// asked, a keepalive is judged against that link's own send clock, and the
+    /// per-link lag is updated on the connection that answered.
     pub(crate) async fn dispatch_frame(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
+        conn: crate::link::LinkId,
         ftype: FrameType,
         payload: &[u8],
     ) -> Result<(), Error> {
+        // The node key behind this link. A frame can only arrive on a link the
+        // set still holds, so this cannot be `None`; treating it as such would
+        // mean silently dropping a frame we have already read.
+        let Some(conn_peer) = links.peer_of(conn) else {
+            return Ok(());
+        };
         match ftype {
             FrameType::KeepAlive | FrameType::Dummy => {}
             FrameType::SigReq => {
                 if let Ok((req, n)) = SigReq::decode(payload)
                     && n == payload.len()
                 {
-                    self.handle_request(links, conn_peer, req).await?;
+                    self.handle_request(links, conn, conn_peer, req).await?;
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::SigRes => {
                 if let Ok((res, n)) = SigRes::decode(payload)
                     && n == payload.len()
                     && res.check(&self.pubkey, &conn_peer)
                 {
-                    self.handle_response(conn_peer, res);
+                    self.handle_response(conn, conn_peer, res);
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::Announce => {
                 if let Ok(ann) = Announce::decode_exact(payload)
@@ -288,42 +324,43 @@ impl Router {
                     if let Some(better) = reply {
                         let mut buf = Vec::new();
                         better.encode(&mut buf);
-                        links.write(conn_peer, FrameType::Announce, &buf).await?;
+                        // Back down the link that sent it, as Go does
+                        // (`p.sendAnnounce(r, ann)`, `peers.go:354-356`).
+                        links.write(conn, FrameType::Announce, &buf).await?;
                         self.tree.announces_sent += 1;
                     }
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::BloomFilter => {
                 let _ = self.bloom_handle(conn_peer, payload);
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::PathLookup => {
                 if let Ok(lookup) = crate::pathfind::PathLookup::decode_exact(payload) {
-                    self.handle_lookup(links, conn_peer, conn_peer, &lookup)
-                        .await?;
+                    self.handle_lookup(links, conn_peer, &lookup).await?;
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::PathNotify => {
                 if let Ok(notify) = crate::pathfind::PathNotify::decode_exact(payload)
                     && notify.check()
                 {
-                    self.handle_notify(links, conn_peer, &notify).await?;
+                    self.handle_notify(links, &notify).await?;
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::PathBroken => {
                 if let Ok(broken) = crate::pathfind::PathBroken::decode_exact(payload) {
-                    self.handle_broken(links, conn_peer, &broken).await?;
+                    self.handle_broken(links, &broken).await?;
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
             FrameType::Traffic => {
                 if let Ok(tr) = crate::traffic::Traffic::decode(payload) {
-                    self.handle_inbound_traffic(links, conn_peer, &tr).await?;
+                    self.handle_inbound_traffic(links, &tr).await?;
                 }
-                self.keepalive_if_idle(links, conn_peer).await?;
+                self.keepalive_if_idle(links, conn).await?;
             }
         }
         Ok(())
@@ -365,13 +402,10 @@ impl Router {
         outgoing.splice(..0, std::mem::take(&mut self.sess.resend));
         let end = hold_for.map(|h| tokio::time::Instant::now() + h);
         let mut last_maintain = tokio::time::Instant::now();
-        for peer in links.peers() {
-            if let Err(e) = self.maintain(links, peer).await {
-                if Self::fatal_link_error(links, &e) {
-                    return Err(e);
-                }
-                break;
-            }
+        if let Err(e) = self.maintain(links).await
+            && Self::fatal_link_error(links, &e)
+        {
+            return Err(e);
         }
         loop {
             let now = tokio::time::Instant::now();
@@ -384,17 +418,17 @@ impl Router {
                 .map(|e| e.saturating_duration_since(now))
                 .unwrap_or(MAINTENANCE_INTERVAL)
                 .min(MAINTENANCE_INTERVAL);
-            if links.peers().is_empty() {
+            let ids = links.ids();
+            if ids.is_empty() {
                 // No links: sleep the budget instead of spinning — an
                 // empty read/dispatch loop has no await point that parks.
                 tokio::time::sleep(timeout).await;
                 continue;
             }
             for (dest, msg) in std::mem::take(outgoing) {
-                // Outbox sends are link-agnostic (pathfinder routes); the
-                // first peer key only scopes per-link state refreshes.
-                let peer = links.peers().into_iter().next().unwrap_or(self.pubkey);
-                if let Err(e) = self.session_send(links, peer, dest, msg).await {
+                // Outbox sends are link-agnostic (the pathfinder picks the next
+                // hop); the peer key only scopes per-link state refreshes.
+                if let Err(e) = self.session_send(links, dest, msg).await {
                     if Self::fatal_link_error(links, &e) {
                         return Err(e);
                     }
@@ -405,29 +439,26 @@ impl Router {
             }
             if now.duration_since(last_maintain) >= MAINTENANCE_INTERVAL {
                 last_maintain = now;
-                for peer in links.peers() {
-                    if let Err(e) = self.maintain(links, peer).await {
-                        if Self::fatal_link_error(links, &e) {
-                            return Err(e);
-                        }
-                        break;
-                    }
+                if let Err(e) = self.maintain(links).await
+                    && Self::fatal_link_error(links, &e)
+                {
+                    return Err(e);
                 }
             }
             // Drain every link. A single link blocks for the whole budget
             // (exact old `serve` timing); several links take short slices
             // each so one quiet link never starves the rest.
-            let slice = if links.peers().len() > 1 {
+            let slice = if links.len() > 1 {
                 timeout.min(Duration::from_millis(100))
             } else {
                 timeout
             };
-            for peer in links.peers() {
-                let frame = tokio::time::timeout(slice, links.read_frame(&peer)).await;
+            for id in links.ids() {
+                let frame = tokio::time::timeout(slice, links.read_frame(id)).await;
                 match frame {
                     Ok(Ok((ftype, payload))) => {
                         self.frames[ftype as usize] += 1;
-                        if let Err(e) = self.dispatch_frame(links, peer, ftype, &payload).await {
+                        if let Err(e) = self.dispatch_frame(links, id, ftype, &payload).await {
                             if Self::fatal_link_error(links, &e) {
                                 return Err(e);
                             }
@@ -444,17 +475,20 @@ impl Router {
                     Ok(Err(e)) => {
                         // The removed link is dropped here, which closes its
                         // socket; the caller owns nothing left to reclaim.
-                        let _ = links.remove(&peer);
+                        // Its per-link tree state goes with it, or the router
+                        // would keep routing to a connection that is gone.
+                        let _ = links.remove(id);
+                        self.tree.links.remove(&id);
                         if links.is_empty() {
                             return Err(e);
                         }
                     }
-                    // Quiet slice: top up links idle past a full tick so
-                    // the peer's liveness monitor never starves, even when
-                    // no frames arrive to answer (Go sends on the same
-                    // 1s timer instead of per-frame).
+                    // Quiet slice: top up links idle past a full tick so the
+                    // peer's liveness monitor never starves, even when no
+                    // frames arrive to answer (Go sends on the same 1 s timer
+                    // instead of per frame).
                     Err(_) => {
-                        if let Err(e) = self.keepalive_if_idle(links, peer).await {
+                        if let Err(e) = self.keepalive_if_idle(links, id).await {
                             if Self::fatal_link_error(links, &e) {
                                 return Err(e);
                             }

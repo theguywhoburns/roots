@@ -64,15 +64,15 @@ async fn serve_peer(
     let mut accepted = 0usize;
     while Instant::now() < stop {
         while let Ok(mut conn) = incoming.try_recv() {
-            let peer = conn.remote_key;
-            if router.register(&mut conn, peer).await.is_ok() {
+            let (peer, id) = (conn.remote_key, conn.id);
+            if router.register(&mut conn, peer, id).await.is_ok() {
                 links.add(conn);
                 accepted += 1;
             }
         }
         while close_links.try_recv().is_ok() {
-            for peer in links.peers() {
-                let _ = links.remove(&peer);
+            for id in links.ids() {
+                let _ = links.remove(id);
             }
         }
         let _ = router

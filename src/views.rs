@@ -37,18 +37,17 @@ impl Router {
     /// behind `ROOTS_DBG_DUMP` in `src/main.rs`).
     pub fn dump(&self) -> String {
         let mut out = String::new();
-        let mut peers: Vec<_> = self.tree.peers.keys().collect();
-        peers.sort();
-        for k in peers {
-            let p = &self.tree.peers[k];
+        let mut peers: Vec<_> = self.tree.links.values().collect();
+        peers.sort_by_key(|l| (l.peer, l.order));
+        for l in peers {
             // `kind` is roots-only diagnostics (our `dump` format, never on
             // the wire): `go` vs `roots`. Gated behavior fixes key off this.
-            let kind = if p.kind.is_roots() { "roots" } else { "go" };
+            let kind = if l.kind.is_roots() { "roots" } else { "go" };
             out.push_str(&format!(
                 "PEER key={} prio={} order={} impl={kind}\n",
-                hex::encode(k),
-                p.prio,
-                p.order
+                hex::encode(l.peer),
+                l.prio,
+                l.order
             ));
         }
         let mut keys: Vec<_> = self.tree.infos.keys().collect();
@@ -113,28 +112,33 @@ impl Router {
         out
     }
 
-    /// Direct link peers, sorted by key: the router's half of a `getPeers`
-    /// row — Go's `DebugPeerInfo` (`ironwood/network/debug.go:71-91`), which
-    /// `Core.GetPeers` joins to the link's own counters by connection identity
-    /// (`core/api.go:71-103`). `responded` tracks the last `SigReq` round trip,
-    /// `lag_ms` is Go's EWMA in whole milliseconds — 4 for a link that has not
-    /// answered one yet, because `UNKNOWN_LATENCY` is Go's 4294967295 *nanosecond*
-    /// sentinel (`router.go:39`).
+    /// Direct links, one row per **connection**, sorted by key then age: the
+    /// router's half of a `getPeers` row — Go's `DebugPeerInfo`
+    /// (`ironwood/network/debug.go:71-91`), which `Core.GetPeers` joins to the
+    /// link's own counters by connection identity (`core/api.go:71-103`).
+    ///
+    /// Per link, not per key, because that is what Go iterates: a node we hold
+    /// two connections to contributes two rows, each with its own priority, lag
+    /// and round trip. `responded` tracks the last `SigReq` round trip on that
+    /// link, and `lag_ms` is Go's EWMA in whole milliseconds — 4294967295 for a
+    /// link that has not answered one yet, because that is Go's
+    /// `routerUnknownLatency` in *nanoseconds* (`router.go:39`).
     pub fn link_peers(&self) -> Vec<LinkPeer> {
         let mut out: Vec<LinkPeer> = self
             .tree
-            .peers
+            .links
             .iter()
-            .map(|(k, p)| LinkPeer {
-                key: *k,
-                port: p.port,
-                priority: p.prio,
-                responded: p.responded,
-                lag_ms: p.lag.as_millis(),
-                latency: go_latency(p.srrt, p.sent_at),
+            .map(|(id, l)| LinkPeer {
+                id: *id,
+                key: l.peer,
+                port: self.tree.peers.get(&l.peer).map(|p| p.port).unwrap_or(0),
+                priority: l.prio,
+                responded: l.responded,
+                lag_ms: l.lag.as_millis(),
+                latency: go_latency(l.srrt, l.sent_at),
             })
             .collect();
-        out.sort_by_key(|p| p.key);
+        out.sort_by_key(|p| (p.key, p.id));
         out
     }
 
@@ -159,12 +163,16 @@ impl Router {
     }
 }
 
-/// What the router knows about one link peer: Go's `DebugPeerInfo`
+/// What the router knows about one link: Go's `DebugPeerInfo`
 /// (`ironwood/network/debug.go:24-35`), the half of a `getPeers` row that comes
 /// from the tree rather than from the socket.
 #[derive(Clone, Copy, Debug)]
 pub struct LinkPeer {
+    /// Which connection this row describes. Two links to one node are two rows,
+    /// and the id is what tells them apart.
+    pub id: crate::link::LinkId,
     pub key: [u8; KEY_LEN],
+    /// The node's port, which every link to that key shares.
     pub port: u64,
     pub priority: u8,
     /// True once the peer has answered one of our `SigReq`s.

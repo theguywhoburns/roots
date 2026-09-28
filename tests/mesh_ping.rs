@@ -87,15 +87,17 @@ fn checksum(src: &[u8; 16], dst: &[u8; 16], len: u16, icmp: &[u8]) -> u16 {
 
 async fn run_node(key: SigningKey, outgoing: Vec<([u8; 32], Vec<u8>)>) -> Router {
     let client = Client::new(key);
-    let mut conn = dial_retry(PEER, &client).await;
+    let conn = dial_retry(PEER, &client).await;
     let peer_key = conn.remote_key;
+    let mut conn = roots::link::AnyConn::new(conn);
+    let id = conn.id;
     let mut router = Router::new(client.key);
     router
-        .register(&mut conn, peer_key)
+        .register(&mut conn, peer_key, id)
         .await
         .expect("register");
     let mut outgoing = outgoing;
-    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+    let mut links = roots::LinkSet::single(conn);
     router
         .serve(&mut links, Some(HOLD), &mut outgoing)
         .await

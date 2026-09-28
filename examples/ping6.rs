@@ -48,15 +48,17 @@ async fn main() {
     let peer_uri = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "tcp://bode.theender.net:42069".to_string());
-    let mut conn = client.connect(&peer_uri).await.expect("dial public peer");
+    let conn = client.connect(&peer_uri).await.expect("dial public peer");
     let peer_key = conn.remote_key;
     let mut router = Router::new(client.key);
+    let mut conn = roots::link::AnyConn::new(conn);
+    let link = conn.id;
     router
-        .register(&mut conn, peer_key)
+        .register(&mut conn, peer_key, link)
         .await
         .expect("register");
     // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+    let mut links = roots::LinkSet::single(conn);
     let mut no_out = Vec::new();
 
     let end = Instant::now() + Duration::from_secs(60);
@@ -69,7 +71,7 @@ async fn main() {
     assert!(router.parent().is_some(), "convergence timed out");
 
     let key = router
-        .resolve(&mut links, peer_key, &target_addr, Duration::from_secs(60))
+        .resolve(&mut links, link, &target_addr, Duration::from_secs(60))
         .await
         .expect("resolve target");
     println!("target key {}", hex::encode(key));

@@ -38,15 +38,17 @@ async fn main() {
     let client = Client::new(SigningKey::generate(&mut rng));
     println!("local  addr {}", client.address());
     let our_ip = Ipv6Addr::from(client.address().0);
-    let mut conn = client.connect(&peer).await.expect("dial public peer");
+    let conn = client.connect(&peer).await.expect("dial public peer");
     let peer_key = conn.remote_key;
     let mut router = Router::new(client.key);
+    let mut conn = roots::link::AnyConn::new(conn);
+    let link = conn.id;
     router
-        .register(&mut conn, peer_key)
+        .register(&mut conn, peer_key, link)
         .await
         .expect("register");
     // One set for the whole run (see http_fetch).
-    let mut links = roots::LinkSet::single(roots::link::AnyConn::new(conn));
+    let mut links = roots::LinkSet::single(conn);
     let mut no_out = Vec::new();
     let end = Instant::now() + Duration::from_secs(60);
     while router.parent().is_none() && Instant::now() < end {
@@ -58,7 +60,7 @@ async fn main() {
     assert!(router.parent().is_some(), "mesh convergence timed out");
 
     let key = router
-        .resolve(&mut links, peer_key, &target_addr, Duration::from_secs(60))
+        .resolve(&mut links, link, &target_addr, Duration::from_secs(60))
         .await
         .expect("resolve target");
     println!("target key {} as {nick}", hex::encode(key));

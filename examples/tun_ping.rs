@@ -74,14 +74,18 @@ async fn main() {
     });
     let ca = Client::new(a_sk);
     let uri = format!("tcp://{addr}");
-    let mut a_conn = ca.connect(&uri).await.expect("A dial");
+    let a_conn = ca.connect(&uri).await.expect("A dial");
     let a_peer = a_conn.remote_key;
+    let mut a_conn = roots::link::AnyConn::new(a_conn);
+    let a_id = a_conn.id;
     let mut ra = Router::new(ca.key);
-    ra.register(&mut a_conn, a_peer).await.expect("A register");
-    let mut a_links = roots::LinkSet::single(roots::link::AnyConn::new(a_conn));
+    ra.register(&mut a_conn, a_peer, a_id)
+        .await
+        .expect("A register");
+    let mut a_links = roots::LinkSet::single(a_conn);
     let (b_sock, b_peer, b_kind) = accepted.await.unwrap();
     let cb = Client::new(b_sk);
-    let mut b_conn = roots::PeerConn::<roots::Tcp> {
+    let b_conn = roots::PeerConn::<roots::Tcp> {
         remote_key: b_peer,
         priority: 0,
         kind: b_kind,
@@ -89,9 +93,13 @@ async fn main() {
         remote_addr: None,
         stream: b_sock,
     };
+    let mut b_conn = roots::link::AnyConn::new(b_conn);
+    let b_id = b_conn.id;
     let mut rb = Router::new(cb.key);
-    rb.register(&mut b_conn, b_peer).await.expect("B register");
-    let mut b_links = roots::LinkSet::single(roots::link::AnyConn::new(b_conn));
+    rb.register(&mut b_conn, b_peer, b_id)
+        .await
+        .expect("B register");
+    let mut b_links = roots::LinkSet::single(b_conn);
 
     // A side: real TUN with A's mesh address + route back to B.
     let ifname = format!("roots{}", std::process::id() % 100000);

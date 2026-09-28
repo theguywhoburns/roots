@@ -170,10 +170,10 @@ async fn run(
     resolve: Option<roots::address::Address>,
 ) {
     show("remote", &conn.remote_key);
-    let peer_key = conn.remote_key;
+    let (peer_key, link_id) = (conn.remote_key, conn.id);
     let mut router = Router::new(client.key);
     let mut no_out = Vec::new();
-    if let Err(e) = router.register(&mut conn, peer_key).await {
+    if let Err(e) = router.register(&mut conn, peer_key, link_id).await {
         eprintln!("register failed: {e}");
         std::process::exit(1);
     }
@@ -195,12 +195,12 @@ async fn run(
     }
     if let Some(addr) = resolve {
         match router
-            .resolve(&mut links, peer_key, &addr, Duration::from_secs(60))
+            .resolve(&mut links, link_id, &addr, Duration::from_secs(60))
             .await
         {
             Ok(key) => {
                 show("target", &key);
-                if let Err(e) = router.request_nodeinfo(&mut links, peer_key, key).await {
+                if let Err(e) = router.request_nodeinfo(&mut links, key).await {
                     eprintln!("nodeinfo request failed: {e}");
                 } else {
                     // Pump briefly for the reply.

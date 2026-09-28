@@ -177,24 +177,22 @@ impl Node {
             .entries()
             .iter()
             .map(|e| {
-                // The row's own link, asked by identity: a [`roots::LinkId`] and
-                // a node key cannot be joined any other way, because the set keeps
-                // one slot per *key* — so a peer that both dialled us and we
-                // dialled has two links in play and one slot, and only the id says
-                // which of the two a row is describing.
+                // The row's own link, asked by identity. A [`roots::LinkId`] is
+                // the only thing that tells two connections to one node apart,
+                // and Go joins its rows the same way — by connection, not by
+                // key (`core/api.go:85-103`). So a node that dialled us while we
+                // dialled it produces two rows, each reporting its own
+                // direction, counters and round trip.
                 //
                 // Everything the set and the router have to say about the row is
                 // gated on that one answer, so a row never reports the key, the
-                // direction or the counters of a link it no longer holds
-                // (`core/api.go:85-103` reads the same way: the `up` half comes
-                // from the row's own connection, and the router half is joined
-                // through it).
+                // direction or the counters of a link it no longer holds.
                 let live = e
                     .live
-                    .and_then(|(id, key)| self.links.stats(id).map(|s| (s, key)));
+                    .and_then(|(id, key)| self.links.stats(id).map(|s| (id, key, s)));
                 let router = live
                     .as_ref()
-                    .and_then(|(_, key)| known.iter().find(|p| p.key == *key));
+                    .and_then(|(id, _, _)| known.iter().find(|p| p.id == *id));
                 let (port, priority, cost, latency) = router
                     .map(|p| (p.port, p.priority, p.lag_ms.max(1) as u64, p.latency))
                     .unwrap_or((0, 0, 0, None));
@@ -206,7 +204,7 @@ impl Node {
                     // which matters, because it is a secret.
                     uri: link_id(&e.uri),
                     sintf: e.sintf.clone(),
-                    key: live.as_ref().map(|(_, k)| *k),
+                    key: live.as_ref().map(|(_, k, _)| *k),
                     up: live.is_some(),
                     // Go's is the row's link type, not the connection's
                     // (`api.go:87`), and only while the row has a connection.
@@ -215,11 +213,11 @@ impl Node {
                     priority,
                     cost,
                     latency,
-                    up_for: live.as_ref().map(|(s, _)| s.up).unwrap_or_default(),
-                    rx_bytes: live.as_ref().map(|(s, _)| s.rx_bytes).unwrap_or(0),
-                    tx_bytes: live.as_ref().map(|(s, _)| s.tx_bytes).unwrap_or(0),
-                    rx_rate: live.as_ref().map(|(s, _)| s.rx_rate).unwrap_or(0),
-                    tx_rate: live.as_ref().map(|(s, _)| s.tx_rate).unwrap_or(0),
+                    up_for: live.as_ref().map(|(_, _, s)| s.up).unwrap_or_default(),
+                    rx_bytes: live.as_ref().map(|(_, _, s)| s.rx_bytes).unwrap_or(0),
+                    tx_bytes: live.as_ref().map(|(_, _, s)| s.tx_bytes).unwrap_or(0),
+                    rx_rate: live.as_ref().map(|(_, _, s)| s.rx_rate).unwrap_or(0),
+                    tx_rate: live.as_ref().map(|(_, _, s)| s.tx_rate).unwrap_or(0),
                     last_error: e.last_error.clone(),
                     err_at: e.err_at,
                 }
@@ -315,8 +313,8 @@ impl Node {
                 if uri.as_deref().is_some_and(|uri| self.peers.busy(uri)) {
                     return;
                 }
-                let peer = conn.remote_key;
-                if let Err(e) = self.router.register(&mut conn, peer).await {
+                let (peer, id) = (conn.remote_key, conn.id);
+                if let Err(e) = self.router.register(&mut conn, peer, id).await {
                     eprintln!("inbound link dropped: {e}");
                     return;
                 }
@@ -349,8 +347,8 @@ impl Node {
             }
             Ok(conn) => conn,
         };
-        let peer = conn.remote_key;
-        if let Err(e) = self.router.register(&mut conn, peer).await {
+        let (peer, id) = (conn.remote_key, conn.id);
+        if let Err(e) = self.router.register(&mut conn, peer, id).await {
             eprintln!("dial {uri}: {e}");
             self.peers.mark_failed(token, &e.to_string());
             return;

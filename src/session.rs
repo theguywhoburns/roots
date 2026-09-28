@@ -242,18 +242,16 @@ impl crate::router::Router {
     async fn net_send(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         payload: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
-        self.pathfinder_send(links, conn_peer, dest, payload).await
+        self.pathfinder_send(links, dest, payload).await
     }
 
     /// Handle one session payload extracted from inbound traffic.
     pub(crate) async fn handle_session_bytes(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         from: [u8; KEY_LEN],
         data: &[u8],
     ) -> Result<(), crate::error::Error> {
@@ -287,11 +285,10 @@ impl crate::router::Router {
                     });
                     if let Some(ack) = ack_init {
                         let enc = ack.encrypt_msg(SESSION_TYPE_ACK, &sk, &from);
-                        self.net_send(links, conn_peer, from, enc).await?;
+                        self.net_send(links, from, enc).await?;
                     }
                     if let Some((kind, payload)) = buffered.and_then(|b| b.data) {
-                        self.session_send_inner(links, conn_peer, from, kind, payload)
-                            .await?;
+                        self.session_send_inner(links, from, kind, payload).await?;
                     }
                     return Ok(());
                 }
@@ -309,7 +306,7 @@ impl crate::router::Router {
                 });
                 if let Some(ack) = ack_init {
                     let enc = ack.encrypt_msg(SESSION_TYPE_ACK, &sk, &from);
-                    self.net_send(links, conn_peer, from, enc).await?;
+                    self.net_send(links, from, enc).await?;
                 }
             }
             SESSION_TYPE_TRAFFIC => {
@@ -336,8 +333,7 @@ impl crate::router::Router {
                                     self.inbox.push((from, payload[1..].to_vec()));
                                 }
                                 Some(&PACKET_TYPE_PROTO) => {
-                                    self.handle_proto_bytes(links, conn_peer, from, &payload[1..])
-                                        .await?;
+                                    self.handle_proto_bytes(links, from, &payload[1..]).await?;
                                 }
                                 _ => {}
                             }
@@ -345,7 +341,7 @@ impl crate::router::Router {
                         None => {
                             let init = s.make_init(reinit_seq);
                             let enc = init.encrypt_msg(SESSION_TYPE_INIT, &sk, &from);
-                            self.net_send(links, conn_peer, from, enc).await?;
+                            self.net_send(links, from, enc).await?;
                         }
                     }
                 } else {
@@ -360,7 +356,7 @@ impl crate::router::Router {
                         seq: self.next_init_seq(),
                     };
                     let enc = init.encrypt_msg(SESSION_TYPE_INIT, &sk, &from);
-                    self.net_send(links, conn_peer, from, enc).await?;
+                    self.net_send(links, from, enc).await?;
                 }
             }
             _ => {}
@@ -378,7 +374,6 @@ impl crate::router::Router {
     async fn session_send_inner(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,
         msg: Vec<u8>,
@@ -391,7 +386,7 @@ impl crate::router::Router {
             s.encrypt(&wrapped)
         });
         if let Some(enc) = enc {
-            let sent = self.net_send(links, conn_peer, dest, enc).await;
+            let sent = self.net_send(links, dest, enc).await;
             if sent.is_err() {
                 // Link died mid-write: retry the raw plaintext on the next link.
                 self.sess.resend.push((dest, msg));
@@ -405,11 +400,10 @@ impl crate::router::Router {
     pub(crate) async fn session_send(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         msg: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
-        self.session_send_kind(links, conn_peer, dest, PACKET_TYPE_TRAFFIC, msg)
+        self.session_send_kind(links, dest, PACKET_TYPE_TRAFFIC, msg)
             .await
     }
 
@@ -419,15 +413,12 @@ impl crate::router::Router {
     pub(crate) async fn session_send_kind(
         &mut self,
         links: &mut LinkSet,
-        conn_peer: [u8; KEY_LEN],
         dest: [u8; KEY_LEN],
         kind: u8,
         msg: Vec<u8>,
     ) -> Result<(), crate::error::Error> {
         if self.sess.sessions.contains_key(&dest) {
-            return self
-                .session_send_inner(links, conn_peer, dest, kind, msg)
-                .await;
+            return self.session_send_inner(links, dest, kind, msg).await;
         }
         let now = std::time::Instant::now();
         let sk = self.key.clone();
@@ -455,7 +446,7 @@ impl crate::router::Router {
             buf.deadline = now + SESSION_TIMEOUT;
             buf.init.clone().encrypt_msg(SESSION_TYPE_INIT, &sk, &dest)
         };
-        self.net_send(links, conn_peer, dest, enc).await
+        self.net_send(links, dest, enc).await
     }
 }
 
