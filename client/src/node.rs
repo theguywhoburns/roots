@@ -107,9 +107,62 @@ pub enum Cmd {
     Send { dest: [u8; 32], bytes: Vec<u8> },
     /// Answer with the node's whole readable state, then carry on.
     Report { respond: oneshot::Sender<Snapshot> },
+    /// Ask a remote node something over an E2E session and wait for the answer.
+    ///
+    /// Go's four remote commands (`core/api.go:240-259` registering
+    /// `getNodeInfo` and the three `debug_remoteGet*`) all do the same two
+    /// things: send a request addressed to a node key through `PacketConn
+    /// .WriteTo`, and block on a channel with a 6 s timer. The reply is matched
+    /// by the node that sent it, which is why this is a command and not a call:
+    /// only this task may read `proto_inbox`, and the answer arrives on a later
+    /// tick, not inside this await.
+    Remote {
+        key: [u8; 32],
+        what: RemoteQuery,
+        respond: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
     /// Leave the loop after the current slice.
     Quit,
 }
+
+/// Which remote question to ask, and the dispatch byte that carries it.
+///
+/// The wire values are the library's (`src/proto.rs`): a `nodeinfo` request is
+/// `[PROTO_NODEINFO_REQ]`, a debug request is `[PROTO_DEBUG, subtype]`. Go's
+/// four admin commands are one nodeinfo request and three debug subtypes
+/// (`core/proto.go:19-25`), so this is the same split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteQuery {
+    /// `getNodeInfo`: the peer's advertised nodeinfo, verbatim JSON.
+    NodeInfo,
+    /// `debug_remoteGetSelf`: `{"key": hex, "routing_entries": "<n>"}`.
+    SelfInfo,
+    /// `debug_remoteGetPeers`: `{"keys": [hex, …]}`.
+    Peers,
+    /// `debug_remoteGetTree`: `{"keys": [hex, …]}`.
+    Tree,
+}
+
+impl RemoteQuery {
+    /// The protocol dispatch byte, for matching an answer to its question.
+    pub fn answer_tag(self) -> (u8, Option<u8>) {
+        use roots::proto::*;
+        match self {
+            RemoteQuery::NodeInfo => (PROTO_NODEINFO_RES, None),
+            RemoteQuery::SelfInfo => (PROTO_DEBUG, Some(DEBUG_GETSELF_RES)),
+            RemoteQuery::Peers => (PROTO_DEBUG, Some(DEBUG_GETPEERS_RES)),
+            RemoteQuery::Tree => (PROTO_DEBUG, Some(DEBUG_GETTREE_RES)),
+        }
+    }
+}
+
+/// How long a remote question waits before it is a failure.
+///
+/// Go uses `time.After(6 * time.Second)` in all four handlers
+/// (`nodeinfo.go:164-172`, `proto.go:281-285`, `:329-333`, `:373-377`) while the
+/// bookkeeping underneath it expires at one minute. Six seconds is the operator's
+/// wait, so it is the number that goes in the error.
+pub const REMOTE_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// A running node. Build one with [`Node::new`], hand the sender to whatever
 /// produces work, then `run` it — in the task that owns it, which is the only
@@ -124,6 +177,22 @@ pub struct Node {
     outbox: Vec<([u8; 32], Vec<u8>)>,
     tick: Duration,
     quit: bool,
+    /// Remote questions waiting for an answer.
+    ///
+    /// Go keeps three maps for the debug queries plus one for nodeinfo
+    /// (`core/proto.go:44-49`, `core/nodeinfo.go:18-22`), each entry holding a
+    /// callback and a one-minute expiry. One list keyed by node and question is
+    /// the same thing without the repetition; the wait is [`REMOTE_TIMEOUT`]
+    /// because that is the number the operator is told about.
+    pending: Vec<PendingRemote>,
+}
+
+/// One outstanding remote question, waiting for a node to answer it.
+struct PendingRemote {
+    key: [u8; 32],
+    what: RemoteQuery,
+    asked_at: Instant,
+    respond: oneshot::Sender<Result<Vec<u8>, String>>,
 }
 
 impl Node {
@@ -152,6 +221,7 @@ impl Node {
             outbox: Vec::new(),
             tick,
             quit: false,
+            pending: Vec::new(),
         };
         let sender = node.tx.clone();
         (node, sender)
@@ -259,8 +329,76 @@ impl Node {
             {
                 return Err(e);
             }
+            // Answers to remote questions, then the ones nobody answered. Both
+            // are read here because this is the only task that may read
+            // `proto_inbox`: it fills during the serve slice above.
+            self.settle_remote();
         }
         Ok(())
+    }
+
+    /// Match whatever arrived in `proto_inbox` against the questions still
+    /// waiting, and fail the ones that have waited out Go's 6 s.
+    fn settle_remote(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut still: Vec<PendingRemote> = Vec::new();
+        for q in std::mem::take(&mut self.pending) {
+            if now.duration_since(q.asked_at) >= REMOTE_TIMEOUT {
+                // Go's `time.After(6 * time.Second)` arm, with its own wording
+                // (`nodeinfo.go:169` and `proto.go:284`, `:332`, `:376`).
+                let msg = match q.what {
+                    RemoteQuery::NodeInfo => "timed out waiting for response",
+                    _ => "timeout",
+                };
+                let _ = q.respond.send(Err(msg.to_string()));
+                continue;
+            }
+            let (tag, sub) = q.what.answer_tag();
+            let answer = self
+                .router
+                .proto_inbox
+                .iter()
+                .position(|(from, bytes)| *from == q.key && Self::is_answer(bytes, tag, sub))
+                .map(|at| {
+                    let (_, bytes) = self.router.proto_inbox.remove(at);
+                    bytes
+                });
+            match answer {
+                Some(bytes) => {
+                    let _ = q.respond.send(Ok(Self::answer_body(bytes, tag, sub)));
+                }
+                None => still.push(q),
+            }
+        }
+        self.pending = still;
+    }
+
+    /// Does this inbound proto payload answer the question `tag`/`sub` names?
+    ///
+    /// A nodeinfo answer is `[PROTO_NODEINFO_RES, …json]`. A debug answer is
+    /// `[PROTO_DEBUG, subtype, …]`, and the library re-adds the dispatch byte
+    /// when it files the reply (`src/proto.rs`), so both bytes are present.
+    fn is_answer(bytes: &[u8], tag: u8, sub: Option<u8>) -> bool {
+        match sub {
+            None => bytes.first() == Some(&tag),
+            Some(sub) => bytes.len() >= 2 && bytes[0] == tag && bytes[1] == sub,
+        }
+    }
+
+    /// Strip the dispatch bytes, leaving the payload the handler marshals.
+    ///
+    /// Go's handlers get the body without them: `_handleGetSelfResponse(key,
+    /// bs[1:])` after `handleProto` has already peeled the proto byte
+    /// (`proto.go:87`, `:91`, `:95`), and `json.Unmarshal` then sees a bare
+    /// object. So ours must not, or the admin body would nest the dispatch byte
+    /// inside the JSON.
+    fn answer_body(bytes: Vec<u8>, tag: u8, sub: Option<u8>) -> Vec<u8> {
+        let n = if sub.is_some() { 2 } else { 1 };
+        debug_assert_eq!(bytes.first(), Some(&tag));
+        bytes.into_iter().skip(n).collect()
     }
 
     async fn on_cmd(&mut self, cmd: Cmd) {
@@ -296,7 +434,34 @@ impl Node {
                 sintf,
                 respond,
             } => {
+                // Go's `links.remove` cancels the redial context **and** closes
+                // the live connection (`core/link.go:433-438`), so the row
+                // disappears from `getPeers` with the link. Slice 5 kept ours
+                // open on the strength of the comment at `core/api.go:207-211`
+                // ("the peer is not disconnected immediately"), which reading
+                // Go disproves: the comment describes nothing that happens.
+                // Parity is the product, so this now closes the link, and the
+                // row set that results is what Go's would be.
+                //
+                // The id has to be taken before the row goes, because the row is
+                // what holds it. Asking afterwards would always answer "no
+                // link" and quietly leave the socket open.
+                let id = self.peers.live_id(&uri, &sintf);
                 let outcome = self.peers.remove(&uri, &sintf);
+                if outcome.is_ok()
+                    && let Some(id) = id
+                {
+                    // Take the link out of the set and drop the `AnyConn` it
+                    // returns, which closes the socket. This is not Go's
+                    // nil-context panic on an inbound row's URI (`link.go:536-543`
+                    // builds an inbound link without a context, and `:434`
+                    // dereferences it): we hold the id either way, so there is
+                    // nothing to panic on.
+                    if let Some(conn) = self.links.remove(id) {
+                        drop(conn);
+                    }
+                    self.router.forget_link(id);
+                }
                 match (respond, &outcome) {
                     (Some(respond), _) => {
                         let _ = respond.send(outcome);
@@ -327,6 +492,46 @@ impl Node {
                 let _ = respond.send(self.snapshot());
             }
             Cmd::Send { dest, bytes } => self.outbox.push((dest, bytes)),
+            Cmd::Remote { key, what, respond } => {
+                // The request goes out addressed to a node key, so the
+                // pathfinder picks the next hop — the same route any other
+                // payload to that node takes. Go reaches the same place through
+                // `PacketConn.WriteTo` (`core/proto.go:101`,
+                // `core/nodeinfo.go:114`), which is what makes the answer come
+                // back from the node asked rather than from whichever link
+                // happened to be first.
+                use roots::proto::*;
+                let sent = match what {
+                    RemoteQuery::NodeInfo => {
+                        self.router.request_nodeinfo(&mut self.links, key).await
+                    }
+                    other => {
+                        let sub = match other {
+                            RemoteQuery::SelfInfo => DEBUG_GETSELF_REQ,
+                            RemoteQuery::Peers => DEBUG_GETPEERS_REQ,
+                            _ => DEBUG_GETTREE_REQ,
+                        };
+                        self.router.request_debug(&mut self.links, key, sub).await
+                    }
+                };
+                match sent {
+                    Ok(()) => self.pending.push(PendingRemote {
+                        key,
+                        what,
+                        asked_at: Instant::now(),
+                        respond,
+                    }),
+                    // A send that fails has not started a clock, so the caller
+                    // is told now instead of waiting out a timeout for an answer
+                    // that can never arrive. Go's `WriteTo` discards this too
+                    // (`core/nodeinfo.go:114`, `_ =`), because the session
+                    // layer buffers the request; ours reports it because the
+                    // admin socket has nowhere to hide it.
+                    Err(e) => {
+                        let _ = respond.send(Err(e.to_string()));
+                    }
+                }
+            }
             Cmd::Quit => self.quit = true,
         }
     }

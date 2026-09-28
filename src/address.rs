@@ -22,7 +22,7 @@ pub const PAYLOAD_BIT_OFFSET: usize = 8 * (PREFIX_LEN + 1);
 /// Total key bits scanned.
 pub const KEY_BITS: usize = 8 * KEY_LEN;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address(pub [u8; ADDR_LEN]);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

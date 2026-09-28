@@ -102,6 +102,19 @@ impl Router {
         self.tree.announces_recv
     }
 
+    /// Forget one link's per-connection state.
+    ///
+    /// The driver does this on eviction (`src/driver.rs`), and a caller that
+    /// takes a link out of the set on its own behalf must do it too: a
+    /// `LinkState` with no connection behind it would keep feeding `fix` a
+    /// lag and a next-hop candidate for a socket that is closed. The per-key
+    /// books are left alone, which is the deliberate divergence documented in
+    /// `docs/architecture-map.md` — Go prunes all of it in `removePeer`
+    /// (`router.go:147-168`).
+    pub fn forget_link(&mut self, id: crate::link::LinkId) {
+        self.tree.links.remove(&id);
+    }
+
     /// Which implementation a link peer runs (`Go` when unknown).
     /// Gates roots-only behavior fixes; defaults to Go-exact.
     pub fn peer_kind(&self, peer: &[u8; KEY_LEN]) -> crate::peer::PeerKind {

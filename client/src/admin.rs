@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::node::{Cmd, Snapshot};
+use crate::node::{Cmd, RemoteQuery, Snapshot};
 
 /// Go's four protocol-level strings (`admin.go:324-336`). Verbatim, including
 /// the fact that the first one throws away whatever the decoder actually
@@ -35,20 +35,33 @@ fn unknown_action(name: &str) -> String {
 }
 
 /// A command name, its `list` description and its argument names — the exact
-/// `AddHandler` triples from `admin.go:139-257`, lowercased because Go
-/// registers and looks up with `strings.ToLower`. Sorted, because `list` sorts.
+/// `AddHandler` triples, lowercased because Go registers and looks up with
+/// `strings.ToLower`. Sorted, because `list` sorts.
 ///
-/// `getNodeInfo`, the three `debug_remote*` commands (`core/api.go:240-259`),
 /// `getTun` (`tun/admin.go:31`) and `getMulticastInterfaces`
-/// (`multicast/admin.go:50`) are missing from this table: their answers need
-/// mesh round trips, a TUN and multicast state, so they arrive with Slices 9,
-/// 14 and 11. `list` says what the node can do, so it says eight commands
-/// rather than Go's fourteen.
+/// (`multicast/admin.go:50`) are still missing: their answers need a kernel
+/// interface and multicast socket state, which arrive with Slices 14 and 11.
+/// `list` says what the node can do, so it says twelve commands rather than
+/// Go's fourteen.
 const COMMANDS: &[(&str, &str, &[&str])] = &[
     (
         "addpeer",
         "Add a peer to the peer list",
         &["uri", "interface"],
+    ),
+    (
+        "debug_remotegetself",
+        // Go registers these three with the literal description
+        // "Debug use only" (`core/api.go:245-256`), so that is what `list` says.
+        "Debug use only",
+        &["key"],
+    ),
+    ("debug_remotegetpeers", "Debug use only", &["key"]),
+    ("debug_remotegettree", "Debug use only", &["key"]),
+    (
+        "getnodeinfo",
+        "Request nodeinfo from a remote node by its public key",
+        &["key"],
     ),
     ("getpaths", "Show established paths through this node", &[]),
     ("getpeers", "Show directly connected peers", &["sort"]),
@@ -69,6 +82,130 @@ const COMMANDS: &[(&str, &str, &[&str])] = &[
 
 fn known(name: &str) -> bool {
     COMMANDS.iter().any(|(n, _, _)| *n == name)
+}
+
+impl RemoteQuery {
+    /// Which of the four remote commands this name is, if it is one.
+    pub fn for_command(name: &str) -> Option<RemoteQuery> {
+        Some(match name {
+            "getnodeinfo" => RemoteQuery::NodeInfo,
+            "debug_remotegetself" => RemoteQuery::SelfInfo,
+            "debug_remotegetpeers" => RemoteQuery::Peers,
+            "debug_remotegettree" => RemoteQuery::Tree,
+            _ => return None,
+        })
+    }
+}
+
+/// Go's `ed25519.PublicKeySize`, the only length a `key` argument may be.
+const KEY_SIZE: usize = 32;
+
+/// The four remote queries, as Go's handlers write them.
+///
+/// Two of the four differ in a way that is easy to get wrong. `getNodeInfo`
+/// checks for an empty key first and says "no remote public key supplied"
+/// (`nodeinfo.go:157-160`); the three debug handlers do not, so an empty key
+/// decodes to zero bytes and fails the length check instead
+/// (`proto.go:270-281` and its two siblings). Same argument, different error.
+async fn remote_query(
+    what: RemoteQuery,
+    args: &Value,
+    tx: &mpsc::UnboundedSender<Cmd>,
+) -> Result<Body, String> {
+    let key_text = args.get("key").and_then(Value::as_str).unwrap_or("");
+    if what == RemoteQuery::NodeInfo && key_text.is_empty() {
+        return Err("no remote public key supplied".to_string());
+    }
+    let key = decode_remote_key(what, key_text)?;
+    let (wt, rr) = oneshot::channel();
+    tx.send(Cmd::Remote {
+        key,
+        what,
+        respond: wt,
+    })
+    .map_err(|_| "node is not running".to_string())?;
+    let answer = rr.await.map_err(|_| "node did not answer".to_string())?;
+    let body = answer?;
+
+    // The top-level key is the node's address for the debug three and its key
+    // for nodeinfo, matching Go: `DebugGetSelfResponse{ip.String(): msg}`
+    // (`proto.go:290-292`) against `GetNodeInfoResponse{key: msg}` with the
+    // hex key (`nodeinfo.go:175-177`).
+    let name = match what {
+        RemoteQuery::NodeInfo => hex::encode(key),
+        _ => roots::addr_for_key(&key).to_string(),
+    };
+    let mut map = serde_json::Map::new();
+    map.insert(name, remote_body(what, &body)?);
+    Ok(Body::Map(Value::Object(map)))
+}
+
+/// Decode the `key` argument, with Go's two error strings.
+///
+/// `hex.DecodeString` fails in exactly two ways and Go wraps both in the same
+/// text (`nodeinfo.go:161-163`, `proto.go:274-276`): an odd number of digits
+/// with `encoding/hex: odd length hex string`, and a non-hex digit with
+/// `encoding/hex: invalid byte: U+0078 'x'`.
+fn decode_remote_key(what: RemoteQuery, text: &str) -> Result<[u8; KEY_SIZE], String> {
+    if !text.len().is_multiple_of(2) {
+        return Err(go_hex_error(text, None));
+    }
+    let bytes = hex::decode(text).map_err(|e| go_hex_error(text, Some(&e)))?;
+    if bytes.len() != KEY_SIZE {
+        // `invalid public key length` is one of Go's, and it is what an empty
+        // key reaches on the debug path (`proto.go:277-279`).
+        let _ = what;
+        return Err("invalid public key length".to_string());
+    }
+    let mut key = [0u8; KEY_SIZE];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
+/// Go's `encoding/hex` error text, rebuilt from what `hex::decode` reports.
+fn go_hex_error(text: &str, err: Option<&hex::FromHexError>) -> String {
+    match err {
+        Some(hex::FromHexError::OddLength) => {
+            "failed to decode public key: encoding/hex: odd length hex string".to_string()
+        }
+        Some(hex::FromHexError::InvalidHexCharacter { c, .. }) => {
+            format!(
+                "failed to decode public key: encoding/hex: invalid byte: U+{:04X} '{c}'",
+                *c as u32
+            )
+        }
+        // `InvalidStringLength` is unreachable: `decode` only raises it for
+        // `decode_slice`, which we do not call. It gets a wrapper rather than a
+        // panic so a future caller of this function cannot take the node down.
+        _ => format!("failed to decode public key: {text}"),
+    }
+}
+
+/// Marshal a remote answer into the shape its handler returns.
+fn remote_body(what: RemoteQuery, body: &[u8]) -> Result<Value, String> {
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|e| format!("invalid character in remote response: {e}"))?;
+    Ok(match what {
+        // Nodeinfo is passed through verbatim: Go holds it as `json.RawMessage`
+        // and marshals it back unchanged (`nodeinfo.go:174-177`).
+        RemoteQuery::NodeInfo => parsed,
+        // The self answer is also a map Go marshals as-is (`proto.go:290-292`),
+        // including its string-typed `routing_entries` (`proto.go:132-133`,
+        // which is `fmt.Sprintf("%v", …)` and so a JSON string, not a number).
+        RemoteQuery::SelfInfo => parsed,
+        // The peers and tree answers are concatenated 32-byte keys on the wire
+        // (`peers.go:168-180`) and become a `keys` list in the reply
+        // (`proto.go:300-315`, `:343-358`).
+        RemoteQuery::Peers | RemoteQuery::Tree => {
+            let keys: Vec<Value> = body
+                .as_chunks::<KEY_SIZE>().0.iter()
+                .map(|c| Value::String(hex::encode(c)))
+                .collect();
+            let mut m = serde_json::Map::new();
+            m.insert("keys".to_string(), Value::Array(keys));
+            Value::Object(m)
+        }
+    })
 }
 
 /// The word Go's `json` package uses for a value's kind in an error message.
@@ -105,6 +242,14 @@ fn decode_args(name: &str, args: &Value) -> Result<(), String> {
         "getpeers" => ("GetPeersRequest", &["sort"]),
         "addpeer" => ("AddPeerRequest", &["uri", "interface"]),
         "removepeer" => ("RemovePeerRequest", &["uri", "interface"]),
+        // The four remote handlers live in `core`, not `admin`, so their
+        // request structs marshal as `core.GetNodeInfoRequest` and friends.
+        // `core/api.go:241` registers `getNodeInfo` with `[]string{"key"}`, and
+        // the three debug handlers with the same.
+        "getnodeinfo" => ("core.GetNodeInfoRequest", &["key"]),
+        "debug_remotegetself" => ("core.DebugGetSelfRequest", &["key"]),
+        "debug_remotegetpeers" => ("core.DebugGetPeersRequest", &["key"]),
+        "debug_remotegettree" => ("core.DebugGetTreeRequest", &["key"]),
         _ => return Ok(()),
     };
     let Some(map) = args.as_object() else {
@@ -180,6 +325,15 @@ enum Body {
     Tree(GetTreeResponse),
     Paths(GetPathsResponse),
     Sessions(GetSessionsResponse),
+    /// The four remote queries, which Go answers as a **map**, not a struct.
+    ///
+    /// `GetNodeInfoResponse map[string]json.RawMessage` (`nodeinfo.go:150`) and
+    /// `DebugGetSelfResponse map[string]interface{}` (`proto.go:249`) are both
+    /// maps, and `encoding/json` writes a map with its keys sorted — so a
+    /// `serde_json` map, which is a `BTreeMap`, matches. This is the one place a
+    /// map body is right, and the reason is that Go has one too. Each has
+    /// exactly one entry, so key order cannot differ anyway.
+    Map(Value),
 }
 
 impl Serialize for Body {
@@ -193,6 +347,7 @@ impl Serialize for Body {
             Body::Tree(b) => b.serialize(s),
             Body::Paths(b) => b.serialize(s),
             Body::Sessions(b) => b.serialize(s),
+            Body::Map(v) => v.serialize(s),
         }
     }
 }
@@ -536,6 +691,9 @@ async fn dispatch(
     }
     if name == "addpeer" || name == "removepeer" {
         return change_peer(name, args, tx).await;
+    }
+    if let Some(what) = RemoteQuery::for_command(name) {
+        return remote_query(what, args, tx).await;
     }
     let snap = report(tx).await?;
     Ok(match name {

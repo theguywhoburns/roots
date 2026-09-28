@@ -149,6 +149,53 @@ impl Router {
         self.dropped_no_link
     }
 
+    /// The link a payload for `dest` would leave by: the greedy next hop toward
+    /// `dest`'s position in the spanning tree.
+    ///
+    /// This is Go's `_lookup` (`router.go:685-757`) asked as a question rather
+    /// than as a send. The remote admin queries need it because Go answers them
+    /// by handing the request to `PacketConn.WriteTo`, which routes through the
+    /// pathfinder — not to whichever link happened to be first. `None` means no
+    /// live link takes us closer, which is the same answer `_lookup` gives.
+    pub fn next_hop(
+        &self,
+        links: &crate::link::LinkSet,
+        dest: &[u8; KEY_LEN],
+    ) -> Option<crate::link::LinkId> {
+        let path = self.root_path_for(dest)?;
+        // A fresh watermark, as Go's `WriteTo` gets: `traffic.watermark =
+        // ^uint64(0)` (packetconn.go:86), so the first candidate always wins on
+        // distance and the cost comparison only breaks ties.
+        self.greedy_next(links, &path, &mut { u64::MAX })
+    }
+
+    /// Destinations we are holding a payload for, waiting on a DHT notify.
+    ///
+    /// Go keeps the same queue inside `pathfinder.rumors[xkey(dest)].traffic`
+    /// and never exposes it, but a caller that queues a packet needs to be able
+    /// to say how much is still in flight — otherwise a lookup that never
+    /// completes is a black hole.
+    pub fn pending_routes(&self) -> Vec<crate::address::Address> {
+        let mut out: Vec<crate::address::Address> = self
+            .path
+            .rumors
+            .values()
+            .filter(|r| r.pending.is_some())
+            .map(|r| {
+                let want = r.dest;
+                self.path
+                    .entries
+                    .keys()
+                    .find(|k| crate::bloom::xkey(k) == crate::bloom::xkey(&want))
+                    .map(crate::address::addr_for_key)
+                    .unwrap_or_else(|| crate::address::addr_for_key(&want))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Spanning-tree entries as `(key, parent, seq)`, sorted by key
     /// (for diagnostics / admin adapter).
     pub fn tree_entries(&self) -> Vec<([u8; KEY_LEN], [u8; KEY_LEN], u64)> {

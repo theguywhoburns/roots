@@ -228,12 +228,25 @@ impl Links {
         });
     }
 
-    /// Cancel the redial loop for a configured peer, and **keep** the live link:
-    /// a divergence from Go, whose `links.remove` cancels the context *and*
-    /// closes the connection (`link.go:433-438`) whatever its doc comment claims
-    /// ("The peer is not disconnected immediately", `core/api.go:203`). Go's row
-    /// therefore disappears with the link; ours stays, `up: true`, until the link
-    /// dies by itself. Slice 5 chose this; Slice 9 owns the comparison.
+    /// The id of the link this row currently holds, if any. Asked **before**
+    /// [`Links::remove`], which forgets the row and with it the id.
+    pub fn live_id(&self, uri: &str, sintf: &str) -> Option<roots::LinkId> {
+        self.find(uri, sintf)
+            .and_then(|at| self.entries[at].live)
+            .map(|(id, _)| id)
+    }
+
+    /// Cancel the redial loop for a configured peer and forget the row.
+    ///
+    /// Go's `links.remove` does this *and* closes the live connection
+    /// (`link.go:433-438`), so the row vanishes from `getPeers` together with the
+    /// link. The caller closes the link, because only it holds the set; this
+    /// returns the id that names it.
+    ///
+    /// Slice 5 deliberately kept the link open here, on the strength of the
+    /// comment at `core/api.go:207-211` ("The peer is not disconnected
+    /// immediately"). Reading Go rather than its comment showed the opposite
+    /// (`link.go:438` is the `conn.Close()`), so the divergence is gone.
     pub fn remove(&mut self, uri: &str, sintf: &str) -> Result<(), LinkError> {
         let at = self.find(uri, sintf).ok_or(LinkError::NotConfigured)?;
         self.entries.remove(at);
