@@ -6,4 +6,5 @@ pub mod admin;
 pub mod config;
 pub mod links;
 pub mod listen;
+pub mod multicast;
 pub mod node;

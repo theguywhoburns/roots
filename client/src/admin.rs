@@ -38,11 +38,9 @@ fn unknown_action(name: &str) -> String {
 /// `AddHandler` triples, lowercased because Go registers and looks up with
 /// `strings.ToLower`. Sorted, because `list` sorts.
 ///
-/// `getTun` (`tun/admin.go:31`) and `getMulticastInterfaces`
-/// (`multicast/admin.go:50`) are still missing: their answers need a kernel
-/// interface and multicast socket state, which arrive with Slices 14 and 11.
-/// `list` says what the node can do, so it says twelve commands rather than
-/// Go's fourteen.
+/// `getTun` (`tun/admin.go:31`) is still missing: its answer needs a kernel
+/// interface, which arrives with Slice 14. `list` says what the node can do, so
+/// it says thirteen commands rather than Go's fourteen.
 const COMMANDS: &[(&str, &str, &[&str])] = &[
     (
         "addpeer",
@@ -58,6 +56,12 @@ const COMMANDS: &[(&str, &str, &[&str])] = &[
     ),
     ("debug_remotegetpeers", "Debug use only", &["key"]),
     ("debug_remotegettree", "Debug use only", &["key"]),
+    (
+        "getmulticastinterfaces",
+        // Go's literal description (`multicast/admin.go:56`).
+        "Show which interfaces multicast is enabled on",
+        &[],
+    ),
     (
         "getnodeinfo",
         "Request nodeinfo from a remote node by its public key",
@@ -242,6 +246,10 @@ fn decode_args(name: &str, args: &Value) -> Result<(), String> {
         "getpaths" => ("GetPathsRequest", &[]),
         "getsessions" => ("GetSessionsRequest", &[]),
         "getpeers" => ("GetPeersRequest", &["sort"]),
+        // The handler declares an empty struct and `json.Unmarshal`s into it
+        // (`multicast/admin.go:58-59`), so nothing in it can be the wrong type —
+        // but a non-object argument still is, exactly as for `getself`.
+        "getmulticastinterfaces" => ("multicast.GetMulticastInterfacesRequest", &[]),
         "addpeer" => ("AddPeerRequest", &["uri", "interface"]),
         "removepeer" => ("RemovePeerRequest", &["uri", "interface"]),
         // The four remote handlers live in `core`, not `admin`, so their
@@ -327,6 +335,8 @@ enum Body {
     Tree(GetTreeResponse),
     Paths(GetPathsResponse),
     Sessions(GetSessionsResponse),
+    /// `getMulticastInterfaces` (`multicast/admin.go:15-20`).
+    Multicast(GetMulticastInterfacesResponse),
     /// The four remote queries, which Go answers as a **map**, not a struct.
     ///
     /// `GetNodeInfoResponse map[string]json.RawMessage` (`nodeinfo.go:150`) and
@@ -349,6 +359,7 @@ impl Serialize for Body {
             Body::Tree(b) => b.serialize(s),
             Body::Paths(b) => b.serialize(s),
             Body::Sessions(b) => b.serialize(s),
+            Body::Multicast(b) => b.serialize(s),
             Body::Map(v) => v.serialize(s),
         }
     }
@@ -485,13 +496,18 @@ async fn bind_unix(path: &str) -> Result<Bound, io::Error> {
 
 /// Accept forever: one task per connection, exactly Go's `listen`
 /// (`admin.go:288-304`).
-pub async fn serve_admin(bound: Bound, tx: mpsc::UnboundedSender<Cmd>) {
+pub async fn serve_admin(
+    bound: Bound,
+    tx: mpsc::UnboundedSender<Cmd>,
+    ifaces: crate::multicast::InterfaceTable,
+) {
     loop {
         match bound.accept().await {
             Ok(sock) => {
                 let tx = tx.clone();
+                let ifaces = ifaces.clone();
                 tokio::spawn(async move {
-                    admin_conn(sock, tx).await;
+                    admin_conn(sock, tx, ifaces).await;
                 });
             }
             // Go keeps looping here without pausing, which turns a dead
@@ -507,11 +523,16 @@ pub async fn serve_admin(bound: Bound, tx: mpsc::UnboundedSender<Cmd>) {
 /// Serve one admin connection, in Go's `handleRequest` shape (`admin.go:307`):
 /// decode a value, answer it, and stop only when the request did not ask to be
 /// kept alive — including when answering it failed.
-async fn admin_conn(mut sock: Box<dyn AdminStream>, tx: mpsc::UnboundedSender<Cmd>) {
+async fn admin_conn(
+    mut sock: Box<dyn AdminStream>,
+    tx: mpsc::UnboundedSender<Cmd>,
+    ifaces: crate::multicast::InterfaceTable,
+) {
     let mut buf = Vec::new();
     let mut at_eof = false;
     loop {
-        let (outcome, echo, keepalive) = handle_one(&mut sock, &mut buf, &mut at_eof, &tx).await;
+        let (outcome, echo, keepalive) =
+            handle_one(&mut sock, &mut buf, &mut at_eof, &tx, &ifaces).await;
         let resp = match outcome {
             Ok(response) => Response {
                 status: "success",
@@ -547,6 +568,7 @@ async fn handle_one(
     buf: &mut Vec<u8>,
     at_eof: &mut bool,
     tx: &mpsc::UnboundedSender<Cmd>,
+    ifaces: &crate::multicast::InterfaceTable,
 ) -> (Result<Body, String>, Request, bool) {
     let zero = Request {
         request: String::new(),
@@ -576,7 +598,7 @@ async fn handle_one(
     if let Err(error) = decode_args(&name, &args) {
         return (Err(error), echo, keepalive);
     }
-    (dispatch(&name, &args, tx).await, echo, keepalive)
+    (dispatch(&name, &args, tx, ifaces).await, echo, keepalive)
 }
 
 /// Go's `decoder.Decode(&buf)` then `json.Unmarshal(buf, &req)`: a bare JSON
@@ -687,6 +709,7 @@ async fn dispatch(
     name: &str,
     args: &Value,
     tx: &mpsc::UnboundedSender<Cmd>,
+    ifaces: &crate::multicast::InterfaceTable,
 ) -> Result<Body, String> {
     if name == "list" {
         return Ok(Body::List(list_body()));
@@ -696,6 +719,9 @@ async fn dispatch(
     }
     if let Some(what) = RemoteQuery::for_command(name) {
         return remote_query(what, args, tx).await;
+    }
+    if name == "getmulticastinterfaces" {
+        return Ok(multicast_interfaces(ifaces));
     }
     let snap = report(tx).await?;
     Ok(match name {
@@ -1036,6 +1062,73 @@ struct SessionEntry {
 #[derive(Serialize)]
 struct GetSessionsResponse {
     sessions: Vec<SessionEntry>,
+}
+
+/// Go's `GetMulticastInterfacesResponse` (`multicast/admin.go:15-20`), with its
+/// one field and Go's spelling.
+#[derive(Serialize)]
+struct GetMulticastInterfacesResponse {
+    multicast_interfaces: Vec<multicast_state::State>,
+}
+
+/// Go's `MulticastInterfaceState` (`multicast/admin.go:21-27`) has five fields
+/// and no `omitempty`, so all five are always present. It needs `Serialize`, and
+/// the field order must be Go's declaration order because a `serde_json` map
+/// would sort them alphabetically instead.
+mod multicast_state {
+    use serde::Serialize;
+
+    /// The row as Go declares it, field for field and in order.
+    #[derive(Serialize)]
+    pub(super) struct State {
+        pub name: String,
+        /// `-` when nothing is listening, which is Go's own placeholder
+        /// (`multicast/admin.go:41`) rather than an empty string.
+        pub address: String,
+        pub beacon: bool,
+        pub listen: bool,
+        /// Whether a password is set, never the password: Go reports
+        /// `len(intf.password) > 0` (`multicast/admin.go:44`).
+        pub password: bool,
+    }
+
+    impl From<crate::multicast::MulticastInterfaceState> for State {
+        fn from(s: crate::multicast::MulticastInterfaceState) -> Self {
+            State {
+                name: s.name,
+                address: s.address,
+                beacon: s.beacon,
+                listen: s.listen,
+                password: s.password,
+            }
+        }
+    }
+}
+
+/// `getMulticastInterfaces`: the multicast task's own table, read under its
+/// lock.
+///
+/// Go answers from inside the multicast actor (`multicast/admin.go:30-48`),
+/// which is what keeps the read consistent with the tick that writes it. Ours
+/// publishes once a tick and reads here, which is the same consistency with a
+/// cheaper hand-off — see `multicast::InterfaceTable` for why this is the only
+/// lock in the client.
+///
+/// A node with no multicast module answers an empty list rather than an error,
+/// because Go's handler is registered unconditionally and a host where the bind
+/// failed still has the actor, with nothing in it.
+fn multicast_interfaces(ifaces: &crate::multicast::InterfaceTable) -> Body {
+    let mut rows: Vec<crate::multicast::MulticastInterfaceState> =
+        ifaces.lock().map(|guard| guard.clone()).unwrap_or_default();
+    // Go sorts here rather than where it collects, because its source is a map
+    // and map order is random (`multicast/admin.go:46-48`,
+    // `slices.SortStableFunc` on `res.Interfaces`). Ours is a list, but the sort
+    // stays in the answer for the same reason: it is the answer's guarantee, not
+    // the producer's.
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Body::Multicast(GetMulticastInterfacesResponse {
+        multicast_interfaces: rows.into_iter().map(Into::into).collect(),
+    })
 }
 
 /// Go's `SessionEntry` (`getsessions.go:18-24`) also carries `bytes_recvd`,

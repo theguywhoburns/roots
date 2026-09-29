@@ -922,10 +922,105 @@ pub async fn dial(
     opts: &LinkOptions,
 ) -> Result<PeerConn<Tcp>, Error> {
     let peer = parse_peer_uri(uri)?;
-    let stream = tokio::time::timeout(DIAL_TIMEOUT, Tcp::dial(&peer.host_port, DIAL_TIMEOUT))
+    let stream = tokio::time::timeout(DIAL_TIMEOUT, connect_tcp(&peer.host_port))
         .await
         .map_err(|_| Error::Timeout)??;
     complete_dial(stream, &peer, local, opts).await
+}
+
+/// Connect to a `host:port`, resolving an IPv6 zone name to a scope id.
+///
+/// Two things are wrong with handing such a string to `getaddrinfo`, and both
+/// were found by running two nodes rather than by reading anything:
+///
+///  - `[fe80::1%eth0]:0` fails outright with `Name or service not known`, which
+///    is how a multicast-discovered peer failed to dial (`links.rs` spawns the
+///    dial with the URI as given).
+///  - a name in the zone has to be turned into a number anyway, because the
+///    kernel socket API takes a scope *id*. Go's `net` resolves the name for you;
+///    `getaddrinfo` only resolves an address when it is doing a lookup at all,
+///    and here there is nothing to look up.
+///
+/// So a bracketed IPv6 literal with a zone is parsed here and connected to
+/// directly as a `SocketAddrV6`, and everything else — a hostname, an IPv4
+/// literal, a `fe80::` address with no zone — is handed to `TcpStream::connect`
+/// exactly as before.
+pub(crate) async fn connect_tcp(host_port: &str) -> std::io::Result<TcpStream> {
+    match socket_addr_with_zone(host_port) {
+        Some(addr) => TcpStream::connect(addr).await,
+        None => TcpStream::connect(host_port).await,
+    }
+}
+
+/// The `SocketAddrV6` a `host:port` denotes, if its host is an IPv6 literal
+/// whose zone is a name this host knows.
+///
+/// `None` for everything else, and for a zone name that is not an interface —
+/// which leaves the caller's `getaddrinfo` path to report it, rather than this
+/// function inventing an address.
+pub(crate) fn socket_addr_with_zone(host_port: &str) -> Option<std::net::SocketAddrV6> {
+    let (host, rest) = host_port.split_once(']')?;
+    let host = host.strip_prefix('[')?;
+    let port: u16 = rest.trim_start_matches(':').parse().ok()?;
+    let (addr, zone) = match host.split_once('%') {
+        Some((a, z)) => (a, Some(z)),
+        None => (host, None),
+    };
+    let addr: std::net::Ipv6Addr = addr.parse().ok()?;
+    // A numeric zone is already what the kernel wants and needs no lookup.
+    let scope = match zone {
+        None => 0,
+        Some(z) => z.parse::<u32>().ok().or_else(|| interface_index(z))?,
+    };
+    Some(std::net::SocketAddrV6::new(addr, port, 0, scope))
+}
+
+/// A network interface's index, from `/proc/net/if_inet6`.
+///
+/// The file's columns are address, **ifindex**, prefix length, scope, flags,
+/// name — so one pass gives the index for every interface that has an IPv6
+/// address, which is every interface a link-local peering can use.
+///
+/// `/proc/net` rather than `/sys/class/net` for a reason that only running two
+/// nodes showed: `sysfs` is not namespace-aware unless it is remounted, so
+/// inside `unshare -n` it still lists the *host's* interfaces and
+/// `/sys/class/net/mca0/ifindex` does not exist for an interface just created in
+/// the namespace. `/proc/self/net` follows the process's network namespace, so it
+/// is right in both cases. (A second reason to avoid the syscall: `if_nametoindex`
+/// needs a C binding, and the library has no dependencies to spare — `smoltcp`,
+/// `tun` and `serde_json` are all absent by design.)
+///
+/// `/sys/class/net/<name>/ifindex` is tried second, for an interface with no IPv6
+/// address at all. On the host that is where a zone's interface usually is; in a
+/// fresh namespace it is simply absent, which is fine, because such an interface
+/// cannot carry a link-local peering anyway.
+///
+/// `None` for a name that is neither, which is what a zone naming something else
+/// means.
+pub fn interface_index(name: &str) -> Option<u32> {
+    if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in text.lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            // Six columns, and the name is the last. A name cannot contain a
+            // space, so the count is enough to know the line is well formed.
+            if cols.len() >= 6
+                && cols[5] == name
+                && let Ok(index) = u32::from_str_radix(cols[1], 16)
+            {
+                return Some(index);
+            }
+        }
+    }
+    // A name with a path separator is never an interface, and it would let a
+    // caller read outside `/sys/class/net`.
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Merge URI query options over the configured defaults (Go `links.add`).
@@ -1015,6 +1110,72 @@ pub async fn dial_any(uri: &str, local: &SigningKey, opts: &LinkOptions) -> Resu
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// A peering URI's zone is the interface the peering leaves by, and a
+    /// multicast-discovered one is always link-local — so this is not a corner
+    /// case, it is how a discovered peer is dialled.
+    ///
+    /// Handing `[fe80::1%eth0]:1` to `getaddrinfo` fails with `Name or service not
+    /// known`, which is exactly how a discovered peer failed to dial until this
+    /// was parsed here instead. A zone that is already a number needs no lookup,
+    /// which is why the listen URI uses one.
+    #[test]
+    fn a_zoned_link_local_address_becomes_a_socket_addr() {
+        let got = socket_addr_with_zone("[fe80::1%3]:9001").expect("a zone index");
+        assert_eq!(got.ip().to_string(), "fe80::1");
+        assert_eq!(got.port(), 9001);
+        assert_eq!(
+            got.scope_id(),
+            3,
+            "a numeric zone is already what the kernel wants"
+        );
+    }
+
+    /// A named zone is resolved through the interface table, and `lo` is the one
+    /// interface every Linux test host is guaranteed to have — so the assertion
+    /// does not depend on which interfaces the machine running it has.
+    #[test]
+    fn a_named_zone_resolves_to_an_index() {
+        let got = socket_addr_with_zone("[fe80::1%lo]:1").expect("lo is an interface");
+        assert_eq!(
+            got.scope_id(),
+            interface_index("lo").expect("lo has an index"),
+            "the zone name became the index `lo` has"
+        );
+        assert_ne!(got.scope_id(), 0, "and never the 0 that means 'nowhere'");
+    }
+
+    /// Everything that is not a bracketed IPv6 literal keeps the old path, so a
+    /// hostname is still a hostname and an IPv4 address still reaches
+    /// `getaddrinfo`. Inventing an address here would be worse than useless.
+    #[test]
+    fn everything_else_is_left_for_name_resolution() {
+        for host_port in [
+            "1.2.3.4:1234",
+            "example.invalid:443",
+            "[fe80::1%no-such-iface]:1", // an unknown interface is not ours to guess at
+            "not-a-host-port",
+            "",
+        ] {
+            assert_eq!(
+                socket_addr_with_zone(host_port),
+                None,
+                "{host_port:?} should fall through to getaddrinfo"
+            );
+        }
+    }
+
+    /// `lo` is the interface the test host certainly has; anything else may not
+    /// exist, and an unknown name must be `None` rather than 0 — a 0 scope id
+    /// sends the datagram out the default route, where it vanishes.
+    #[test]
+    fn an_unknown_interface_has_no_index() {
+        assert_eq!(interface_index("lo"), Some(1).or(interface_index("lo")));
+        assert_eq!(interface_index("no-such-iface-xyz"), None);
+        assert_eq!(interface_index(""), None);
+        // A name with a separator could read outside `/sys/class/net`.
+        assert_eq!(interface_index("../../etc/passwd"), None);
+    }
 
     #[test]
     fn uri_parsing() {

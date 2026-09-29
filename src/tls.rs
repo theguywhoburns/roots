@@ -108,6 +108,15 @@ pub(crate) fn server_config() -> Arc<rustls::ServerConfig> {
 }
 
 /// SNI host: `?sni=` override, else the authority host (brackets stripped).
+/// The SNI to offer, per Go's rule at `link.go:216-228`: an explicit `?sni=`
+/// wins, then the host — but only if the host is **not** an IP address, because
+/// SNI is a name and an address is not one.
+///
+/// The zone is stripped before that test. Go does not strip it, so a link-local
+/// peer ends up with `fe80::1%eth0` as its SNI there; the address alone is enough
+/// to make the decision, and stripping it means a `tls://[fe80::1]:1` dial takes
+/// the "no SNI" branch, which is what Go does for a zoneless address and what
+/// rustls needs.
 pub(crate) fn sni_host(peer: &PeerUri) -> Result<String, Error> {
     if let Some(sni) = &peer.sni {
         return Ok(sni.clone());
@@ -117,12 +126,29 @@ pub(crate) fn sni_host(peer: &PeerUri) -> Result<String, Error> {
         .rsplit_once(':')
         .map(|(h, _)| h)
         .unwrap_or(&peer.host_port);
-    Ok(host
+    let host = host
         .strip_prefix('[')
         .unwrap_or(host)
         .strip_suffix(']')
+        .unwrap_or(host);
+    Ok(host
+        .split_once('%')
+        .map(|(a, _)| a)
         .unwrap_or(host)
         .to_string())
+}
+
+/// A rustls `ServerName` for an SNI string.
+///
+/// rustls types the name, where Go's `tls.Client` takes any string at all, so the
+/// two shapes have to be told apart rather than hoped for: an IP literal becomes
+/// an `IpAddress`, which sends no SNI — matching Go's rule that an address is not
+/// a name — and anything else becomes a `DnsName`.
+fn server_name(sni: &str) -> Result<ServerName<'static>, Error> {
+    if let Ok(ip) = sni.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(ip.into()));
+    }
+    ServerName::try_from(sni.to_string()).map_err(|_| Error::BadUri(sni.to_string()))
 }
 
 pub(crate) async fn tls_connect(
@@ -130,11 +156,11 @@ pub(crate) async fn tls_connect(
     sni: &str,
     timeout: Duration,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, Error> {
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect(host_port))
+    let tcp = tokio::time::timeout(timeout, crate::link::connect_tcp(host_port))
         .await
         .map_err(|_| Error::Timeout)?
         .map_err(Error::Io)?;
-    let name = ServerName::try_from(sni.to_string()).map_err(|_| Error::BadUri(sni.to_string()))?;
+    let name = server_name(sni)?;
     let connector = tokio_rustls::TlsConnector::from(client_config());
     tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, connector.connect(name, tcp))
         .await
@@ -212,6 +238,59 @@ pub async fn tls_accept(
 mod tests {
     use super::*;
     use crate::link::LinkOptions;
+
+    /// Go's rule at `link.go:216-228`: an explicit `?sni=` wins, and otherwise
+    /// the host is used only if it is **not** an IP address, because SNI is a
+    /// name.
+    ///
+    /// The zone is stripped before that test. Leaving it in made rustls reject the
+    /// name outright — `bad peer URI: fe80::b%eth0` — which is how a
+    /// multicast-discovered peer failed to dial: Go's `tls.Client` takes any
+    /// string, rustls's `ServerName` is a type that must be a DNS name or an IP.
+    #[test]
+    fn an_ip_address_is_not_a_name_and_gets_no_sni() {
+        for (uri, want) in [
+            ("tls://example.invalid:1", "example.invalid"),
+            ("tls://192.0.2.1:1", "192.0.2.1"),
+            ("tls://[2001:db8::1]:1", "2001:db8::1"),
+            // The two link-local forms a discovered peer arrives in.
+            ("tls://[fe80::1]:1", "fe80::1"),
+            ("tls://[fe80::1%3]:1", "fe80::1"),
+            ("tls://[fe80::b%eth0]:1", "fe80::b"),
+            // An explicit `?sni=` is used whatever the host looks like.
+            ("tls://[fe80::1%3]:1?sni=named.invalid", "named.invalid"),
+        ] {
+            let peer = crate::link::parse_link_uri(uri).expect("a valid URI").1;
+            assert_eq!(
+                sni_host(&peer).expect("an SNI"),
+                want,
+                "{uri} should offer {want}"
+            );
+        }
+    }
+
+    /// rustls types the name, so the SNI has to be mapped onto one of its two
+    /// shapes: an IP literal becomes an `IpAddress` — which sends no SNI, exactly
+    /// as Go's "an address is not a name" rule intends — and anything else a
+    /// `DnsName`. A zoneless link-local address takes this path too, so it is
+    /// covered rather than assumed.
+    #[test]
+    fn the_sni_becomes_an_ip_address_or_a_dns_name() {
+        assert!(matches!(
+            server_name("192.0.2.1"),
+            Ok(ServerName::IpAddress(_))
+        ));
+        assert!(matches!(
+            server_name("fe80::1"),
+            Ok(ServerName::IpAddress(_))
+        ));
+        assert!(matches!(
+            server_name("example.invalid"),
+            Ok(ServerName::DnsName(_))
+        ));
+        // Nothing else is a valid name, and saying so beats panicking here.
+        assert!(server_name("not a name").is_err());
+    }
 
     #[tokio::test]
     async fn tls_loopback_handshake() {

@@ -1,7 +1,7 @@
 //! The admin socket's framing, checked against bytes captured from a real Go
 //! 0.5.14 node (`docs/protocol/21-admin.md`, Slice 7).
 //!
-//! Seven claims, all of them loopback:
+//! Eight claims, all of them loopback:
 //! 1. both transports Go's `AdminListen` understands answer identically, and the
 //!    socket file gets Go's mode;
 //! 2. a body keeps Go's struct field order, which a `serde_json::Value` would
@@ -13,7 +13,9 @@
 //! 6. an argument of the wrong JSON type is refused in Go's own words, before
 //!    the command runs;
 //! 7. `getPeers` prints Go's `PeerEntry` fields — all sixteen of them, and only
-//!    the ones its `omitempty` tags do not hide.
+//!    the ones its `omitempty` tags do not hide;
+//! 8. `getMulticastInterfaces` reports the multicast task's table, with `-` for an
+//!    interface nothing is listening on and a bool rather than a password.
 //!
 //! The three `sort` modes are proved in `admin.rs`'s own tests instead: they need
 //! rows whose cost, uptime and direction are chosen, which no loopback mesh can
@@ -26,8 +28,9 @@ use ed25519_dalek::SigningKey;
 use roots::LinkOptions;
 use roots_client::admin::{Bound, bind_admin, serve_admin};
 use roots_client::listen::spawn_listeners;
+use roots_client::multicast::{InterfaceTable as MulticastTable, MulticastInterfaceState};
 use roots_client::node::{Cmd, Node};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::mpsc;
@@ -57,12 +60,18 @@ impl Server {
     /// A socket on top of a node the caller drives, for the tests that need a
     /// peer to report on rather than an empty table.
     async fn on(tx: mpsc::UnboundedSender<Cmd>) -> Self {
+        Self::with_table(tx, roots_client::multicast::empty_table()).await
+    }
+
+    /// A socket whose multicast table the caller can fill, for
+    /// `getMulticastInterfaces`.
+    async fn with_table(tx: mpsc::UnboundedSender<Cmd>, ifaces: MulticastTable) -> Self {
         let bound = bind_admin("tcp://127.0.0.1:0")
             .await
             .expect("bind_admin")
             .expect("a real address was asked for");
         let addr = bound.addr();
-        tokio::spawn(serve_admin(bound, tx));
+        tokio::spawn(serve_admin(bound, tx, ifaces));
         Self { addr }
     }
 
@@ -78,7 +87,11 @@ impl Server {
             matches!(bound, Bound::Unix(_)),
             "unix:// must bind a unix socket"
         );
-        tokio::spawn(serve_admin(bound, tx));
+        tokio::spawn(serve_admin(
+            bound,
+            tx,
+            roots_client::multicast::empty_table(),
+        ));
         Self { addr: path }
     }
 
@@ -207,12 +220,12 @@ async fn admin_unix_socket_matches_tcp() {
     );
     let body: Value = serde_json::from_slice(&one).expect("one value");
     assert_eq!(body["status"], "success");
-    // Twelve since Slice 9 added `getNodeInfo` and the three `debug_remoteGet*`
-    // (`core/api.go:239-259`). Go's own fourteen are `getTun`
-    // (`tun/admin.go:31`) and `getMulticastInterfaces`
-    // (`multicast/admin.go:50`), which need a kernel interface and multicast
-    // socket state and arrive with Slices 14 and 11.
-    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(12));
+    // Thirteen: Slice 9 added `getNodeInfo` and the three `debug_remoteGet*`
+    // (`core/api.go:239-259`) and Slice 11 added `getMulticastInterfaces`
+    // (`multicast/admin.go:56`). Go's own fourteen are those plus `getTun`
+    // (`tun/admin.go:31`), which needs a kernel interface and arrives with
+    // Slice 14.
+    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(13));
 
     // Go's `os.Chmod(path, 0660)` (`admin.go:118`).
     let mode = std::fs::metadata(unix.host())
@@ -827,5 +840,123 @@ async fn admin_getpeers_reports_every_field_go_does() {
     assert!(
         latency > 0 && latency % 10_000 == 0,
         "Go rounds the round trip to hundredths of a millisecond: {text}"
+    );
+}
+
+/// `getMulticastInterfaces` reads the multicast task's table and nothing else
+/// (`multicast/admin.go:30-48`), so the claims here are about what it does and
+/// does not do with a row.
+///
+/// Three of Go's details are easy to get wrong and each is asserted:
+///   - the five fields are always present, because `MulticastInterfaceState` has
+///     no `omitempty` (`multicast/admin.go:21-27`);
+///   - an interface nothing is listening on reports `-`, not an empty string
+///     (`multicast/admin.go:41`);
+///   - `password` is a **bool**. Go answers `len(intf.password) > 0` and never
+///     the password itself (`multicast/admin.go:44`), because the reader already
+///     has the config file.
+#[tokio::test]
+async fn admin_getmulticastinterfaces_reports_the_table_and_no_passwords() {
+    let ifaces: MulticastTable = roots_client::multicast::empty_table();
+    *ifaces.lock().unwrap() = vec![
+        // Two interfaces, given to the socket **out of name order**, because Go
+        // sorts by name before answering (`multicast/admin.go:46-48`) and a map
+        // is where an unsorted table would otherwise hide.
+        MulticastInterfaceState {
+            name: "wlan0".into(),
+            address: "-".into(),
+            beacon: true,
+            listen: true,
+            password: true,
+        },
+        MulticastInterfaceState {
+            name: "eth0".into(),
+            address: "[fe80::1%eth0]:9000".into(),
+            beacon: true,
+            listen: false,
+            password: false,
+        },
+    ];
+    let server = Server::with_table(spawn_node().await, ifaces).await;
+    let mut reader = Reader::new(server.connect().await);
+
+    let one = reader.ask(r#"{"request":"getMulticastInterfaces"}"#).await;
+    let body: Value = serde_json::from_slice(&one).expect("one value");
+    assert_eq!(body["status"], "success");
+    let rows = body["response"]["multicast_interfaces"]
+        .as_array()
+        .expect("a list");
+    assert_eq!(rows.len(), 2, "{one:?}");
+
+    assert_eq!(rows[0]["name"], "eth0", "sorted by name: {one:?}");
+    assert_eq!(
+        rows[0]["address"], "[fe80::1%eth0]:9000",
+        "the bound listener's own address"
+    );
+    assert_eq!(rows[0]["beacon"], true);
+    assert_eq!(rows[0]["listen"], false);
+    assert_eq!(
+        rows[0]["password"], false,
+        "`password` is a bool, never the password"
+    );
+
+    // Every field, every time, **in Go's declaration order**. The order has to
+    // be checked on the raw bytes: reading the answer into a `serde_json::Value`
+    // sorts the keys, because `serde_json::Map` is a `BTreeMap`. An assertion
+    // made through a parsed value would pass on a body built from a map, which
+    // is the mistake `docs/protocol/21-admin.md` warns about.
+    let text = String::from_utf8(one.clone()).expect("utf-8");
+    let at = |needle: &str| {
+        text.find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {text}"))
+    };
+    let mut order: Vec<(&str, usize)> = [
+        "\"name\"",
+        "\"address\"",
+        "\"beacon\"",
+        "\"listen\"",
+        "\"password\"",
+    ]
+    .into_iter()
+    .map(|k| (k, at(k)))
+    .collect();
+    order.sort_by_key(|(_, at)| *at);
+    assert_eq!(
+        order.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        [
+            "\"name\"",
+            "\"address\"",
+            "\"beacon\"",
+            "\"listen\"",
+            "\"password\""
+        ],
+        "Go's declaration order, all five, with nothing omitted: {text}"
+    );
+
+    assert_eq!(
+        rows[1]["address"], "-",
+        "Go's placeholder for an interface with no listener, not an empty \
+         string: {one:?}"
+    );
+    assert_eq!(
+        rows[1]["password"], true,
+        "a set password is reported as true"
+    );
+}
+
+/// A node whose multicast module never started — a host where the group bind
+/// failed — still has the handler, because Go registers it unconditionally
+/// (`multicast/admin.go:55-64`). The answer is an empty list, not an error.
+#[tokio::test]
+async fn admin_getmulticastinterfaces_on_a_node_with_no_module_is_empty() {
+    let server = Server::tcp().await;
+    let mut reader = Reader::new(server.connect().await);
+    let one = reader.ask(r#"{"request":"getMulticastInterfaces"}"#).await;
+    let body: Value = serde_json::from_slice(&one).expect("one value");
+    assert_eq!(body["status"], "success", "{one:?}");
+    assert_eq!(
+        body["response"]["multicast_interfaces"],
+        json!([]),
+        "an empty list, not a null and not an error: {one:?}"
     );
 }
