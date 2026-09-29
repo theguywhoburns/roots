@@ -215,6 +215,36 @@ impl Router {
     /// liveness check, the same one [`Router::resolve`] makes before it reads
     /// a frame. The payload that follows the notify picks its own next hop
     /// through the pathfinder.
+    ///
+    /// `payload` is an **application payload** — a whole IP packet, for the TUN —
+    /// and it goes out as a **session message**, not as the traffic frame's
+    /// payload. Those are different layers, and the difference is the whole
+    /// reason a TUN works:
+    ///
+    /// - Ironwood's layering is app → **session** → **pathfinder** → link:
+    ///   `encrypted.PacketConn.WriteTo` → `sessions.writeTo` →
+    ///   `network.PacketConn.WriteTo` (`encrypted/packetconn.go:66-84`, then
+    ///   `network/packetconn.go:72-93`). Our `session_send` → `net_send` →
+    ///   `pathfinder_send` is exactly that chain.
+    /// - So the IP packet is **box-sealed against the peer's session key first**,
+    ///   and only the sealed blob is a traffic frame's payload. `ipv6rwc` calls
+    ///   `core.WriteTo` in both directions (`ipv6rwc.go:82`, `:307`), and
+    ///   `Core.WriteTo` prepends the type byte to the *plaintext* before handing
+    ///   it down (`core.go:210-216`).
+    ///
+    /// This reached **below** the session layer at first, straight to
+    /// `pathfinder_send`, and the TUN silently carried nothing: the frame left
+    /// the sender, the counter moved, and the far end's `handle_session_bytes`
+    /// dropped it because a raw IP packet is not a session message. Measured as
+    /// 100% ICMP loss over a link that was `up: true` on both ends. Two things
+    /// were missing at once — the type byte *and* the seal — and either alone is
+    /// fatal, which is why the empty test suite did not catch it and the real
+    /// device did.
+    ///
+    /// The DHT lookup keeps its one job, which is Go's: learn the **key** behind
+    /// an address. Go holds the packet against the address in the key store
+    /// (`ipv6rwc.go:84-102`) and the path-notify callback writes it out through
+    /// `core.WriteTo` (`ipv6rwc.go:66-68`) — never through a traffic frame.
     pub async fn send_or_resolve(
         &mut self,
         links: &mut LinkSet,
@@ -225,26 +255,29 @@ impl Router {
         if links.peer_of(via).is_none() {
             return Err(Error::NoLink);
         }
-        let known = self.key_for_addr(dest);
-        // A usable path, not merely a key: `_handleTraffic` takes the path
-        // branch only when the entry exists, and a broken one sends a
-        // `PathBroken` and re-looks-up instead (`pathfinder.go:196-210`).
-        let routed = known
-            .and_then(|k| self.path.entries.get(&k))
-            .is_some_and(|e| !e.broken);
-        // A queued lookup always carries the lossy key the address gives, never
-        // a full one: Go's keyStore only learns a key from a notify, and by
-        // then it has a path and writes rather than looking up
-        // (`ipv6rwc.go:79-82`).
-        let key = match (routed, known) {
-            (true, Some(k)) => k,
-            _ => crate::address::lookup_key_for_addr(dest),
-        };
-        // `_handleTraffic` (pathfinder.go:194-224): attach the learned path, or
-        // start a lookup and hold the payload in that destination's one slot,
-        // overwriting whatever was held there (`pathfinder.go:211-222`).
-        self.pathfinder_send(links, key, payload).await?;
-        Ok(if routed { Route::Sent } else { Route::Queued })
+        // No type byte here. `session_send` is the thing that adds it
+        // (`session_send_kind(..., PACKET_TYPE_TRAFFIC, ...)`, `session.rs:400`),
+        // which is where Go adds it too (`core.go:210-216`) and why the payload
+        // is passed on as it arrived. Putting one on *here* as well is a
+        // plausible-looking double prepend that the far end answers by delivering
+        // a packet whose first byte is `0x01` instead of `0x60` — measured, and
+        // the kernel drops it as malformed.
+        let msg = payload;
+        if let Some(key) = self.key_for_addr(dest) {
+            // A notify or a session already named the key, so no lookup:
+            // `session_send` boxes it now, or holds it behind an init if the
+            // session is not up yet (`ipv6rwc.go:82` → `core.WriteTo`).
+            self.session_send(links, key, msg).await?;
+            return Ok(Route::Sent);
+        }
+        // No key yet. The lossy key is all an address gives us and a session
+        // cannot be opened to one, so this is a *lookup*, not a send. One slot
+        // per destination, overwriting whatever was held — ironwood's
+        // `rumors[xform].traffic` (`pathfinder.go:211-222`), and Go's key store
+        // does the same (`ipv6rwc.go:88-92`).
+        let lossy = crate::address::lookup_key_for_addr(dest);
+        self.hold_for_lookup(links, lossy, msg).await?;
+        Ok(Route::Queued)
     }
 
     /// The full key that owns `addr`, from the keys a notify or a session

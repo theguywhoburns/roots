@@ -6,23 +6,26 @@
 //! A—B—C over loopback TCP, all three routers ours. A (the sender) and B (the
 //! relay) link first; C (the destination) only dials after the payloads have
 //! been held, so "the overwritten payload was never delivered" is a fact about
-//! the wire rather than a race. A's link and C's link are both tapped, so the
-//! test reads which payload bytes left the sender and which arrived at the
-//! destination, instead of inferring delivery from a frame counter.
+//! the destination rather than a race.
+//!
+//! **Delivery is read off C's session inbox**, not off a link tap. That is not a
+//! style choice: a payload crosses the link **box-sealed**, because the session
+//! layer sits above the pathfinder (`encrypted/packetconn.go:66-84` then
+//! `network/packetconn.go:72-93`), so on the wire it is ciphertext. This test
+//! used to tap both links and byte-scan them, and it passed — against a seam
+//! that shipped the payload in the clear, straight into a traffic frame. The tap
+//! was reading a plaintext that no working mesh ever sends, so it could not have
+//! caught it. Asking the far end what it received is both readable and the
+//! stronger claim: it says the session decrypted and the type byte said traffic.
 //!
 //! Loopback only: no device, no privileges, no network.
 
-use std::io;
-use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
 
 use roots::address::{KEY_LEN, addr_for_key, subnet_for_key};
 use roots::driver::Route;
@@ -37,65 +40,15 @@ const TICK: Duration = Duration::from_millis(100);
 /// loaded machine: a lookup is re-driven on a 1 s maintenance tick
 /// (`MAINTENANCE_INTERVAL`) and throttled to one a second (`PATH_THROTTLE`),
 /// and the bloom B advertises to A has to reach A before a lookup for C can
-/// leave at all.
+/// leave at all. A delivery is now several round trips — notify, session init,
+/// ack, payload — so this is the budget for the chain, not for one hop.
 const BUDGET: Duration = Duration::from_secs(60);
 
-/// Long enough that finding one in a tap log is a fact about a payload rather
-/// than a coincidence inside a signature.
+/// Long enough that finding one in a destination's inbox is a fact about a
+/// payload rather than a coincidence inside a signature.
 const FIRST: &[u8] = b"roots-resolve-queue-first-payload";
 const SECOND: &[u8] = b"roots-resolve-queue-second-payload";
 const THIRD: &[u8] = b"roots-resolve-queue-third-payload";
-
-/// A link that keeps a copy of every byte crossing it.
-///
-/// The router frames its own reads and writes (`link.rs` `read_frame_from` /
-/// `write_frame_to`), so the tap sits underneath the framing and records raw
-/// bytes; the test then searches that log for a whole payload. A tap is a byte
-/// stream, not a frame boundary, so the search is a byte scan: a payload is
-/// long and ASCII, and nothing else on the link can hold it.
-struct Tap {
-    inner: TcpStream,
-    log: Arc<Mutex<Vec<u8>>>,
-}
-
-impl AsyncRead for Tap {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let res = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = res {
-            let fresh = &buf.filled()[before..];
-            self.log.lock().expect("tap log").extend_from_slice(fresh);
-        }
-        res
-    }
-}
-
-impl AsyncWrite for Tap {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        self.log.lock().expect("tap log").extend_from_slice(buf);
-        Pin::new(&mut self.inner).poll_write(cx, buf)
-    }
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-/// True when bytes containing `needle` crossed a tapped link.
-fn saw(log: &Arc<Mutex<Vec<u8>>>, needle: &[u8]) -> bool {
-    let log = log.lock().expect("tap log");
-    log.windows(needle.len()).any(|w| w == needle)
-}
 
 /// The routed subnet of `key` written as a full address: the eight bytes
 /// `writePC` copies out of a packet before asking `sendToSubnet`
@@ -106,42 +59,14 @@ fn subnet_address(key: &[u8; KEY_LEN]) -> Address {
     Address(raw)
 }
 
-/// Wrap a finished handshake so the link is tapped.
-///
-/// `AnyConn` is a plain struct of public fields and mints its `LinkId` from the
-/// same counter as every other link (`link.rs:176-203`), so building one by
-/// hand is the only way to put a tap in the set.
-fn tapped(conn: PeerConn, log: Arc<Mutex<Vec<u8>>>) -> AnyConn {
-    AnyConn {
-        remote_key: conn.remote_key,
-        priority: conn.priority,
-        kind: conn.kind.clone(),
-        inbound: conn.inbound,
-        id: LinkId::absent(),
-        remote_addr: conn.remote_addr.clone(),
-        stream: Box::new(Tap {
-            inner: conn.stream,
-            log,
-        }),
-    }
-}
-
 /// Register a connection and add it to the set.
 ///
 /// `register` writes the bloom and the signature request through the
 /// connection, so it runs before the connection joins the set, exactly as a
 /// caller that registered once per link must.
-async fn join(
-    router: &mut Router,
-    set: &mut LinkSet,
-    conn: PeerConn,
-    tap: Option<Arc<Mutex<Vec<u8>>>>,
-) -> LinkId {
+async fn join(router: &mut Router, set: &mut LinkSet, conn: PeerConn) -> LinkId {
     let remote = conn.remote_key;
-    let mut conn = match tap {
-        Some(log) => tapped(conn, log),
-        None => AnyConn::new(conn),
-    };
+    let mut conn = AnyConn::new(conn);
     let id = conn.id;
     router
         .register(&mut conn, remote, id)
@@ -178,6 +103,20 @@ enum Cmd {
         dest_key: [u8; KEY_LEN],
         reply: Sender<State>,
     },
+    /// What C's session inbox holds: the payloads that actually arrived.
+    ///
+    /// This is the destination-side read, and it is here because the wire tap
+    /// cannot be. A payload crosses the link **box-sealed** — the session layer
+    /// is above the pathfinder (`encrypted/packetconn.go:66-84`), so `SECOND`'s
+    /// bytes are ciphertext on the wire and a byte scan will never find them.
+    /// They used to cross in the clear, which is exactly the bug this slice's
+    /// seam had: the tap was reading plaintext that a working mesh never sends.
+    ///
+    /// So "did it arrive" is asked of the far end's inbox, which is also the
+    /// question an operator asks. Reading a delivered payload is a stronger
+    /// claim than seeing its bytes go past: it says the session decrypted and the
+    /// type byte said traffic, not merely that a frame was written.
+    Inbox(Sender<Vec<Vec<u8>>>),
     /// B: accept one more inbound link, C's.
     AcceptMore,
     /// C: dial B.
@@ -226,6 +165,27 @@ async fn state(tx: &Sender<Cmd>, dest_key: [u8; KEY_LEN]) -> State {
     round_trip(tx, |reply| Cmd::State { dest_key, reply }, "state").await
 }
 
+/// Everything the destination's session inbox holds, drained.
+///
+/// Drained rather than cloned because the inbox is the *only* place a delivered
+/// payload is readable, and a payload that stays there would be mistaken for one
+/// that arrived twice.
+async fn inbox(tx: &Sender<Cmd>) -> Vec<Vec<u8>> {
+    round_trip(tx, Cmd::Inbox, "inbox").await
+}
+
+/// Did `payload` arrive at a node that is not the sender?
+///
+/// Whole-packet equality, not `starts_with`. The session layer adds a type byte
+/// to the plaintext and strips it again on the way out, so a correct send lands
+/// the payload untouched — and a mesh that prepended a *second* type byte would
+/// still match a `starts_with` here and then be dropped by the kernel as
+/// malformed. That is not hypothetical: it is the version this seam had until
+/// Slice 14's device showed it.
+fn arrived(got: &[Vec<u8>], payload: &[u8]) -> bool {
+    got.iter().any(|p| p == payload)
+}
+
 async fn send(tx: &Sender<Cmd>, dest: Address, payload: &[u8]) -> Route {
     round_trip(
         tx,
@@ -243,10 +203,10 @@ async fn send(tx: &Sender<Cmd>, dest: Address, payload: &[u8]) -> Route {
 /// How a node gets its links: A dials at once, B accepts A at once and C when
 /// told, C dials when told.
 enum Wiring {
-    /// Dial this now; the link is tapped when a log is given.
-    DialNow(String, Option<Arc<Mutex<Vec<u8>>>>),
+    /// Dial this now.
+    DialNow(String),
     /// Dial this when the node is told to join.
-    DialOnJoin(String, Option<Arc<Mutex<Vec<u8>>>>),
+    DialOnJoin(String),
     /// Accept one link now, then one more when told.
     AcceptThenAcceptMore(tokio::net::TcpListener),
 }
@@ -273,17 +233,17 @@ where
 
     // What is still to arrive, once the links that come first are up.
     let (mut dial_on_join, mut accept_more) = match wiring {
-        Wiring::DialNow(uri, tap) => {
+        Wiring::DialNow(uri) => {
             let conn = roots::link::dial(&uri, &sk, &opts).await.expect("dial");
-            join(&mut router, &mut set, conn, tap).await;
+            join(&mut router, &mut set, conn).await;
             (None, None)
         }
-        Wiring::DialOnJoin(uri, tap) => (Some((uri, tap)), None),
+        Wiring::DialOnJoin(uri) => (Some(uri), None),
         Wiring::AcceptThenAcceptMore(listener) => {
             let conn = roots::link::accept(&listener, &sk, &opts)
                 .await
                 .expect("accept first link");
-            join(&mut router, &mut set, conn, None).await;
+            join(&mut router, &mut set, conn).await;
             (None, Some(listener))
         }
     };
@@ -315,10 +275,13 @@ where
                         has_path: router.has_path(&dest_key),
                     });
                 }
+                Cmd::Inbox(reply) => {
+                    let _ = reply.send(router.inbox.drain(..).map(|(_, p)| p).collect());
+                }
                 Cmd::Join => {
-                    if let Some((uri, tap)) = dial_on_join.take() {
+                    if let Some(uri) = dial_on_join.take() {
                         let conn = roots::link::dial(&uri, &sk, &opts).await.expect("dial");
-                        join(&mut router, &mut set, conn, tap).await;
+                        join(&mut router, &mut set, conn).await;
                     }
                 }
                 Cmd::AcceptMore => {
@@ -326,7 +289,7 @@ where
                         let conn = roots::link::accept(&listener, &sk, &opts)
                             .await
                             .expect("accept");
-                        join(&mut router, &mut set, conn, None).await;
+                        join(&mut router, &mut set, conn).await;
                     }
                 }
             }
@@ -367,24 +330,14 @@ async fn scenario(subnet: bool) {
     let stop_a = Arc::new(AtomicBool::new(false));
     let stop_b = Arc::new(AtomicBool::new(false));
     let stop_c = Arc::new(AtomicBool::new(false));
-    // A's link: what the sender put on the wire. C's link: what the
-    // destination received.
-    let a_wire = Arc::new(Mutex::new(Vec::new()));
-    let c_wire = Arc::new(Mutex::new(Vec::new()));
 
     let a_task = {
-        let (sk, rx, stop, wire, uri) = (
-            a_sk.clone(),
-            a_rx,
-            stop_a.clone(),
-            a_wire.clone(),
-            uri.clone(),
-        );
+        let (sk, rx, stop, uri) = (a_sk.clone(), a_rx, stop_a.clone(), uri.clone());
         tokio::spawn(async move {
             drive(
                 sk.clone(),
                 Router::new(sk),
-                Wiring::DialNow(uri, Some(wire)),
+                Wiring::DialNow(uri),
                 rx,
                 stop,
                 |_, _| (),
@@ -407,12 +360,12 @@ async fn scenario(subnet: bool) {
         })
     };
     let c_task = {
-        let (sk, rx, stop, wire) = (c_sk.clone(), c_rx, stop_c.clone(), c_wire.clone());
+        let (sk, rx, stop) = (c_sk.clone(), c_rx, stop_c.clone());
         tokio::spawn(async move {
             drive(
                 sk.clone(),
                 Router::new(sk),
-                Wiring::DialOnJoin(uri, Some(wire)),
+                Wiring::DialOnJoin(uri),
                 rx,
                 stop,
                 |_, _| (),
@@ -471,34 +424,36 @@ async fn scenario(subnet: bool) {
     assert_eq!(send(&a_tx, dest, SECOND).await, Route::Queued);
     let s = state(&a_tx, c_pub).await;
     assert_eq!(s.pending.len(), 1, "one slot per destination");
-    // Nothing has left: C is not in the mesh, so no notify can arrive, and a
-    // payload that is only held never reaches a socket.
+    // Nothing has left the process: C is not in the mesh, so no notify can
+    // arrive, and a held payload opens no session and writes no frame. The
+    // sender's own state is the evidence, because the wire is sealed — a
+    // byte-scan of a link would find neither payload now and would be
+    // indistinguishable from one that never tried.
     assert!(
-        !saw(&a_wire, FIRST) && !saw(&a_wire, SECOND),
-        "a held payload must not reach the wire before the notify"
+        s.sessions.is_empty() && !s.has_path,
+        "a held payload opens no session and builds no path: {s:?}"
     );
 
     // 3. The destination joins. A re-drives the lookup on its own maintenance
     //    tick, C answers, the notify comes back, and the payload goes out with
-    //    no second call from this test.
+    //    no second call from this test. Delivery is then several round trips —
+    //    notify, session init, ack, payload — so this waits on C's inbox.
     c_tx.send(Cmd::Join).expect("C task is alive");
     b_tx.send(Cmd::AcceptMore).expect("B task is alive");
     let end = tokio::time::Instant::now() + BUDGET;
-    while !saw(&c_wire, SECOND) {
+    let mut got: Vec<Vec<u8>> = Vec::new();
+    while !arrived(&got, SECOND) {
         assert!(
-            !saw(&c_wire, FIRST) && !saw(&a_wire, FIRST),
+            !arrived(&got, FIRST),
             "the overwritten payload was sent, so the slot is a queue"
         );
         assert!(
             tokio::time::Instant::now() < end,
             "the notify never delivered the held payload"
         );
+        got.extend(inbox(&c_tx).await);
         tokio::time::sleep(TICK).await;
     }
-    assert!(
-        saw(&a_wire, SECOND),
-        "the delivered payload never left the sender"
-    );
     // 5. The queue is empty again once the payload is on its way, and A now
     //    knows the key behind the address.
     let s = state(&a_tx, c_pub).await;
@@ -509,29 +464,40 @@ async fn scenario(subnet: bool) {
     );
     assert!(s.has_path, "the notify must leave A holding a path to C");
 
-    // 4. A destination we already have a path to goes out at once.
+    // 4. A destination we already have a path to goes out at once. And it
+    //    arrives whole, which is the claim the type byte and the seal exist for:
+    //    a payload that went out unboxed, or with one type byte too many, reads
+    //    here as a packet the destination could not use.
     assert_eq!(
         send(&a_tx, dest, THIRD).await,
         Route::Sent,
         "a known path must send, not queue"
     );
     let end = tokio::time::Instant::now() + BUDGET;
-    while !saw(&c_wire, THIRD) {
+    while !arrived(&got, THIRD) {
         assert!(
             tokio::time::Instant::now() < end,
             "a payload on a known path never arrived"
         );
+        got.extend(inbox(&c_tx).await);
         tokio::time::sleep(TICK).await;
     }
+    assert_eq!(
+        got.iter().find(|p| *p == THIRD).expect("THIRD arrived"),
+        THIRD,
+        "and it is the payload, byte for byte"
+    );
 
     // More slices, then the same question again: "overwritten" must not have
     // meant "delayed".
     for _ in 0..10 {
         tokio::time::sleep(TICK).await;
     }
+    got.extend(inbox(&c_tx).await);
     assert!(
-        !saw(&a_wire, FIRST) && !saw(&c_wire, FIRST),
-        "the overwritten payload was delivered after all"
+        !arrived(&got, FIRST),
+        "the overwritten payload was delivered after all: {:?}",
+        got
     );
     assert!(
         state(&a_tx, c_pub).await.pending.is_empty(),

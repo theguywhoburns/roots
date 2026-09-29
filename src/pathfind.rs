@@ -33,6 +33,21 @@ pub(crate) struct RumorEntry {
     pub send_at: Option<std::time::Instant>,
     pub deadline: std::time::Instant,
     pub pending: Option<Vec<u8>>,
+    /// Is the held `pending` payload an **application** payload rather than a
+    /// sealed session blob?
+    ///
+    /// One slot for both, because one payload per destination is the whole point
+    /// (`pathfinder.go:211-222`, and Go's key store at `ipv6rwc.go:88-92`) — but
+    /// the notify that flushes it has to know which layer it belongs to, and
+    /// getting that wrong is silent in the worst way. A sealed blob flushed
+    /// through `session_send` comes out double-boxed and the far end discards it
+    /// on a failed decrypt; an application payload flushed through
+    /// `pathfinder_send` is unencrypted, reaches the wire, and is discarded by
+    /// the session layer's type-byte check instead. Neither raises anything.
+    ///
+    /// `send_lookup`'s own `pending` writes leave this `false` — they are
+    /// `pathfinder_send`'s, and those are always sealed.
+    pub pending_is_app: bool,
 }
 
 /// How long a learned path is kept without inbound traffic (Go `pathTimeout`).
@@ -450,14 +465,29 @@ impl crate::router::Router {
                 },
             );
         }
-        if let Some(data) = self
+        let held = self
             .path
             .rumors
             .get_mut(&crate::bloom::xkey(&notify.source))
-            .and_then(|r| r.pending.take())
-        {
+            .and_then(|r| r.pending.take().map(|p| (p, r.pending_is_app)));
+        if let Some((data, is_app)) = held {
             let dest = notify.source;
-            self.pathfinder_send(links, dest, data).await?;
+            // An application payload goes out as a **session** message, which is
+            // the only thing the far end can read: `ipv6rwc.go:66-68` writes Go's
+            // held packet out through `core.WriteTo`, never as a traffic frame.
+            // The path notify is the *first* thing that names the full key, so
+            // this is also the first moment a session could be opened to it —
+            // and that the session layer then has to open one is the design, not
+            // a problem to solve here.
+            //
+            // A sealed blob (everything `net_send` holds) goes back down through
+            // `pathfinder_send`, which is where it came from and now has a path
+            // to attach.
+            if is_app {
+                self.session_send(links, dest, data).await?;
+            } else {
+                self.pathfinder_send(links, dest, data).await?;
+            }
         }
         Ok(())
     }
@@ -514,11 +544,56 @@ impl crate::router::Router {
             send_at: None,
             deadline: now + PATH_TIMEOUT,
             pending: None,
+            pending_is_app: false,
         });
         e.send_at = Some(now);
         e.deadline = now + PATH_TIMEOUT;
         // Boxed: the lookup/notify/send graph is mutually recursive.
         Box::pin(self.send_lookup(links, dest)).await
+    }
+
+    /// Hold an **application** payload against this destination's single slot and
+    /// make sure a lookup is out, so the notify that names the key can write it
+    /// out through the session layer.
+    ///
+    /// A separate name from [`Router::pathfinder_send`] on purpose. That one
+    /// carries a payload the session layer already sealed, and this one carries
+    /// a bare application payload that still needs a session; both land in the
+    /// same slot, and [`Router::handle_notify`] is the one place that has to tell
+    /// them apart. Two functions with the same name would hide the difference at
+    /// the two call sites that get it wrong silently — a raw packet put in a
+    /// traffic frame reaches the wire and dies in the far end's session layer.
+    pub(crate) async fn hold_for_lookup(
+        &mut self,
+        links: &mut LinkSet,
+        dest: [u8; KEY_LEN],
+        payload: Vec<u8>,
+    ) -> Result<(), Error> {
+        let now = std::time::Instant::now();
+        let x = crate::bloom::xkey(&dest);
+        let already = self
+            .path
+            .rumors
+            .get(&x)
+            .and_then(|r| r.send_at)
+            .map(|t| now.duration_since(t) < PATH_THROTTLE)
+            .unwrap_or(false);
+        // The hold comes first and unconditionally: `rumor_lookup` returns early
+        // when it is throttling, and a payload that only got held on a non-throttled
+        // call would sit in a slot nothing will ever flush.
+        let e = self.path.rumors.entry(x).or_insert(RumorEntry {
+            dest,
+            send_at: None,
+            deadline: now + PATH_TIMEOUT,
+            pending: None,
+            pending_is_app: false,
+        });
+        e.pending = Some(payload);
+        e.pending_is_app = true;
+        if already {
+            return Ok(());
+        }
+        self.rumor_lookup(links, dest).await
     }
 
     /// Send a network-layer payload, attaching the learned path or
