@@ -25,7 +25,7 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -262,22 +262,134 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
             .await
             .expect("send our meta to open the link");
         stream.flush().await.expect("flush");
-        println!("=== frames from Go (3s window) ===");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+        // Go answers a `SigReq` with a `SigRes` and nothing else, and only for a
+        // request it has not already answered. So the harness has to ask: the
+        // unsolicited burst is `SigReq` + `BloomFilter` + `Announce`, and the
+        // `SigRes` payload — the one with a real `psig` in it — is simply absent
+        // from a passive capture. `SigReq::encode` is ours, which does not
+        // matter: the vector under test is Go's answer.
+        //
+        // The request has to be one Go will accept, so it is the *oracle's* key
+        // and the seq it already used. Go caches answered requests
+        // (`peers.sigCache`, ironwood `network/peers.go`), so a repeated
+        // (node, seq) nonce is silently dropped — which is the third of
+        // AGENTS.md's traps in a new dress.
+        let req = roots::tree::SigReq { seq: 1, nonce: 0 };
+        let mut req_bytes = Vec::new();
+        req.encode(&mut req_bytes);
+        println!("ours(SigReq) {}", hex::encode(&req_bytes));
+        roots::link::write_frame_to(&mut stream, FrameType::SigReq, &req_bytes)
+            .await
+            .expect("send a SigReq");
+
+        // Answer Go's `Announce` with one of our own, so Go accepts us as a tree
+        // peer rather than dropping the link for want of an upstream. Built by
+        // hand rather than by a router because this harness is the byte-level
+        // oracle and a router in the loop would make the capture depend on the
+        // thing under test.
+        //
+        // MEASURED: this does *not* produce a second, non-empty bloom. Go accepts
+        // the announce, keeps the link open, and does not re-advertise its
+        // filter inside the 30 s window — one bloom, still empty. So the bloom
+        // bit order stays pinned by a generator vector rather than by the
+        // installed binary (`src/bloom.rs`, `bloom_vector_matches_go`, and the
+        // note on `the_flag_layout_is_flags_then_data`). The code is kept because
+        // the announce is a real interop check: if our `Announce` were malformed
+        // Go would close the link, and that is a cheap thing to assert by eye in
+        // the log.
+        //
+        // The shapes are Go's: `Announce{key, parent, res{req, port, psig}, sig}`,
+        // where `res.psig` is signed by the parent and `sig` by the announcer
+        // (`router.go:409-416`).
+        let our_sk = SigningKey::from_bytes(&OUR_SEED);
+        let our_pk = our_sk.verifying_key().to_bytes();
+        // We are our own parent, since we have no upstream: the same shape as
+        // the root announce Go sent us, and `Announce::check` requires exactly
+        // this (`port == 0 && key == parent`).
+        //
+        // So `psig` is signed over *our* key as both `node` and `parent` — which
+        // is not the preimage of the `SigRes` Go sent us above. That one is
+        // signed over (our key, Go's key), because Go answers a request with a
+        // preimage naming the *requester* (`network/router.go:412`). An announce
+        // carries a `SigRes` about its own `key`, and a node with no upstream
+        // answers its own request.
+        let sigreq = roots::tree::SigReq { seq: 1, nonce: 0 };
+        let sigres = roots::tree::SigRes::seal(sigreq, 0, &our_pk, &our_sk, &our_pk);
+        // The outer `sig` covers the same preimage as `psig` — node ‖ parent ‖
+        // req ‖ port — signed by the announcer rather than by the parent
+        // (`Announce::check` verifies both over `res.bytes_for_sig`).
+        let preimage = sigres.bytes_for_sig(&our_pk, &our_pk);
+        let ann = roots::tree::Announce {
+            key: our_pk,
+            parent: our_pk,
+            res: sigres,
+            sig: our_sk.sign(&preimage).to_bytes(),
+        };
+        assert!(
+            ann.check(),
+            "our own announce must satisfy our own checker before we send it"
+        );
+        let mut ann_bytes = Vec::new();
+        ann.encode(&mut ann_bytes);
+        println!("ours(Announce) {}", hex::encode(&ann_bytes));
+        roots::link::write_frame_to(&mut stream, FrameType::Announce, &ann_bytes)
+            .await
+            .expect("send an Announce");
+
+        println!("=== frames from Go ===");
+        // Generous, and it stays in place because the report at the end says
+        // what did *not* arrive: a second bloom, or a session. Both are open
+        // gaps in the evidence (`src/bloom.rs`, and the session formats in
+        // `docs/protocol/README.md`), and a capture that silently printed
+        // nothing would hide them.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut got = 0;
+        let mut blooms = 0;
+        let mut seen_session = false;
         while let Ok(Some((raw, ftype, payload))) =
             tokio::time::timeout_at(deadline, read_frame_raw(&mut stream)).await
         {
             got += 1;
+            if ftype == FrameType::BloomFilter {
+                blooms += 1;
+            }
             println!(
                 "{:?} payload={} raw={}",
                 ftype,
                 hex::encode(&payload),
                 hex::encode(&raw)
             );
+            // A session rides inside a `Traffic` frame: there is no session
+            // frame type, because the path-encrypted `Traffic` payload *is* the
+            // session message (`encrypted/packetconn.go:66-84` →
+            // `network/packetconn.go:72-93`). Its payload is sealed to *our* box
+            // key, which we hold, so unlike a peer's we can read it.
+            if ftype == FrameType::Traffic {
+                seen_session = true;
+                match roots::traffic::Traffic::decode(&payload) {
+                    Ok(tr) => {
+                        println!(
+                            "GO_SESSION src={} n={}",
+                            hex::encode(tr.source),
+                            tr.payload.len()
+                        );
+                        println!("GO_SESSION_HEX {}", hex::encode(&tr.payload));
+                    }
+                    Err(e) => println!("(traffic decode failed: {e})"),
+                }
+            }
         }
         if got == 0 {
-            println!("(no frame arrived within 3s)");
+            println!("(no frame arrived within the window)");
+        }
+        if blooms < 2 {
+            println!("(only {blooms} bloom(s): Go's filter is still empty, so the");
+            println!(" flag bit order stays pinned by a generator vector — see");
+            println!(" `the_flag_layout_is_flags_then_data` in src/bloom.rs)");
+        }
+        if !seen_session {
+            println!("(no Traffic frame: no session was opened, so no session bytes)");
         }
     }
 

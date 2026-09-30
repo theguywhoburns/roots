@@ -5,7 +5,7 @@ others can embed, with the wire protocol documented well enough to be a
 reference — and bring the stitched-in client up to parity with Go's `yggdrasil`
 binary so the client is a specimen of the library, not part of it.
 
-- Gate 1 — Product: APPROVED 2026-09-24 (metric refined at Gate 2: 12 of 22 formats guarded today)
+- Gate 1 — Product: APPROVED 2026-09-24 (metric refined at Gate 2: 12 of 22 formats guarded today — **that figure is the gate's, and it counts Go's own test expectations; see "Slice 13" below for the measured split**)
 - Gate 2 — Architecture: APPROVED 2026-09-24 (option B: `roots` + `client` workspace)
 - Gate 3 — Program Design: APPROVED 2026-09-24
 - Gate 4 — Slice plan: APPROVED 2026-09-24 (14 slices; Slice 14 marked optional — TUN is userland, not a library goal)
@@ -36,10 +36,13 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 10 — multicast codec + state machine in the library (no sockets) — DONE 2026-09-28, `src/multicast.rs`, 8 tests, 20/20 mutation reversions killed
 - [x] Slice 11 — multicast sockets in the client + captured Go beacon — DONE 2026-09-29, `client/src/multicast.rs` + `getMulticastInterfaces` + `proof/9-multicast.sh`. **Five bugs found by running two nodes, none of which reading Go would have found**: the `if_inet6` scope column, a named zone not resolving through `getaddrinfo`, rustls refusing a zoneless IP as a server name, one socket being unable to say which interface a datagram arrived on, and a beacon gated on a port nothing ever reported. Details in the commit message and below.
 - [x] Slice 12 — `send_or_resolve` resolve-and-hold seam (library only, no privileges) — DONE 2026-09-28, `Router::send_or_resolve` + `Route` in `src/driver.rs`, `pending_routes`/`next_hop` in `src/views.rs`, `tests/resolve_queue.rs` (3 tests), 5/5 reversions killed. Three places the plan doc was wrong (`via` is a `LinkId` not a key; the flush is one layer deeper than cited; `Route` is ours, not Go's).
-- [ ] Slice 13 — remaining wire vectors + 22/22 coverage refresh. **Not started.** A
-  subagent was given this and returned without writing anything; the tree is
-  untouched. It needs a Go 0.5.14 capture under `unshare -Urn` for each format,
-  so it is not a typing job.
+- [x] Slice 13 — remaining wire vectors + a 22/22 coverage refresh. **Partly
+  done, and the refresh was worth more than the vectors.** `SigRes` and
+  `SigRes.psig` are now captured from the installed binary — `examples/go_capture.rs
+  --frames` grew a `SigReq` + `Announce` exchange for exactly this — and
+  `SigReq`/`Announce`/`BloomFilter` are *decoded and asserted* rather than only
+  envelope-checked, in `go_tree_payloads_match_captured`. Plus a page,
+  `docs/protocol/30-tree.md`. The finding is in the section below.
 - [x] Slice 14 — client TUN bridge (dead last: `CAP_NET_ADMIN`, cannot run in CI)
   — DONE 2026-09-29, `client/src/tun.rs` + `Node::open_tun`/`Cmd::Tun` in
   `client/src/node.rs` + `getTun` in `client/src/admin.rs` + `proof/10-tun.sh`
@@ -50,6 +53,45 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
   100% ICMP loss over a link that was `up: true` on both ends. Fixed in
   `53c6d36`; the test that should have caught it was reading plaintext off a
   wire tap, which no working mesh ever sends. Details below.
+
+## Slice 13 — the coverage count was wrong, and measuring it was the work
+
+The number this project has carried since Slice 2 is "14 of 22 formats guarded
+by captured Go bytes". It was never refreshed, and it was counting things it
+should not have. Slice 13's real output is a table that labels every format with
+the provenance it actually has (`docs/protocol/README.md`), and the honest split
+of the 22 is:
+
+**7 captured · 6 transcribed · 1 partial · 4 round-trip or semantics only ·
+4 unguarded**
+
+Three findings are worth keeping:
+
+1. **"Guarded" had been counting Go's own test expectations.** The address
+   vectors are byte-identical to
+   `reference/yggdrasil-go/src/address/address_test.go`, and
+   `examples/go_capture.rs`'s own header says transcribed expectations "prove
+   nothing about our bytes". So the count was crediting the wrong oracle. The
+   vectors are still worth having; they are labelled now.
+2. **A captured bloom payload was sitting in `tests/go_vectors.rs` guarding
+   nothing.** `FRAME_BLOOM` was used only by the envelope test, which never
+   called the bloom decoder. One assertion converts it, and it pins the flag
+   *block order* — which nothing else did, because swapping the two blocks is
+   self-consistent. That swap is now killed by
+   `the_flag_layout_is_flags_then_data`.
+3. **The bloom's bit order *within* a byte cannot be captured from this harness,
+   and the code now says so rather than implying otherwise.** Go's first filter
+   is empty, and an all-ones flag block has every position set, so MSB-first and
+   LSB-first encoders produce identical bytes — measured, by reversion, against
+   a comment that claimed otherwise. The bit order is pinned by a generator
+   vector, and `examples/go_capture.rs` records why the binary cannot supply it:
+   answering Go's `Announce` does not make it re-advertise a non-empty filter.
+
+Still open, and each is a *capture* rather than a typing job: session `ack` and
+`key` have no captured bytes and `key` is exercised by no test at all; multicast
+has a round-trip test and a non-Go blake2b KAT but no captured beacon
+(`04-slices.md` promised a `GO_MULTICAST_BEACON` that was never written); and 17
+of the 22 formats still have no page.
 
 ## Slice 14 — what a real device found
 

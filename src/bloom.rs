@@ -466,6 +466,55 @@ mod tests {
         assert_eq!(hex::encode(b.encode()), BLOOM);
     }
 
+    /// The flag layout: which block is which, and where the data words sit.
+    ///
+    /// This is a self-consistency claim a swap cannot survive. Swapping `flags0`
+    /// and `flags1` in `encode` kills it (measured), and so does doing the same
+    /// to `decode_exact`; nothing else in the file catches that swap.
+    ///
+    /// The bit order *within* a byte is deliberately **not** claimed here:
+    /// flipping `0x80 >>` to `1 <<` in both directions is self-consistent and
+    /// passes. That half is carried by `bloom_vector_matches_go` above, against
+    /// bytes from a Go generator — and the captured empty filter in
+    /// `tests/go_vectors.rs` cannot help with it, because an all-ones flag block
+    /// has every position set, so MSB-first and LSB-first encoders produce
+    /// identical bytes for it (measured). A second, non-empty bloom from the Go
+    /// binary would settle it against the installed version rather than a
+    /// generator; `examples/go_capture.rs --frames` says why it cannot get one,
+    /// and that is a real gap in the evidence rather than a stylistic one.
+    #[test]
+    fn the_flag_layout_is_flags_then_data() {
+        let mut b = BloomFilter::new();
+        b.add(&[0x42; KEY_LEN]);
+        let enc = hex::encode(b.encode());
+        // The format's own contribution, said independently of the hash: a
+        // clear bit in flags0 means a data word, and the data words follow the
+        // 32 flag bytes in index order.
+        let raw = hex::decode(&enc).expect("hex");
+        let (flags0, rest) = raw.split_at(BLOOM_FLAGS);
+        let (flags1, data) = rest.split_at(BLOOM_FLAGS);
+        assert_eq!(data.len() % 8, 0, "data words are 8 bytes each");
+        let words = data.len() / 8;
+        let mut at = 0;
+        for w in 0..BLOOM_WORDS {
+            let zero = flags0[w / 8] & (0x80 >> (w % 8)) != 0;
+            let ones = flags1[w / 8] & (0x80 >> (w % 8)) != 0;
+            assert!(!(zero && ones), "word {w} cannot be both zero and all-ones");
+            if !zero && !ones {
+                assert!(
+                    at < words,
+                    "a clear flag bit at word {w} with no data word to match"
+                );
+                at += 1;
+            }
+        }
+        assert_eq!(at, words, "every data word accounted for, none invented");
+        assert!(
+            flags1.iter().all(|b| *b == 0),
+            "no word is all-ones for one key, so flags1 is empty"
+        );
+    }
+
     #[test]
     fn bloom_test_semantics() {
         let r = key(RPUB);

@@ -17,6 +17,7 @@ use roots::PeerKind;
 use roots::frame::{self, FrameType};
 use roots::handshake::{Meta, PREAMBLE, SIG_LEN};
 use roots::{addr_for_key, subnet_for_key};
+use roots::{bloom, tree};
 
 /// The seed the capture configured into Go.
 const GO_SEED: [u8; 32] = [0x5c; 32];
@@ -44,8 +45,31 @@ ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3\
 /// `BloomFilter` then the root `Announce` (`addPeer`, ironwood
 /// `network/router.go:136-143`). The nonces inside them are random, so these
 /// are envelope evidence, not re-encodable structs.
-const FRAME_SIGREQ: &str = "0c0202989088dbb5989884a701";
+const FRAME_SIGREQ: &str = "0c0202f4a6dfc495bdbeb4f601";
 const FRAME_BLOOM: &str = "2105ffffffffffffffffffffffffffffffff00000000000000000000000000000000";
+/// `SigRes`, which a passive capture never sees.
+///
+/// Go sends one only in answer to a `SigReq` it has not already answered
+/// (`_handleRequest`, ironwood `network/router.go:409-416`), and the unsolicited
+/// burst after a handshake is `SigReq` + `BloomFilter` + `Announce`. So the
+/// harness sends a request first — `examples/go_capture.rs --frames`, which is
+/// why this vector did not exist for the first four slices.
+///
+/// The request that produced it was `SigReq { seq: 1, nonce: 0 }` for the
+/// harness's own identity, and the response echoes it back verbatim
+/// (`routerSigRes{routerSigReq: *req}`, `:410-413`). That echo is the assertion
+/// that catches a field-order mistake: every field of `SigRes` is a uvarint
+/// except the signature, so a swapped pair is two plausible small numbers.
+///
+/// `port: 1` is the **requester's** port, not the responder's — Go fills
+/// `port: p.port` from the peer the request arrived on (`:412`).
+const FRAME_SIGRES: &str = "440301000185224f9d08ece29c8c70c62a7aab1b554d75fc11dc2afd5606b97ad32f0\
+7bb11e337a23da6117bd2572499316df4416b49cefe87f566d33de31beddf4028dd06";
+/// The identity the harness dials as, and so the *other* half of the `SigRes`
+/// signature preimage: Go signs `res.bytesForSig(p.key, ourPublicKey)` with its
+/// own key, where `p` is us (`network/router.go:412`). So this vector verifies
+/// against (harness key, Go key) and **not** against Go's key twice.
+const HARNESS_SEED: [u8; 32] = [0x2b; 32];
 const FRAME_ANNOUNCE: &str = "cd0104ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3\
 ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3\
 0193b1f6e39d8cc7c2ae0100\
@@ -141,6 +165,7 @@ fn go_link_frame_envelope_matches_captured() {
     for (vector, want) in [
         (FRAME_SIGREQ, FrameType::SigReq),
         (FRAME_BLOOM, FrameType::BloomFilter),
+        (FRAME_SIGRES, FrameType::SigRes),
         (FRAME_ANNOUNCE, FrameType::Announce),
     ] {
         let raw = bytes(vector);
@@ -161,6 +186,129 @@ fn go_link_frame_envelope_matches_captured() {
             "{want:?}: our encoder must reproduce Go's framing"
         );
     }
+}
+
+/// The three tree payloads, decoded from Go's own bytes and re-encoded to the
+/// same bytes.
+///
+/// Before this, `SigReq`, `SigRes` and `Announce` were only round-tripped
+/// through our own encoder (`sigreq_roundtrip_exact`,
+/// `announce_chain_verifies`), which cannot catch a layout that is
+/// self-consistent and wrong. What each vector adds:
+///
+/// - **`SigRes`** — the field order, and that `port` is the *requester's*
+///   (`network/router.go:412`). The signature preimage is
+///   `node ‖ parent ‖ req ‖ port` (`SigRes::bytes_for_sig`), and the vector
+///   verifies only if all four are right, so a vector that checked would catch
+///   a missing field; one that does not, proves nothing.
+/// - **`Announce`** — that `res.port == 0` with `key == parent` is legal (a
+///   root has no parent to sign for it) and that both signatures verify.
+/// - **`SigReq`** — only the shape, since its nonce is Go's random draw.
+#[test]
+fn go_tree_payloads_match_captured() {
+    let go_pub: [u8; 32] = hex::decode(GO_PUB).unwrap().try_into().unwrap();
+    let our_pub = SigningKey::from_bytes(&HARNESS_SEED)
+        .verifying_key()
+        .to_bytes();
+
+    let payload = |vector: &str| -> Vec<u8> {
+        let raw = bytes(vector);
+        let (_, skip) = frame::read_uvarint(&raw).expect("uvarint length");
+        frame::decode_body(&raw[skip..]).expect("body").1.to_vec()
+    };
+
+    // SigReq: Go's own sequence and the random nonce it drew, 11 bytes of
+    // uvarint in all. The nonce is a 10-byte value, which is why it is read off
+    // the wire rather than written as a literal: a hand-typed `u64` constant
+    // here would be silently truncated and the test would still compile.
+    let req_bytes = payload(FRAME_SIGREQ);
+    let (req, n) = tree::SigReq::decode(&req_bytes).expect("SigReq");
+    assert_eq!(
+        n,
+        req_bytes.len(),
+        "two uvarints and nothing else: {n} of {} consumed",
+        req_bytes.len()
+    );
+    assert_eq!(req.seq, 2, "Go's own sequence number");
+    let mut out = Vec::new();
+    req.encode(&mut out);
+    assert_eq!(out, payload(FRAME_SIGREQ), "our SigReq encoder");
+
+    // SigRes: the request we sent (seq 1, nonce 0) comes back untouched, and
+    // the port is ours.
+    let raw_res = payload(FRAME_SIGRES);
+    let (res, n) = tree::SigRes::decode(&raw_res).expect("SigRes");
+    assert_eq!(n, raw_res.len(), "a trailing field would be a length bug");
+    assert_eq!(
+        (res.req.seq, res.req.nonce, res.port),
+        (1, 0, 1),
+        "the echoed request, and the requester's port"
+    );
+    assert!(
+        res.check(&our_pub, &go_pub),
+        "the signature covers node ‖ parent ‖ req ‖ port, signed by the responder"
+    );
+    assert!(
+        !res.check(&go_pub, &go_pub),
+        "and it is not signed over Go's key twice"
+    );
+    let mut out = Vec::new();
+    res.encode(&mut out);
+    assert_eq!(out, payload(FRAME_SIGRES), "our SigRes encoder");
+
+    // BloomFilter: the captured payload is Go advertising an *empty* filter, and
+    // that is exactly what it proves. `ff`×16 then `00`×16 reads as "every one of
+    // the 128 words is zero", which is what a node sends before its filter has
+    // any bits set.
+    //
+    // What it pins: **flags0 comes before flags1**. Swapped, the payload still
+    // decodes to "every word is zero", because the two blocks are symmetric —
+    // measured, by reversion. And a flag bit means the word is zero or all-ones
+    // rather than a data word, since there is no third block to find.
+    //
+    // What it does *not* pin, and it is worth being exact here: the bit order
+    // *within* a flag byte. An all-ones block has every position set, so
+    // MSB-first (`0x80 >> (idx % 8)`) and LSB-first (`1 << (idx % 8)`) both
+    // produce it — also measured, by reversion. That half of the format rests
+    // on Go's source (`network/bloomfilter.go`) and is pinned by exact bytes in
+    // `src/bloom.rs`. A second, non-empty bloom from Go would close the gap; the
+    // capture cannot get one, and `examples/go_capture.rs --frames` says why.
+    let raw_bloom = payload(FRAME_BLOOM);
+    let bloom = bloom::BloomFilter::decode_exact(&raw_bloom).expect("Go's BloomFilter");
+    // Every bit clear: a filter that matches nothing, which is what Go sends to
+    // a node it has no bits for. `test` is the observable, since the words are
+    // private.
+    for probe in [b"".as_slice(), b"anything", &raw_bloom] {
+        assert!(
+            !bloom.test(probe),
+            "a filter of 128 zero words matches nothing, including {} bytes",
+            probe.len()
+        );
+    }
+    assert_eq!(
+        bloom.encode(),
+        raw_bloom,
+        "our BloomFilter encoder must reproduce Go's bytes"
+    );
+    // The same claim from the other direction, because `decode_exact` and
+    // `encode` are separate code and a symmetric bug in both would pass.
+    assert_eq!(
+        bloom::BloomFilter::new().encode(),
+        raw_bloom,
+        "and a freshly-built empty filter encodes to those bytes"
+    );
+
+    // Announce: the root announcing itself, which is the only shape a capture
+    // can see — a Go node with one peer has no other parent to announce.
+    let ann = payload(FRAME_ANNOUNCE);
+    let ann = tree::Announce::decode_exact(&ann).expect("Announce");
+    assert_eq!(ann.key, go_pub, "a lone Go node announces itself");
+    assert_eq!(ann.parent, go_pub, "as its own parent: it is the root");
+    assert_eq!(ann.res.port, 0, "and has no port to advertise");
+    assert!(ann.check(), "both signatures over the same preimage");
+    let mut out = Vec::new();
+    ann.encode(&mut out);
+    assert_eq!(out, payload(FRAME_ANNOUNCE), "our Announce encoder");
 }
 
 /// Addresses, and how Go renders them.
