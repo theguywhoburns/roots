@@ -272,7 +272,7 @@ impl crate::router::Router {
                     // initiator keys when we initiated first, then always
                     // handle the message as an init — even acks (Go
                     // `_handleAck` !isOld path) — and flush queued payload.
-                    let mut s = Session::for_init(from, &init);
+                    let mut s = Session::for_init(&init);
                     let buffered = self.sess.bufs.remove(&from);
                     if let Some(buf) = &buffered {
                         s.adopt_buffered(buf.send_pub, buf.send_priv, buf.next_pub, buf.next_priv);
@@ -453,7 +453,6 @@ impl crate::router::Router {
 /// One peer's session state. Faithful port of Go `sessionInfo`
 /// (single-threaded; callers handle timers).
 pub struct Session {
-    pub remote: [u8; KEY_LEN],
     seq: u64,
     remote_key_seq: u64,
     current: [u8; 32],
@@ -490,14 +489,13 @@ impl Session {
     }
 
     /// Create from an inbound init (responder side), like Go `_newSession`.
-    pub fn for_init(remote: [u8; KEY_LEN], init: &SessionInit) -> Self {
+    pub fn for_init(init: &SessionInit) -> Self {
         let (recv_pub, recv_priv) = fresh_box();
         let (send_pub, send_priv) = fresh_box();
         let (next_pub, next_priv) = fresh_box();
         let (recv_shared, send_shared, next_send_shared, next_recv_shared) =
             shared4(&init.current, &init.next, &recv_priv, &send_priv);
         Self {
-            remote,
             seq: init.seq.wrapping_sub(1),
             remote_key_seq: 0,
             current: init.current,
@@ -769,12 +767,12 @@ mod tests {
         let dec = SessionInit::decrypt_msg(&b_box_priv, &pa, &enc).unwrap();
         assert_eq!(dec, init);
         // B adopts session, replies ack; A adopts buffered keys then the ack.
-        let mut sb = Session::for_init(pa, &dec);
+        let mut sb = Session::for_init(&dec);
         let ack_init = sb.handle_init(&dec, 101).unwrap();
         let enc_ack = ack_init.encrypt_msg(SESSION_TYPE_ACK, &b, &pa);
         let a_box_priv = ed_to_curve_priv(&[0xA1; 32]);
         let dec_ack = SessionInit::decrypt_msg(&a_box_priv, &pb, &enc_ack).unwrap();
-        let mut sa = Session::for_init(pb, &dec_ack);
+        let mut sa = Session::for_init(&dec_ack);
         sa.adopt_buffered(a_cur_pub, a_cur_priv, a_nxt_pub, a_nxt_priv);
         sa.handle_ack(&dec_ack);
         // Traffic A -> B.

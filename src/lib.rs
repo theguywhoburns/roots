@@ -34,8 +34,8 @@ pub use error::Error;
 pub use frame::FrameType;
 pub use handshake::Meta;
 pub use link::{
-    AnyConn, Link, LinkId, LinkOptions, LinkSet, PeerConn, RunStats, Scheme, Tcp, Transport,
-    complete_accept, complete_dial, dial_any, interface_index, parse_link_uri,
+    AnyConn, Link, LinkId, LinkOptions, LinkSet, PeerConn, Scheme, Tcp, Transport, complete_accept,
+    complete_dial, dial_any, interface_index, parse_link_uri,
 };
 pub use peer::{PeerKind, feat};
 pub use quic::Quic;

@@ -279,8 +279,9 @@ async fn run_multicast(
                     // The index goes in because this URI is for a `bind()`, and
                     // a bind with a zone *name* fails on a host with two
                     // interfaces. The beacon keeps the name, because the name is
-                    // what the peer reads.
-                    let Some(index) = iface_index(&iface) else {
+                    // what the peer reads. Go's `net` resolves a name for every
+                    // zone it is handed; ours resolves it once, here.
+                    let Ok(index) = roots_client::multicast::interface_index(&iface) else {
                         eprintln!("multicast: {iface} has no index, not listening on it");
                         continue;
                     };
@@ -361,12 +362,6 @@ fn with_zone_index(uri: &str, index: u32) -> String {
         return uri.to_string();
     }
     format!("{}%{}{}", &uri[..close], index, &uri[close..])
-}
-
-/// The interface's index, for the listen URI. Go's `net` resolves the name for
-/// every zone it is given; ours has to do it once, here.
-fn iface_index(iface: &str) -> Option<u32> {
-    roots_client::multicast::interface_index(iface).ok()
 }
 
 /// The bound address and port out of a served URI.

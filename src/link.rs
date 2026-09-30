@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use crate::address::KEY_LEN;
 use crate::error::Error;
-use crate::frame::{self, FRAME_KINDS, FrameType, MAX_MESSAGE_SIZE};
+use crate::frame::{self, FrameType, MAX_MESSAGE_SIZE};
 use crate::handshake::{HEADER_LEN, Meta};
 
 /// Timeout for the TCP connect itself (Go: 5s).
@@ -382,14 +382,6 @@ impl LinkSet {
     /// existence test, which asks about a node rather than a connection.
     pub fn has_peer(&self, peer: &[u8; KEY_LEN]) -> bool {
         self.entries.iter().any(|e| &e.peer == peer)
-    }
-
-    /// Direct access to one link, for I/O the set itself does not mediate.
-    pub fn get(&mut self, id: LinkId) -> Option<&mut AnyConn> {
-        self.entries
-            .iter_mut()
-            .find(|e| e.link.id == id)
-            .map(|e| &mut e.link)
     }
 
     /// Take one link out of the set (dead links, or handing ownership back to
@@ -824,14 +816,6 @@ pub async fn accept(
     complete_accept(stream, local, opts, Some(addr.to_string())).await
 }
 
-/// Per-type frame counters from a [`PeerConn::run`] session.
-#[derive(Debug, Default)]
-pub struct RunStats {
-    pub frames: [u64; FRAME_KINDS],
-    pub keepalives_sent: u64,
-    pub payload_bytes: u64,
-}
-
 /// Read one framed body (type + payload) after the length prefix, over
 /// any byte stream. Shared by [`PeerConn`] and [`AnyConn`].
 pub async fn read_frame_from<S: AsyncRead + Unpin>(
@@ -885,33 +869,6 @@ impl<T: Transport> PeerConn<T> {
 
     pub async fn write_frame(&mut self, ftype: FrameType, payload: &[u8]) -> Result<(), Error> {
         write_frame_to(&mut self.stream, ftype, payload).await
-    }
-
-    /// Serve the link until `hold_for` elapses: reply keepalive to every
-    /// non-keepalive frame (mirrors Go's `peerMonitor`), count by type.
-    pub async fn run(&mut self, hold_for: Duration) -> Result<RunStats, Error> {
-        let end = tokio::time::Instant::now() + hold_for;
-        let mut stats = RunStats::default();
-        loop {
-            let remaining = end.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let (ftype, payload) = match tokio::time::timeout(remaining, self.read_frame()).await {
-                Ok(r) => r?,
-                Err(_) => break,
-            };
-            stats.frames[ftype as usize] += 1;
-            stats.payload_bytes += payload.len() as u64;
-            match ftype {
-                FrameType::KeepAlive | FrameType::Dummy => {}
-                _ => {
-                    self.write_frame(FrameType::KeepAlive, &[]).await?;
-                    stats.keepalives_sent += 1;
-                }
-            }
-        }
-        Ok(stats)
     }
 }
 

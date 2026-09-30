@@ -19,7 +19,6 @@ use crate::link::LinkSet;
 pub(crate) struct PathEntry {
     pub path: Vec<u64>,
     pub seq: u64,
-    pub req_at: Option<std::time::Instant>,
     pub deadline: std::time::Instant,
     pub broken: bool,
 }
@@ -355,9 +354,6 @@ impl crate::router::Router {
         links: &mut LinkSet,
         dest: [u8; KEY_LEN],
     ) -> Result<(), Error> {
-        if let Some(e) = self.path.entries.get_mut(&dest) {
-            e.req_at = Some(std::time::Instant::now());
-        }
         let lookup = PathLookup {
             source: self.pubkey,
             dest,
@@ -459,7 +455,6 @@ impl crate::router::Router {
                 PathEntry {
                     path: notify.info.path.clone(),
                     seq: notify.info.seq,
-                    req_at: Some(std::time::Instant::now()),
                     deadline: std::time::Instant::now() + PATH_TIMEOUT,
                     broken: false,
                 },

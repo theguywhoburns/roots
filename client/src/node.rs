@@ -245,10 +245,6 @@ impl Node {
         (node, sender)
     }
 
-    pub fn sender(&self) -> mpsc::UnboundedSender<Cmd> {
-        self.tx.clone()
-    }
-
     /// Attach a TUN bridge, which is how a config's `IfName` becomes a real
     /// interface.
     ///
@@ -280,13 +276,6 @@ impl Node {
         );
         self.tun = Some(device);
         Ok(())
-    }
-
-    /// The configured-peer bookkeeping, for a caller that has the node itself:
-    /// a running node must be asked over [`Cmd::Report`] instead, because
-    /// `run` holds the borrow.
-    pub fn peers(&self) -> &Links {
-        &self.peers
     }
 
     /// Read the router and the link set from inside the node task, which is the

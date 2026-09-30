@@ -259,7 +259,6 @@ pub(crate) struct BloomState {
     pub(crate) send: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
     pub(crate) recv: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
     pub(crate) on_tree: std::collections::HashMap<[u8; KEY_LEN], bool>,
-    pub(crate) dirty: std::collections::HashMap<[u8; KEY_LEN], bool>,
 }
 
 /// DHT transform: yggdrasil-go uses `SubnetForKey(key).GetKey()`.
@@ -272,7 +271,6 @@ impl crate::router::Router {
         self.bloom.send.entry(peer).or_default();
         self.bloom.recv.entry(peer).or_default();
         self.bloom.on_tree.entry(peer).or_insert(false);
-        self.bloom.dirty.entry(peer).or_insert(false);
     }
 
     /// Recompute on-tree flags (Go `_fixOnTree`, minus its panic when we
@@ -296,7 +294,6 @@ impl crate::router::Router {
                 // Dropped from the tree: advertise blank so the peer
                 // forgets our old bits instead of keeping false positives.
                 self.bloom.send.insert(pk, BloomFilter::new());
-                self.bloom.dirty.insert(pk, true);
             }
         }
     }
@@ -343,7 +340,6 @@ impl crate::router::Router {
             let b = self.bloom_for(pk);
             if self.bloom.send.get(&pk) != Some(&b) {
                 self.bloom.send.insert(pk, b.clone());
-                self.bloom.dirty.insert(pk, false);
                 let bytes = b.encode();
                 // Every link to the key gets it, as Go does: `if ps, isIn :=
                 // bs.router.peers[k]; isIn { for p := range ps { p.sendBloom

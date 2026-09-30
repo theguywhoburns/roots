@@ -479,18 +479,7 @@ impl Discovery {
     /// the first hit). So the first matching row wins, and a row with neither
     /// `Beacon` nor `Listen` is skipped before matching at all.
     fn config_for(&self, name: &str) -> Option<&MulticastRow> {
-        self.config.iter().find(|row| {
-            if !row.beacon && !row.listen {
-                return false;
-            }
-            if !matches(&row.regex, name) {
-                return false;
-            }
-            // Go skips an interface whose password is over blake2b's 64-byte key
-            // limit, because `blake2b.New512` returns an error and there is no
-            // hash to compare with (`multicast.go:213-217`).
-            row.password.len() <= 64
-        })
+        config_for(&self.config, name)
     }
 
     /// The operator's `MulticastInterfaces`, kept so the scan can answer for
@@ -519,7 +508,9 @@ impl Discovery {
 /// (`multicast.go:216`, `interfaceInfo.password`) and blake2b keys on the bytes,
 /// so the conversion belongs here rather than at each use. The config is JSON and
 /// cannot actually carry a non-UTF-8 password.
-#[cfg_attr(not(test), allow(dead_code))]
+/// A 5-tuple so a test can compare a whole row at once. Test-only: the
+/// scan reads the fields by name.
+#[cfg(test)]
 type InterfaceOptions = (bool, bool, u16, u8, Vec<u8>);
 
 /// One `MulticastInterfaces` entry, as the config carries it.
@@ -550,6 +541,28 @@ impl MulticastRow {
             self.password.as_bytes().to_vec(),
         )
     }
+}
+
+/// Which configured row, if any, applies to the interface called `name`?
+///
+/// A free function rather than a method because it is **pure**: it reads a
+/// slice and a string and touches no socket. The tests need it without binding
+/// a group port, and they used to re-implement the predicate — which is the
+/// worst kind of duplication in a protocol, because the copy is what the test
+/// checks and the original is what runs.
+pub(crate) fn config_for<'a>(rows: &'a [MulticastRow], name: &str) -> Option<&'a MulticastRow> {
+    rows.iter().find(|row| {
+        if !row.beacon && !row.listen {
+            return false;
+        }
+        if !matches(&row.regex, name) {
+            return false;
+        }
+        // Go skips an interface whose password is over blake2b's 64-byte key
+        // limit, because `blake2b.New512` returns an error and there is no hash
+        // to compare with (`multicast.go:213-217`).
+        row.password.len() <= 64
+    })
 }
 
 /// Does Go's `regexp.MatchString` match this interface name?
@@ -837,16 +850,11 @@ fe800000000000008034fb74e62ddf57 04 40 20 80     tun0
         }
     }
 
-    /// Build the same lookup `Discovery::config_for` uses, without a socket.
+    /// The lookup the scan uses, without a socket: the *real*
+    /// [`config_for`], which is the point. The test used to re-implement the
+    /// predicate, so a change to the production one would not have moved the
+    /// test and the two would have drifted silently.
     fn rows_finder(rows: Vec<MulticastRow>) -> impl Fn(&str) -> Option<InterfaceOptions> {
-        move |name: &str| {
-            rows.iter()
-                .find(|row| {
-                    (row.beacon || row.listen)
-                        && matches(&row.regex, name)
-                        && row.password.len() <= 64
-                })
-                .map(MulticastRow::interface)
-        }
+        move |name: &str| config_for(&rows, name).map(MulticastRow::interface)
     }
 }

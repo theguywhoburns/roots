@@ -114,22 +114,6 @@ impl Router {
     pub fn forget_link(&mut self, id: crate::link::LinkId) {
         self.tree.links.remove(&id);
     }
-
-    /// Which implementation a link peer runs (`Go` when unknown).
-    /// Gates roots-only behavior fixes; defaults to Go-exact.
-    pub fn peer_kind(&self, peer: &[u8; KEY_LEN]) -> crate::peer::PeerKind {
-        self.tree
-            .links
-            .values()
-            .find(|l| &l.peer == peer)
-            .map(|l| l.kind.clone())
-            .unwrap_or(crate::peer::PeerKind::Go)
-    }
-
-    /// True when the link peer advertised itself as roots.
-    pub fn is_roots_peer(&self, peer: &[u8; KEY_LEN]) -> bool {
-        self.peer_kind(peer).is_roots()
-    }
 }
 
 #[cfg(test)]
@@ -218,7 +202,6 @@ mod tests {
             crate::pathfind::PathEntry {
                 path: vec![4, 2],
                 seq: 9,
-                req_at: None,
                 deadline: Instant::now() + Duration::from_secs(60),
                 broken: false,
             },

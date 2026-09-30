@@ -10,26 +10,7 @@ use ed25519_dalek::SigningKey;
 
 use roots::{Client, Router};
 
-fn checksum(src: &[u8; 16], dst: &[u8; 16], len: u16, icmp: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    for c in src.chunks(2).chain(dst.chunks(2)) {
-        sum += u16::from_be_bytes([c[0], c[1]]) as u32;
-    }
-    sum += len as u32;
-    sum += 58u32;
-    let mut i = 0;
-    while i + 1 < icmp.len() {
-        sum += u16::from_be_bytes([icmp[i], icmp[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < icmp.len() {
-        sum += (icmp[i] as u32) << 8;
-    }
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
+mod common;
 
 #[tokio::main]
 async fn main() {
@@ -80,22 +61,7 @@ async fn main() {
     let ident = 0xbeefu16;
     let seqno = 1u16;
     let data = b"roots-ping";
-    let echo_request = || {
-        let mut pkt = vec![0u8; 40 + 8 + data.len()];
-        pkt[0] = 0x60;
-        pkt[4..6].copy_from_slice(&((8 + data.len()) as u16).to_be_bytes());
-        pkt[6] = 58;
-        pkt[7] = 64;
-        pkt[8..24].copy_from_slice(&our_bytes);
-        pkt[24..40].copy_from_slice(&target_bytes);
-        pkt[40] = 128;
-        pkt[44..46].copy_from_slice(&ident.to_be_bytes());
-        pkt[46..48].copy_from_slice(&seqno.to_be_bytes());
-        pkt[48..].copy_from_slice(data);
-        let csum = checksum(&our_bytes, &target_bytes, 8 + data.len() as u16, &pkt[40..]);
-        pkt[42..44].copy_from_slice(&csum.to_be_bytes());
-        pkt
-    };
+    let echo_request = || common::icmp6_echo(128, &our_bytes, &target_bytes, ident, seqno, data);
 
     let mut outbox = vec![(key, echo_request())];
     let end = Instant::now() + Duration::from_secs(90);

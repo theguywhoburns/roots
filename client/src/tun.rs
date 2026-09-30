@@ -146,19 +146,15 @@ impl Device {
         self.mtu
     }
 
-    /// This node's mesh address.
-    pub fn local(&self) -> Address {
-        self.local
-    }
-
-    /// Packets from the session inbox, to be written to the device.
+    /// The packets still waiting to go out, for tests.
     ///
-    /// The node loop takes these rather than writing them itself, because the
-    /// write can block on a full device buffer and the loop must keep serving
-    /// links while it does. Go has the same shape: `ipv6rwc` puts a received
-    /// packet on a channel and the TUN adapter drains it (`ipv6rwc.go:174-199`).
-    pub fn take_outbound(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.out)
+    /// A peek, not a drain: `flush` is the only thing that empties the outbox in
+    /// production, and a second way to do it is a second thing to get wrong. (An
+    /// earlier `pub fn take_outbound` claimed the node loop drained through it,
+    /// and it never did — `flush` is the drain.)
+    #[cfg(test)]
+    fn pending(&self) -> &[Vec<u8>] {
+        &self.out
     }
 
     /// Accept a packet from the mesh for the device.
@@ -562,7 +558,7 @@ mod tests {
 
         let (written, held) = d.flush().await.expect("the device accepts writes");
         assert_eq!((written, held), (2, 0), "both went in, none held");
-        assert!(d.take_outbound().is_empty(), "a drain empties the outbox");
+        assert!(d.pending().is_empty(), "a flush empties the outbox");
 
         // Both packets, in the order they were delivered: a device delivers in
         // order and a reordered packet is a corrupted one.
@@ -591,7 +587,7 @@ mod tests {
             "a device that is gone is an error, not a count"
         );
         assert_eq!(
-            d.take_outbound().len(),
+            d.pending().len(),
             1,
             "and the packet is accounted for, not lost"
         );
@@ -615,7 +611,7 @@ mod tests {
         }
         let flush = tokio::spawn(async move {
             let mut d = d;
-            (d.flush().await, d.take_outbound())
+            (d.flush().await, d.pending().to_vec())
         });
         // Let the first packet in, then take the reader away.
         tokio::time::sleep(Duration::from_millis(50)).await;

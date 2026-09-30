@@ -15,7 +15,7 @@ fn main() {
     let b_box = roots::session::ed_to_curve_priv(&seed_b);
     let init = SessionInit::decrypt_msg(&b_box, &pa, &raw).expect("go init decrypts");
     eprintln!("init key_seq={} seq={}", init.key_seq, init.seq);
-    let mut sess = Session::for_init(pa, &init);
+    let mut sess = Session::for_init(&init);
     let ack = sess
         .handle_init(&init, init.seq.saturating_add(1))
         .expect("accept");

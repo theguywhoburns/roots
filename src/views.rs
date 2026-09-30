@@ -153,10 +153,19 @@ impl Router {
     /// `dest`'s position in the spanning tree.
     ///
     /// This is Go's `_lookup` (`router.go:685-757`) asked as a question rather
-    /// than as a send. The remote admin queries need it because Go answers them
-    /// by handing the request to `PacketConn.WriteTo`, which routes through the
-    /// pathfinder — not to whichever link happened to be first. `None` means no
-    /// live link takes us closer, which is the same answer `_lookup` gives.
+    /// than as a send, for a caller that wants to know *where* a packet to
+    /// `dest` would leave without sending one.
+    ///
+    /// Nothing in this repo calls it, and that is worth saying because the
+    /// obvious candidate — the remote admin queries — turned out not to need it.
+    /// They hand the request to `request_nodeinfo`/`request_debug`, which reach
+    /// `pathfinder_send` and so get their next hop from the send path itself; Go
+    /// reaches the same place through `PacketConn.WriteTo` (`core/proto.go:101`,
+    /// `core/nodeinfo.go:114`). Asking for a next hop separately and then writing
+    /// to it would be a second, possibly different, answer to one question.
+    ///
+    /// `None` means no live link takes us closer, which is what `_lookup` says
+    /// and is not an error: it is how a node with no route answers.
     pub fn next_hop(
         &self,
         links: &crate::link::LinkSet,

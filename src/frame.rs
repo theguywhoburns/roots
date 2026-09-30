@@ -66,9 +66,9 @@ impl FrameType {
     }
 }
 
-/// Every discriminant must be its own index in `ALL`: `Router::frames` and
-/// `RunStats::frames` are `[u64; FRAME_KINDS]` indexed by `ftype as usize`, so
-/// a gap or a duplicate is an out-of-bounds panic on the wire, not a typo.
+/// Every discriminant must be its own index in `ALL`: `Router::frames` is
+/// `[u64; FRAME_KINDS]` indexed by `ftype as usize`, so a gap or a duplicate is
+/// an out-of-bounds panic on the wire, not a typo.
 const _: () = {
     let mut i = 0;
     while i < FRAME_KINDS {
@@ -103,11 +103,6 @@ pub const fn wire_len(payload_len: usize) -> u64 {
         rest >>= 7;
     }
     prefix + body
-}
-
-/// The exact bytes Go writes for a keepalive (`{0x01, KeepAlive}`).
-pub fn keepalive_bytes() -> [u8; 2] {
-    [1, FrameType::KeepAlive as u8]
 }
 
 /// Split a full frame body (after the length prefix) into type + payload.
@@ -175,7 +170,6 @@ mod tests {
     fn keepalive_wire_bytes_match_go() {
         // Go: []byte{0x01, byte(wireKeepAlive)}
         assert_eq!(encode_frame(FrameType::KeepAlive, &[]), vec![0x01, 0x01]);
-        assert_eq!(keepalive_bytes(), [0x01, 0x01]);
     }
 
     #[test]
@@ -209,8 +203,8 @@ mod tests {
 
     #[test]
     fn frame_kinds_match_table_len() {
-        // The counters that index by `ftype as usize` (`Router::frames`,
-        // `RunStats::frames`) are `[u64; FRAME_KINDS]`: a variant outside
+        // The counter that indexes by `ftype as usize` (`Router::frames`) is
+        // `[u64; FRAME_KINDS]`: a variant outside
         // that window is an out-of-bounds panic on the wire, not a typo.
         // The const block above is the real guard; this pins the same
         // facts so a reader (and CI diff) sees them as a test.
