@@ -1085,7 +1085,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-tungstenite",
- "tun",
 ]
 
 [[package]]
@@ -1101,6 +1100,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tokio",
+ "tun",
 ]
 
 [[package]]

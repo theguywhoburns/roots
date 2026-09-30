@@ -107,7 +107,9 @@ no lock either, only channels.
 
 Egress has no public send function. Apps drain `Router::inbox` /
 `Router::proto_inbox` and push `(dest_key, payload)` into the `outgoing` `Vec`
-handed to `serve`. `session_send` is `pub(crate)` (`session.rs:405`).
+handed to `serve`, or call `send_or_resolve` with a **destination address** and
+get `Sent`/`Queued` back without waiting for a lookup. `session_send` is
+`pub(crate)` (`session.rs:400`).
 
 ## Table graph
 
@@ -121,7 +123,7 @@ tree    --> bloom    bloom advertises bits derived from our parent info
 
 session --> path     every outbound byte rides pathfinder_send
 path    --> session  a notify flushes whatever pathfinder_send parked in
-                     rumors[].pending (pathfind.rs:424-431); session setup
+                     rumors[].pending (pathfind.rs:453-470); session setup
                      refreshes the entry deadline
 path    --> traffic  greedy_next picks the next hop for a forwarding packet
 bloom   --> path     multicast gate: flood a lookup/notify only to useful peers
@@ -132,6 +134,15 @@ session --> inbox    decrypted payload lands in `inbox` (type byte 1); byte 2
 `tree` is the root of truth for who exists; `bloom` and `path` are both derived
 views of it; `traffic` is the forwarding carrier; `session` is the endpoint
 consumer. `proto` is a session payload variant, not a separate transport.
+
+**One slot, two layers.** `rumors[].pending` holds a payload per destination and
+its `pending_is_app` flag says which layer the bytes belong to, because the
+notify that flushes it is the only place that can tell. An *application* payload
+(a whole IP packet from a TUN) is flushed through `session_send`, which boxes it
+and buffers behind an init; a *sealed* blob is flushed back through
+`pathfinder_send`, which is where it came from and now has a path. Getting the
+flag wrong is silent in both directions: a double-boxed blob dies on a failed
+decrypt, an unboxed packet dies on the type-byte check, and neither raises.
 
 ## Link lifecycle
 
@@ -211,9 +222,12 @@ roots -e normal` (15 crates, no client-only dependency).
 
 `examples/admin.rs` is gone (Slice 7): the node's own `client/src/admin.rs`
 replaced it, so the yggdrasilctl-compatible surface now sits next to the state it
-reports. `examples/tun_ping.rs` is the remaining demo riding the public query
-surface that still has to move, in Slice 14, and only then can `tun` leave the
-root manifest.
+reports. `examples/tun_ping.rs` is gone too (Slice 14), for the same reason, and
+`client/src/tun.rs` is where the device lives: it is node behaviour, it wants
+`&mut Router` and `&mut LinkSet`, and it is a field on `Node` rather than a task
+precisely so it does not need a lock over the one thing here that must not have
+one. `tun` moved to `client/Cargo.toml` with it; `smoltcp` stays in the root
+manifest while `examples/common/` and `tests/tcp_loopback.rs` still want it.
 
 ## The client's node loop (Slices 5 and 7)
 
@@ -310,7 +324,22 @@ Wire-level (must stay byte-identical to Go):
 - `run_handshake` writes ours before reading theirs; reordering deadlocks both
   ends.
 - Session payloads and proto requests need their leading type byte
-  (`session_send` / `proto_send` wrap, inbox strips).
+  (`session_send` / `proto_send` wrap, inbox strips). **Exactly one layer adds
+  it** — a second prepend arrives as a packet whose first byte is `0x01`, which
+  the kernel drops as malformed and which every "did the bytes cross" test made
+  of plaintext on the wire cannot see.
+- An application payload is a **session message**, not a traffic frame's payload.
+  Ironwood layers app → session → pathfinder → link
+  (`encrypted/packetconn.go:66-84` → `network/packetconn.go:72-93`) and
+  `ipv6rwc` calls `core.WriteTo` (`ipv6rwc.go:82`, `:307`). Calling
+  `pathfinder_send` from application code puts a plaintext IP packet where a
+  sealed blob belongs: it reaches the wire, the frame counter moves, and
+  `handle_session_bytes` drops it. Measured as 100% ICMP loss over a link that
+  was `up: true` at both ends. `net_send` is the only legitimate caller.
+- A TUN is addressed `/128`, so a mesh address has **no route** until one is
+  added. Without the reverse route the far kernel receives the request, cannot
+  route its own reply, and drops it — the sender sees 100% loss and the
+  receiver's log is clean.
 - Bloom hashes are Murmur3-x64-128 `sum256`, not a stock murmur3 crate default.
 - DHT rumors rendezvous by **transformed** key, so a full-key notify matches a
   partial-key lookup. Keying by destination key drops every resolution.

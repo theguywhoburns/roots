@@ -2,29 +2,36 @@
 
 ## Public-mesh TUN run (needs a TUN-capable host + second live node)
 
-`examples/tun_ping.rs` is loopback-verified only (kernel ↔ TUN ↔ session ↔
-loopback peer, RTT 3.1s incl. kernel, checked under `unshare -Urn` because
-the sandbox blocks `TUNSETIFF`). Still unverified: the same plumbing
-against the live mesh.
+**Now a config away, not a program away.** Slice 14 moved the bridge into the
+node itself, so this is two config files and a `ping` rather than a harness:
+`IfName` set, a `Peers` entry naming a public node, and
+`ip -6 route add <peer>/128 dev <ifname>` on each side (a TUN is addressed
+`/128`, so a mesh address has no route until you add one — see
+`docs/plans/go-client-parity/00-status.md`, Slice 14).
 
-Steps on a host with TUN privileges (root or CAP_NET_ADMIN, `iproute2`):
+`proof/10-tun.sh` is already green end to end across two namespaces, both
+directions, so the remaining gap is specifically **the public mesh**: a DHT
+resolve across nodes neither side is configured with, and a real link's MTU
+behaviour.
 
-1. `cargo run -q --example tun_ping` currently uses fixed keys/seeds over a
-   loopback link. Extend it (or drive it) so side A peers a **public**
-   node (`tcp://bode.theender.net:42069`) while side B resolves A over the
-   DHT, or run two instances on two hosts and ping A's TUN address from B.
-2. Confirm ICMPv6 echo request/reply round-trips through TUN + E2E
-   session + public mesh, and that the kernel answers (watch `reply …
-   bytes` + `RTT ~=` lines).
-3. Check for MTU issues on the real path (TUN mtu 1280; session payloads
-   must stay within the link `MAX_MESSAGE_SIZE` after framing overhead).
-4. Record results in `docs/plans/rust-client/00-status.md` (Slice 15 line)
-   and flip this entry to DONE.
+Steps on a host with TUN privileges (root or `CAP_NET_ADMIN`, `iproute2`):
 
-Why it wasn't done in-sandbox: `/dev/net/tun` exists but the kernel
-denies `TUNSETIFF` (`Operation not permitted`, even via `ip tuntap add`),
-and `unshare -Urn` (where TUN works) has no internet route for public
-peers.
+1. Config A: `IfName: rootstun0`, `Peers: ["tcp://bode.theender.net:42069"]`.
+   Config B: `IfName: rootstun0`, no configured peer at all — B must find A over
+   the DHT. Start both, then on B: `ip -6 route add <A's address>/128 dev
+   rootstun0 && ping -6 <A's address>`.
+2. Confirm the echo round-trips TUN → session → public mesh → session → TUN, and
+   that **no node is configured with the other** — that is the part `proof/10-tun.sh`
+   cannot show, since it configures both ends.
+3. Check MTU on the real path (the device is 1280 by default, but a config can
+   ask for more; session payloads must fit the link's `MAX_MESSAGE_SIZE` after
+   framing). Slice 14's `supported_mtu` only clamps the *floor* — there is no
+   upper clamp, because Go's `MaximumIfMTU` is a per-platform default we have no
+   equivalent of. That asymmetry is deliberate and untested above 1280.
+4. Record results here and flip this entry to DONE.
+
+Why it wasn't done in-sandbox: `unshare -Urn` (where `TUNSETIFF` succeeds) has no
+internet route for public peers.
 
 ## One node key, one link slot: a peering dialled both ways never settles
 

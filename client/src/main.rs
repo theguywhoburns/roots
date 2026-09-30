@@ -191,6 +191,27 @@ async fn boot(cfg: Config) {
         ifaces.clone(),
     ));
 
+    // The TUN bridge, when `IfName` asks for one. Opened before the loop starts,
+    // so a missing capability is the operator's first line rather than a device
+    // that exists and drops everything: Go's node panics at startup for the same
+    // reason (`cmd/yggdrasil/main.go:282`).
+    if !cfg.if_name.is_empty() && cfg.if_name != "auto" {
+        let subnet = roots::subnet_for_key(&pubkey);
+        match node
+            .open_tun(&cfg.if_name, addr_for_key(&pubkey), cfg.if_mtu as u16)
+            .await
+        {
+            Ok(()) => eprintln!("Your subnet is {subnet}"),
+            // Go exits rather than carrying on (`main.go:282-286`), and a node
+            // with a TUN that silently drops every packet is worse than one that
+            // says why it has none.
+            Err(e) => {
+                eprintln!("TUN {}: {e}", cfg.if_name);
+                std::process::exit(1);
+            }
+        }
+    }
+
     if let Err(e) = node.run().await {
         eprintln!("node: {e}");
         std::process::exit(1);

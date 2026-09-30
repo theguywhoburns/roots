@@ -38,9 +38,8 @@ fn unknown_action(name: &str) -> String {
 /// `AddHandler` triples, lowercased because Go registers and looks up with
 /// `strings.ToLower`. Sorted, because `list` sorts.
 ///
-/// `getTun` (`tun/admin.go:31`) is still missing: its answer needs a kernel
-/// interface, which arrives with Slice 14. `list` says what the node can do, so
-/// it says thirteen commands rather than Go's fourteen.
+/// All fourteen of Go's commands are here, which is the first time `list` says
+/// fourteen.
 const COMMANDS: &[(&str, &str, &[&str])] = &[
     (
         "addpeer",
@@ -75,6 +74,12 @@ const COMMANDS: &[(&str, &str, &[&str])] = &[
         &[],
     ),
     ("getself", "Show details about this node", &[]),
+    (
+        "gettun",
+        // Go's literal description (`tun/admin.go:56`).
+        "Show information about the node's TUN interface",
+        &[],
+    ),
     ("gettree", "Show known Tree entries", &[]),
     ("list", "List available commands", &[]),
     (
@@ -243,6 +248,10 @@ fn decode_args(name: &str, args: &Value) -> Result<(), String> {
     let (struct_name, fields): (&str, &[&str]) = match name {
         "getself" => ("GetSelfRequest", &[]),
         "gettree" => ("GetTreeRequest", &[]),
+        // The handler declares an empty struct and `json.Unmarshal`s into it
+        // (`tun/admin.go:58-59`), so nothing in it can be the wrong type — but a
+        // non-object argument still is, exactly as for `getself`.
+        "gettun" => ("tun.GetTUNRequest", &[]),
         "getpaths" => ("GetPathsRequest", &[]),
         "getsessions" => ("GetSessionsRequest", &[]),
         "getpeers" => ("GetPeersRequest", &["sort"]),
@@ -337,6 +346,8 @@ enum Body {
     Sessions(GetSessionsResponse),
     /// `getMulticastInterfaces` (`multicast/admin.go:15-20`).
     Multicast(GetMulticastInterfacesResponse),
+    /// `getTun` (`tun/admin.go:11-15`).
+    Tun(GetTunResponse),
     /// The four remote queries, which Go answers as a **map**, not a struct.
     ///
     /// `GetNodeInfoResponse map[string]json.RawMessage` (`nodeinfo.go:150`) and
@@ -360,6 +371,7 @@ impl Serialize for Body {
             Body::Paths(b) => b.serialize(s),
             Body::Sessions(b) => b.serialize(s),
             Body::Multicast(b) => b.serialize(s),
+            Body::Tun(b) => b.serialize(s),
             Body::Map(v) => v.serialize(s),
         }
     }
@@ -722,6 +734,9 @@ async fn dispatch(
     }
     if name == "getmulticastinterfaces" {
         return Ok(multicast_interfaces(ifaces));
+    }
+    if name == "gettun" {
+        return get_tun(tx).await;
     }
     let snap = report(tx).await?;
     Ok(match name {
@@ -1103,6 +1118,47 @@ mod multicast_state {
             }
         }
     }
+}
+
+/// Go's `GetTUNResponse` (`tun/admin.go:11-15`).
+///
+/// Two fields carry `omitempty`, which is not decoration: with no TUN, Go's
+/// handler returns early having set only `Enabled` (`tun/admin.go:30-32`), so a
+/// disabled node's answer is `{"enabled": false}` and **not** `{"enabled":
+/// false, "name": "", "mtu": 0}`. Printing the zeroes would make a node with no
+/// TUN indistinguishable from one whose interface is called "".
+#[derive(Serialize)]
+struct GetTunResponse {
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mtu: Option<u16>,
+}
+
+/// `getTun`: what the node's own device says about itself.
+///
+/// Go reads `t.isEnabled`, `t.Name()` and `t.MTU()` off the adapter
+/// (`tun/admin.go:27-33`) and does not ask the kernel — so neither do we, because
+/// a device that exists and a device that carries traffic are different questions
+/// and only the first one is what this command claims.
+async fn get_tun(tx: &mpsc::UnboundedSender<Cmd>) -> Result<Body, String> {
+    let (wt, rr) = oneshot::channel();
+    tx.send(Cmd::Tun { respond: wt })
+        .map_err(|_| "node is not running".to_string())?;
+    let device = rr.await.map_err(|_| "node did not answer".to_string())?;
+    Ok(Body::Tun(match device {
+        Some((name, mtu)) => GetTunResponse {
+            enabled: true,
+            name: Some(name),
+            mtu: Some(mtu),
+        },
+        None => GetTunResponse {
+            enabled: false,
+            name: None,
+            mtu: None,
+        },
+    }))
 }
 
 /// `getMulticastInterfaces`: the multicast task's own table, read under its

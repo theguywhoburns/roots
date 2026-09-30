@@ -29,6 +29,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 
 [dev-dependencies]
+# `smoltcp` stays for the root examples and `tests/tcp_loopback.rs`; `tun` went to
+# `client/` with Slice 14, which is the only thing that opens a device now.
 smoltcp = "0.14.0"
-tun = { version = "0.8", features = ["async"] }
 tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }

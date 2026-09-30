@@ -617,19 +617,29 @@ Three ordering rules that are not obvious from the list:
       refreshed to 22 of 22.
       *Proves:* the number in the README is measured, not asserted.
 
-- [ ] **Slice 14 — OPTIONAL: TUN bridge in the client (dead last, userland).**
-      Marked optional on approval (2026-09-24): a kernel TUN interface is not a
-      library goal and not part of the library — it is one client feature that
-      happens to need root. The plan is complete and the product ships without
-      it. Doing it at all means `client/src/tun.rs` on its own interface name
-      (the host's service node owns `tun0` and the `200::/7` route), wired to
-      `Cmd::Packet` and `router.inbox`. It is the only slice that needs `CAP_NET_ADMIN`, so it is
-      the only slice that cannot run in CI or in this sandbox — everything
-      upstream of it is provable without root, deliberately.
-      *Proves:* `ping6` to a mesh address across a kernel TUN interface our
-      client created, first packet landing after a queued lookup instead of
-      being dropped. Manual, as root, by you — recorded in
-      `docs/protocol/`-adjacent notes with the exact command.
+- [x] **Slice 14 — TUN bridge in the client (dead last, userland).**
+      Marked optional on approval (2026-09-24) and **done** 2026-09-29:
+      `client/src/tun.rs` on its own interface name (the host's service node owns
+      `tun0` and the `200::/7` route), a field on `Node` pumped from
+      `router.inbox`, and `getTun` behind `Cmd::Tun`. `examples/tun_ping.rs`
+      deleted; `tun` moved to `client/Cargo.toml`. Proof: `proof/10-tun.sh`, two
+      netns, two real TUNs, an ICMP echo crossing the mesh in both directions.
+      **Done 2026-09-29:** 10 unit tests on a `tokio::io::duplex` seam (no
+      privilege), one `#[ignore]`d `getTun` test that opens a device, and
+      `proof/10-tun.sh` green end to end. `list` is 14 of Go's 14.
+      **Where the plan was wrong:** it said to wire the device to a
+      `Cmd::Packet`. No such command exists or is needed — the device wants
+      `&mut Router` and `&mut LinkSet`, so it is a *field on `Node`* pumped
+      inline by `Node::run`, and a `Cmd` could only have reached it by
+      round-tripping through the task that owns it. A `Cmd` is right for
+      `getTun` (a question) and wrong for the device (an owner).
+      **Finding:** the device found a library bug no unit test could —
+      `send_or_resolve` was reaching below the session layer, so every TUN
+      payload went out unboxed and without a type byte and was silently dropped
+      by the far end. 100% ICMP loss over a link that was `up: true` on both
+      ends, while `tests/resolve_queue.rs` passed because it proved delivery by
+      byte-scanning a link tap and the payload crossed in plaintext. Fix
+      `53c6d36`; full list in `00-status.md`.
 
 ## Not slices
 

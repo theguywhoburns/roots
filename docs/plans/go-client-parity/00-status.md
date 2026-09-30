@@ -32,12 +32,102 @@ Plan approved 2026-09-24 — details and proof in `04-slices.md`.
 - [x] Slice 6 — Go-shaped config (proven by Go's own binary parsing it) — DONE 2026-09-24, `client/src/config.rs` + `client/src/main.rs` flags + `client/tests/allowlist.rs` + `tests/go_vectors.rs` address/subnet string vectors; `src/address.rs` `Display` fixed to Go's text form
 - [x] Slice 7 — admin framing: `unix://`, `keepalive`, Go error strings — DONE 2026-09-24, `client/src/admin.rs` + `client/src/listen.rs` + `boot()` in `client/src/main.rs` + `client/tests/admin_loopback.rs` (6 tests) + `docs/protocol/21-admin.md` + `proof/7-admin.sh`/`7-admin-raw.sh`/`7-admin-inbound.sh`; `examples/admin.rs` deleted; proven against a live Go 0.5.14 node and stock `yggdrasilctl` over tcp **and** unix, mutation table in `04-slices.md`
 - [x] Slice 8 — `getPeers` content parity: three sort modes + full field set — DONE 2026-09-25, `LinkId` + `stats(id)` + `update_rates` + `AnyConn::remote_addr` in `src/link.rs`, SigReq/SigRes latency stamps in `src/tree.rs`, `LinkKind::Incoming` rows in `client/src/links.rs`, the 16-field body and Go's three `sort` modes in `client/src/admin.rs`; `client/tests/peer_rows.rs` (3 tests) + `proof/8-getpeers.sh` (five phases, `7-admin-inbound.sh` superseded); mutation tables and the crossed-peering flap in `04-slices.md`
-- [ ] Slice 9 — remote queries via `next_hop`; `removePeer` stops lying
-- [ ] Slice 10 — multicast codec + state machine in the library (no sockets)
-- [ ] Slice 11 — multicast sockets in the client + captured Go beacon
-- [ ] Slice 12 — `send_or_resolve` resolve-and-hold seam (library only, no privileges)
-- [ ] Slice 13 — remaining wire vectors + 22/22 coverage refresh
-- [ ] Slice 14 — client TUN bridge (dead last: root/`CAP_NET_ADMIN`, userland not library)
+- [x] Slice 9 — remote queries via `next_hop`; `removePeer` stops lying — DONE 2026-09-28, `Cmd::Remote`/`RemoteQuery` + the node's pending-request table in `client/src/node.rs`, the four commands in `client/src/admin.rs`, `Router::forget_link`, `Links::live_id`, `client/tests/remote_queries.rs` (5 tests). The plan's wrong-hop complaint was already fixed by the crossed-peering refactor (the `links.peers().next()` scope argument is gone from the whole session/pathfind chain); what was missing was the commands. **`removePeer` now closes the link**, matching Go's `links.remove` (`core/link.go:433-438`) — Slice 5's divergence rested on the comment at `core/api.go:207-211`, which reading Go disproves. Also `?password=` is percent-decoded, which multicast needs.
+- [x] Slice 10 — multicast codec + state machine in the library (no sockets) — DONE 2026-09-28, `src/multicast.rs`, 8 tests, 20/20 mutation reversions killed
+- [x] Slice 11 — multicast sockets in the client + captured Go beacon — DONE 2026-09-29, `client/src/multicast.rs` + `getMulticastInterfaces` + `proof/9-multicast.sh`. **Five bugs found by running two nodes, none of which reading Go would have found**: the `if_inet6` scope column, a named zone not resolving through `getaddrinfo`, rustls refusing a zoneless IP as a server name, one socket being unable to say which interface a datagram arrived on, and a beacon gated on a port nothing ever reported. Details in the commit message and below.
+- [x] Slice 12 — `send_or_resolve` resolve-and-hold seam (library only, no privileges) — DONE 2026-09-28, `Router::send_or_resolve` + `Route` in `src/driver.rs`, `pending_routes`/`next_hop` in `src/views.rs`, `tests/resolve_queue.rs` (3 tests), 5/5 reversions killed. Three places the plan doc was wrong (`via` is a `LinkId` not a key; the flush is one layer deeper than cited; `Route` is ours, not Go's).
+- [ ] Slice 13 — remaining wire vectors + 22/22 coverage refresh. **Not started.** A
+  subagent was given this and returned without writing anything; the tree is
+  untouched. It needs a Go 0.5.14 capture under `unshare -Urn` for each format,
+  so it is not a typing job.
+- [x] Slice 14 — client TUN bridge (dead last: `CAP_NET_ADMIN`, cannot run in CI)
+  — DONE 2026-09-29, `client/src/tun.rs` + `Node::open_tun`/`Cmd::Tun` in
+  `client/src/node.rs` + `getTun` in `client/src/admin.rs` + `proof/10-tun.sh`
+  (green, both directions) + `examples/tun_ping.rs` deleted and `tun` moved to
+  `client/Cargo.toml`. **The device found a library bug that no unit test could:**
+  `send_or_resolve` was reaching below the session layer, so a TUN payload left
+  unboxed and with no type byte and was silently dropped by the far end —
+  100% ICMP loss over a link that was `up: true` on both ends. Fixed in
+  `53c6d36`; the test that should have caught it was reading plaintext off a
+  wire tap, which no working mesh ever sends. Details below.
+
+## Slice 14 — what a real device found
+
+The TUN is the first thing here that touches a kernel, and the first thing that
+found bugs by *being wrong visibly* rather than by being wrong silently.
+
+1. **`send_or_resolve` shipped the payload in the clear** (`53c6d36`). Ironwood
+   layers app → session → pathfinder → link, and `ipv6rwc` calls `core.WriteTo`,
+   not the pathfinder. Reaching `pathfinder_send` from application code put an
+   IP packet where a sealed session blob belongs: no box, no type byte, dropped
+   by `handle_session_bytes` with the frame counter still moving. The empty test
+   suite could not see it because `tests/resolve_queue.rs` proved delivery by
+   byte-scanning a link tap — and a plaintext tap passes *precisely because of*
+   the bug. It now reads the destination's session inbox, which is the only
+   place a delivered payload is readable, and is a stronger claim besides.
+2. **`fe80::/10` was not `fe80::/10`.** The first mask tested the second byte's top
+   two bits for `00`, which excludes *every* link-local address. The boundary
+   test (`fe80` in, `febf` last in, `fec0` first out) is what caught it.
+3. **A node's own subnet is not a forward filter.** The device filtered on
+   `subnet_for_key` and so rejected every peer address — the filter's own
+   documentation said "what the operator configured", and no operator
+   configuration produces it. `0200::/7` is the rule, and it covers routed
+   subnets for free because a subnet prefix is `03…` and a node address is
+   `02…`.
+4. **`flush` reported a held packet it had already dropped**, and the doc said
+   the caller put it back. The caller does not; there is no caller. A failed
+   write is an error (the device is gone) and the tail goes back on the way out.
+5. **`pump` allocated `MTU + 64` bytes every tick** — 64 KiB twenty times a
+   second at a config's default `IfMTU`. The buffer is a field now.
+6. **A mesh address has no route.** A TUN is addressed `/128`, so without a
+   hand-added route the kernel cannot even start: the sender's ping leaves,
+   arrives, and the *far* kernel drops its own reply because it cannot route
+   back. Both directions of the route are installed before the first ping in
+   `proof/10-tun.sh` for that reason — and the symptom, "100% loss with the
+   receiver's log looking perfect", is worth writing down.
+7. **A link-local peering URI's zone names the *local* interface**, and both
+   ends need *different* addresses. Getting either wrong fails indistinguishably
+   — `getaddrinfo: Name or service not known` for a crossed zone, `connection
+   refused` from your own listener for a duplicated address. The multicast proof
+   never hit either, because a multicast group is addressed to a group.
+
+## Slice 11 — what running two nodes found
+
+Recorded because the argument generalises: **the socket half of a protocol cannot
+be reviewed, only run.** All five were silent — no error, no log, a node that
+simply reported no peers.
+
+1. `/proc/net/if_inet6`'s scope is **column 4**; column 2 is the ifindex. Reading
+   column 2 for `04` matches only interfaces whose index is 4, so on this host
+   multicast did nothing at all.
+2. A named IPv6 zone does not resolve through `getaddrinfo`
+   (`Name or service not known`), so a discovered peer could not be dialled. The
+   library now parses a bracketed IPv6 literal and connects to the `SocketAddrV6`
+   directly — which also fixes a zoneless IPv6 literal, which was equally broken.
+3. `rustls`'s `ServerName` is a type, not a string: it rejects both `fe80::1` and
+   `fe80::1%eth0`. Go's rule that an address is not a name maps exactly onto
+   rustls's `ServerName::IpAddress`, which sends no SNI.
+4. One socket cannot say which interface a datagram arrived on (tokio surfaces no
+   `IPV6_PKTINFO`). Guessing from the *source* address is wrong invisibly: the
+   source identifies the **far** end. One socket per interface answers by
+   construction, and `SO_REUSEADDR` is what lets them share the group port.
+5. A beacon gated on a bound port that only the `Bind` arm reported, and `Bind`
+   stops being emitted once the address is set — a silent deadlock with no
+   symptom but a node that never beacons.
+
+Two more, folded in: interface state is keyed by name, so two link-local
+addresses on one interface made each look stale to the other and the listener
+rebound for ever; and the `JoinGroup` error must be discarded, because Linux
+answers `EADDRINUSE` to a second join of a group the socket is already in, so the
+error is the *normal* answer on every tick after the first.
+
+**The host cannot prove multicast.** `enp3s0` and `wlp0s20f3` are both on
+192.168.0.0/24 and a `ff02::114` datagram sent on one never reaches a socket
+joined on the other — measured with two plain UDP sockets and no Yggdrasil code in
+the path, so it is the network and not us. `proof/9-multicast.sh` therefore builds
+its own segment (a veth pair under `unshare -Urn`) rather than hoping for the
+host's, and says why in its header.
+
 
 ## Notes for a fresh session
 

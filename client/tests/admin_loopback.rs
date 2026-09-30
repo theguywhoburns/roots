@@ -20,6 +20,11 @@
 //! The three `sort` modes are proved in `admin.rs`'s own tests instead: they need
 //! rows whose cost, uptime and direction are chosen, which no loopback mesh can
 //! be asked to arrange.
+//
+// `getTun` is a tenth claim, split across two tests: the `enabled: false` answer
+// and its absent `name`/`mtu` keys need no privilege and run here, and the
+//! `enabled: true` answer opens a real device and is `#[ignore]`d like
+//! `mesh_ping`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
@@ -72,6 +77,26 @@ impl Server {
             .expect("a real address was asked for");
         let addr = bound.addr();
         tokio::spawn(serve_admin(bound, tx, ifaces));
+        Self { addr }
+    }
+
+    /// A socket whose node has been built by the caller, for the tests that need
+    /// to configure the node itself — a TUN bridge, say — rather than only ask it
+    /// questions.
+    async fn with_node(mut node: Node, tx: mpsc::UnboundedSender<Cmd>) -> Self {
+        let bound = bind_admin("tcp://127.0.0.1:0")
+            .await
+            .expect("bind_admin")
+            .expect("a real address was asked for");
+        let addr = bound.addr();
+        tokio::spawn(async move {
+            let _ = node.run().await;
+        });
+        tokio::spawn(serve_admin(
+            bound,
+            tx,
+            roots_client::multicast::empty_table(),
+        ));
         Self { addr }
     }
 
@@ -220,12 +245,11 @@ async fn admin_unix_socket_matches_tcp() {
     );
     let body: Value = serde_json::from_slice(&one).expect("one value");
     assert_eq!(body["status"], "success");
-    // Thirteen: Slice 9 added `getNodeInfo` and the three `debug_remoteGet*`
-    // (`core/api.go:239-259`) and Slice 11 added `getMulticastInterfaces`
-    // (`multicast/admin.go:56`). Go's own fourteen are those plus `getTun`
-    // (`tun/admin.go:31`), which needs a kernel interface and arrives with
-    // Slice 14.
-    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(13));
+    // Fourteen, which is all of them: Slice 9 added `getNodeInfo` and the three
+    // `debug_remoteGet*` (`core/api.go:239-259`), Slice 11 added
+    // `getMulticastInterfaces` (`multicast/admin.go:56`) and Slice 14 added
+    // `getTun` (`tun/admin.go:31`). Go's own list is these fourteen.
+    assert_eq!(body["response"]["list"].as_array().map(Vec::len), Some(14));
 
     // Go's `os.Chmod(path, 0660)` (`admin.go:118`).
     let mode = std::fs::metadata(unix.host())
@@ -958,5 +982,81 @@ async fn admin_getmulticastinterfaces_on_a_node_with_no_module_is_empty() {
         body["response"]["multicast_interfaces"],
         json!([]),
         "an empty list, not a null and not an error: {one:?}"
+    );
+}
+
+/// Claim 9, the part that needs no privilege: a node with no TUN answers
+/// `{"enabled": false}` and **nothing else**.
+///
+/// Go's handler returns as soon as `!t.isEnabled` (`tun/admin.go:30-32`), having
+/// set only `Enabled`, so `Name` and `MTU` keep their `omitempty` tags
+/// (`tun/admin.go:11-15`) and the two keys are absent from the bytes. A
+/// `serde_json::Value` cannot tell an absent key from a zero, so the assertion is
+/// on the raw response text — printing `"name": ""` and `"mtu": 0` would make this
+/// node indistinguishable from one whose interface is called the empty string and
+/// whose MTU is zero.
+#[tokio::test]
+async fn admin_gettun_on_a_node_with_no_tun_omits_the_name_and_the_mtu() {
+    let server = Server::tcp().await;
+    let mut reader = Reader::new(server.connect().await);
+    let one = reader.ask(r#"{"request":"getTun"}"#).await;
+
+    let body: Value = serde_json::from_slice(&one).expect("one value");
+    assert_eq!(body["status"], "success", "{one:?}");
+    assert_eq!(body["response"]["enabled"], false, "{one:?}");
+
+    let text = String::from_utf8(one).expect("utf-8");
+    assert!(!text.contains("\"name\""), "no name key at all: {text}");
+    assert!(!text.contains("\"mtu\""), "no mtu key at all: {text}");
+    assert_eq!(
+        body["response"].as_object().map(serde_json::Map::len),
+        Some(1),
+        "`enabled` is the only field: {text}"
+    );
+}
+
+/// The same command with a TUN attached, which needs `CAP_NET_ADMIN` and so
+/// cannot run in CI — the rule for a live test here is the same as for
+/// `mesh_ping`: `#[ignore]`d, run by hand, and it is the only thing that proves
+/// the *other* shape of the answer.
+///
+/// `lo` has to be up, which is the third of `AGENTS.md`'s traps: `unshare -Urn`
+/// supplies the capability but leaves loopback down, so the admin socket's
+/// `tcp://127.0.0.1:0` is unreachable and the failure is
+/// `NetworkUnreachable` — which says nothing about `getTun`.
+///
+/// ```sh
+/// unshare -Urn --map-root-user sh -c 'ip link set lo up; \
+///   cargo test -p roots-client --test admin_loopback \
+///     -- --ignored admin_gettun_reports_the_device --nocapture'
+/// ```
+#[tokio::test]
+#[ignore = "needs CAP_NET_ADMIN to open /dev/net/tun, and lo up"]
+async fn admin_gettun_reports_the_device() {
+    let key = SigningKey::from_bytes(&[7u8; 32]);
+    let public = key.verifying_key().to_bytes();
+    let (mut node, tx) = Node::new(key);
+    node.open_tun("rootstun0", roots::addr_for_key(&public), 0)
+        .await
+        .expect("the device opens where the capability exists");
+    let server = Server::with_node(node, tx).await;
+
+    let mut reader = Reader::new(server.connect().await);
+    let one = reader.ask(r#"{"request":"getTun"}"#).await;
+    let body: Value = serde_json::from_slice(&one).expect("one value");
+    assert_eq!(body["status"], "success", "{one:?}");
+    assert_eq!(body["response"]["enabled"], true, "{one:?}");
+    // `Name` is whatever the kernel called the interface, and `MTU` is the
+    // device's: read the interface back rather than trusting the value asked
+    // for, because the kernel is what decides both.
+    assert_eq!(body["response"]["name"], "rootstun0", "{one:?}");
+    let mtu = body["response"]["mtu"]
+        .as_u64()
+        .expect("an mtu number")
+        .try_into()
+        .expect("fits a u16");
+    assert!(
+        (1280..=65535).contains(&mtu),
+        "Go clamps to at least 1280 (`tun/tun.go:322-331`): {one:?}"
     );
 }

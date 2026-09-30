@@ -42,14 +42,14 @@ wire; there is no release process, and CI is three local commands.
   three internally (it dials with a second identity to get frames).
 - The host's own yggdrasil **service** node is live (0.5.14, no admin socket) and
   `tun0` owns `200::/7`; re-read its address with `ip -6 addr show dev tun0`,
-  never hardcode. It is useful as a traffic carrier, and any `tun_ping` run must
-  claim its own interface name.
+  never hardcode. It is useful as a traffic carrier, and any TUN run must claim
+  its own interface name.
 
 ## Commands
 
 - `cargo build --workspace`; run the node: `cargo run -q -p roots-client -- [peer-uri] [hold_secs] [resolve-ipv6]`
   (plain `cargo run` from the root **fails**: that package is lib-only).
-- `cargo test --workspace` — ~35 s, 111 unit + 20 integration, loopback only.
+- `cargo test --workspace` — ~25 s, 181 tests, loopback only.
   Narrow it: `cargo test -p roots --lib <filter>`, `cargo test -p roots --test mesh3`,
   `cargo test -p roots-client --test peer_rows -- --nocapture`.
 - `cargo test -p roots --test mesh_ping -- --ignored --nocapture` — live, needs
@@ -69,10 +69,15 @@ wire; there is no release process, and CI is three local commands.
   and `yggdrasil -genconf -json | ./target/debug/roots -useconf -address`; for a
   fixed identity feed the same `{"PrivateKey": …}` to both and compare
   `-address`, `-subnet`, `-publickey` (one flag per run — the first wins).
-- Admin/`getPeers` proofs, each in its own netns and each **rebuilding the binary
-  first** (a stale `target/debug/roots` fakes a green run): `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/{7-admin,7-admin-raw,8-getpeers}.sh`.
+- Admin/`getPeers`/multicast/TUN proofs, each in its own netns and each
+  **rebuilding the binary first** (a stale `target/debug/roots` fakes a green
+  run): `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/{7-admin,7-admin-raw,8-getpeers,9-multicast,10-tun}.sh`
+  (each re-execs itself into the namespace, so `sh proof/N.sh` is enough).
   `yggdrasilctl` selects the socket with `-endpoint` (no `-admin_socket`; with
-  none set it talks to the host's service node).
+  none set it talks to the host's service node). `10-tun.sh` is the only one that
+  needs `CAP_NET_ADMIN` *and* two namespaces, so it builds a veth pair and moves
+  an end into each child by pid — `ip netns add` needs a writable `/run/netns`
+  that a `unshare -Urn` does not have (measured: `Permission denied`).
 
 ## Boundaries
 
@@ -91,12 +96,21 @@ wire; there is no release process, and CI is three local commands.
   sole off-task exception and earns it by reading no router state.
   `client/src/main.rs` builds one too, but only in the demo probe (no config).
 - Cargo forbids `[[bin]]` from using `[dev-dependencies]`, which is why the
-  workspace exists. `tun`/`smoltcp` stay in the root manifest while
-  `examples/tun_ping.rs` and `examples/common/` still need them.
+  workspace exists. `smoltcp` stays in the root manifest for `examples/common/`
+  and `tests/tcp_loopback.rs`; `tun` moved to `client/` with Slice 14, the last
+  thing that opened a device.
 - Root `examples/` and `tests/` are demo/debug scaffolding around the lib. When
   one turns out to be node behaviour it **moves into `client/src/` and the
-  example is deleted** (Slice 7 deleted `examples/admin.rs`; `tun_ping` is next,
-  and only then can `tun` leave the root manifest).
+  example is deleted** (Slice 7 deleted `examples/admin.rs`, Slice 14 deleted
+  `examples/tun_ping.rs`; `examples/common/` is the last one, and only then can
+  `smoltcp` leave the root manifest).
+- **The library never opens a TUN.** `tun` is a `roots-client` dependency and the
+  device is a field on `Node`, because the bridge reads the router's session
+  inbox and calls `send_or_resolve` — `&mut Router` and `&mut LinkSet`, which is
+  the one thing in the client that must not have a lock. So a slice that needs a
+  device proves its *logic* with `tokio::io::duplex` (see the
+  `AsyncReadWrite` seam in `client/src/tun.rs`) and its *device* with
+  `proof/10-tun.sh`.
 
 ## Silent-failure traps
 
@@ -119,8 +133,15 @@ Full statements, with the Go line each mirrors, are in the architecture map.
   assume a `LinkId` you hold stays live; `stats(id) == None` means "this row lost
   the slot", not "the peer is gone". (`TODO.md`, not a parity slice.)
 - Session and proto payloads need their leading type byte (1 = traffic, 2 =
-  proto); Go silently drops anything else, IPv6 included. The pre-session send
-  buffer is a **single slot, last write wins** — stagger behind `has_session`.
+  proto); Go silently drops anything else, IPv6 included, and **exactly one
+  layer adds it** — adding a second is just as fatal and looks right. The
+  pre-session send buffer is a **single slot, last write wins** — stagger behind
+  `has_session`.
+- A TUN device is addressed `/128`, so a mesh address has **no route** until
+  somebody adds one (a mesh address comes from a key, not an advertisement).
+  Without the *reverse* route the far end's kernel receives your ping, cannot
+  route its own reply, and drops it — so the sender sees 100% loss while the
+  receiver's log shows the request arriving perfectly.
 - Announces carry **ancestry only**, so `known_nodes()` is not network size and
   `tree.infos` cannot find a non-relative (DHT/blooms must).
 - Byte-exactness: bloom hash is Murmur3-x64-128 `sum256` (not a stock crate
@@ -135,10 +156,16 @@ Full statements, with the Go line each mirrors, are in the architecture map.
   not object-safe; validate `arguments` before dispatch; sort with the local
   `sort_stable`, never `sort_by` (Go's comparator truncates floats and is not a
   total order, so `sort_by` panics on large row counts).
-- The admin socket is deliberately **8 of Go's 14 commands**: `getNodeInfo`,
-  the three `debug_remote*`, `getTun` and `getMulticastInterfaces` need mesh
-  round trips, a TUN and multicast state (Slices 9, 14, 11). An unknown action
-  must answer Go's verbatim `unknown action '…', try 'list' for help`.
+- The admin socket answers **all 14 of Go's commands**. An unknown action must
+  answer Go's verbatim `unknown action '…', try 'list' for help`.
+- A **payload from the app is a session message, not a traffic frame.** Ironwood
+  layers app → session → pathfinder → link, and the far end dispatches on the
+  session's leading type byte and drops anything else — silently, with the
+  counter still moving. Reaching `pathfinder_send` from application code is the
+  bug: measured as 100% ICMP loss over a link that was `up: true` on both ends.
+  Application payloads go through `send_or_resolve`; `net_send` is the only
+  caller of `pathfinder_send`, and a held payload carries the flag saying which
+  layer it belongs to.
 - Config is a wire format: Go's key set *and order*, struct-level
   `#[serde(default = "defaults")]` (Go parses the document on top of a generated
   config), a recursive `strip_nulls` (a JSON `null` is an absent key at every

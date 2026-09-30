@@ -570,10 +570,21 @@ platform default **config file** instead.
   (`reference/ironwood/network/debug.go:64`, ours `views.rs:29-31`) — so the gap
   is one entry, not a different measure. With a link up the two agree, row for
   row and in the same key order.
-- `list` offers eight commands while Go offers fourteen: `getTun` is Slice 14's,
-  `getMulticastInterfaces` Slice 11's, `getNodeInfo` and the three
-  `debug_remote*` Slice 9's. Everything those six would have answered is not yet
-  answerable, so listing them would be a promise we break.
+- `list` offers fourteen commands and so does Go. Slice 9 added `getNodeInfo` and
+  the three `debug_remote*` (`core/api.go:239-259`), Slice 11 added
+  `getMulticastInterfaces` (`multicast/admin.go:56`) and Slice 14 added `getTun`
+  (`tun/admin.go:31`).
+- `getTun`'s two optional fields are not decoration. Go's handler returns as soon
+  as `!t.isEnabled` (`tun/admin.go:30-32`) having set only `Enabled`, so `Name`
+  and `MTU` keep their `omitempty` (`tun/admin.go:11-15`) and a node with no TUN
+  answers `{"enabled": false}` — **not** `{"enabled": false, "name": "", "mtu":
+  0}`. Printing the zeroes would make it indistinguishable from an interface
+  called the empty string with an MTU of zero, and a `serde_json::Value` cannot
+  tell an absent key from a zero, so the test asserts on the response *text*.
+  Go reads `isEnabled`, `Name()` and `MTU()` off the adapter and never asks the
+  kernel (`tun/admin.go:27-33`), so neither do we: a device that exists and a
+  device that carries traffic are different questions, and only the first is
+  what this command claims.
 - Our `arguments` echo is a parsed `serde_json` map rather than raw bytes, so its
   keys come out sorted, while Go's `json.RawMessage` echo preserves the
   operator's order: `"arguments": {"uri":"x","interface":"y"}` echoes as

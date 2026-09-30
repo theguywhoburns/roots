@@ -121,6 +121,15 @@ pub enum Cmd {
         what: RemoteQuery,
         respond: oneshot::Sender<Result<Vec<u8>, String>>,
     },
+    /// Answer `getTun`: the device's name and MTU, or `None` when the node has
+    /// no TUN.
+    ///
+    /// A command rather than a method, for the same reason everything else here
+    /// is: the device is a field on `Node`, so only the task running `Node::run`
+    /// may read it.
+    Tun {
+        respond: oneshot::Sender<Option<(String, u16)>>,
+    },
     /// Leave the loop after the current slice.
     Quit,
 }
@@ -185,6 +194,14 @@ pub struct Node {
     /// the same thing without the repetition; the wait is [`REMOTE_TIMEOUT`]
     /// because that is the number the operator is told about.
     pending: Vec<PendingRemote>,
+    /// The TUN bridge, when `IfName` configured one.
+    ///
+    /// A field rather than a task, and that is the whole design: the device reads
+    /// the session inbox and calls `send_or_resolve`, both of which want
+    /// `&mut Router` and `&mut LinkSet`. Those are single-owner in this client
+    /// (`AGENTS.md`, "lib/client boundary"), so a TUN in its own task would need a
+    /// lock over the one thing here that must not have one.
+    tun: Option<crate::tun::Device>,
 }
 
 /// One outstanding remote question, waiting for a node to answer it.
@@ -222,6 +239,7 @@ impl Node {
             tick,
             quit: false,
             pending: Vec::new(),
+            tun: None,
         };
         let sender = node.tx.clone();
         (node, sender)
@@ -229,6 +247,39 @@ impl Node {
 
     pub fn sender(&self) -> mpsc::UnboundedSender<Cmd> {
         self.tx.clone()
+    }
+
+    /// Attach a TUN bridge, which is how a config's `IfName` becomes a real
+    /// interface.
+    ///
+    /// Called once, before [`Node::run`], because opening the device needs
+    /// `CAP_NET_ADMIN` and a failure there is the operator's answer about it —
+    /// a node that starts with no TUN and reports `enabled: false` is
+    /// indistinguishable from one whose TUN silently dropped every packet.
+    ///
+    /// `local` is this node's own mesh address, which is what the device is
+    /// addressed as: the kernel routes a packet for it here, and the mesh finds a
+    /// path for it by the same key.
+    ///
+    /// Which packets the device forwards is not a parameter. It is the mesh range
+    /// `0200::/7` (`tun.rs`, `Device::wants`), which is the one rule that holds
+    /// for every node: it covers every peer address *and* every routed subnet
+    /// prefix, and it needs no configuration that Go's own config does not have.
+    pub async fn open_tun(
+        &mut self,
+        ifname: &str,
+        local: roots::address::Address,
+        mtu: u16,
+    ) -> Result<(), roots::Error> {
+        let device = crate::tun::open(ifname, local, crate::tun::supported_mtu(mtu)).await?;
+        eprintln!(
+            "TUN {} up with {} (mtu {})",
+            device.name(),
+            local,
+            device.mtu()
+        );
+        self.tun = Some(device);
+        Ok(())
     }
 
     /// The configured-peer bookkeeping, for a caller that has the node itself:
@@ -333,8 +384,69 @@ impl Node {
             // are read here because this is the only task that may read
             // `proto_inbox`: it fills during the serve slice above.
             self.settle_remote();
+            self.pump_tun().await;
         }
         Ok(())
+    }
+
+    /// Move packets both ways between the TUN and the mesh.
+    ///
+    /// Three steps, in this order, and the order is the design:
+    ///
+    /// 1. **Session inbox to the device.** `serve` has just filled the inbox, and
+    ///    a session payload is a whole IP packet, so it goes straight out. This is
+    ///    Go's `ipv6rwc` handing a packet to the TUN (`ipv6rwc.go:174-199`).
+    /// 2. **Device to the mesh.** Read what the kernel routed at us and hand it to
+    ///    `send_or_resolve`, which resolves the destination, queues the packet
+    ///    while the lookup runs, and flushes it on the notify. A queued packet is
+    ///    not a lost one — that is the whole reason Slice 12 exists.
+    /// 3. **Back out of the device.** `flush` runs last so a device buffer that
+    ///    will not take the write does not also stop the mesh side being pumped.
+    ///
+    /// A device with no traffic costs two non-blocking reads, which is why this is
+    /// inline rather than behind a flag.
+    async fn pump_tun(&mut self) {
+        let Some(device) = self.tun.as_mut() else {
+            return;
+        };
+        // 1. The mesh's packets to the kernel. Every session payload is a packet:
+        // the session layer carries whole IP datagrams and nothing else
+        // (`session.rs`), so there is no framing to unwrap and no way to tell a
+        // packet from another payload — which is exactly why the device is only
+        // enabled when the node is a router for IP.
+        for (_, packet) in self.router.inbox.drain(..) {
+            device.deliver(packet);
+        }
+        // 2. The kernel's packets to the mesh. The lookup leaves on the first
+        // live link, which is a choice rather than a route: `send_or_resolve`
+        // only needs *a* link to start the DHT query on, and the pathfinder picks
+        // the one the traffic should go out by (`driver.rs`, `pathfind.rs`).
+        let via = self.links.ids().first().copied();
+        // `send_or_resolve` is `&mut self.router` and `&mut self.links` while
+        // `device` borrows `self`, so the borrow has to be split by hand.
+        let Node {
+            router, links, tun, ..
+        } = self;
+        if let (Some(tun), Some(via)) = (tun.as_mut(), via)
+            && let Err(e) = tun.pump(router, links, Some(via)).await
+            && !e.is_link()
+        {
+            // A dead device is not a dead node: drop it and keep serving links.
+            eprintln!("tun: {e}");
+            self.tun = None;
+            return;
+        }
+        // 3. Whatever the mesh produced, out to the kernel. A failed write means
+        // the device is gone — it was deleted, or its namespace went away — and it
+        // is dropped for the same reason a failed read drops it: an outbox nobody
+        // drains grows without bound, and a node with no TUN reports
+        // `enabled: false` rather than pretending.
+        if let Some(tun) = self.tun.as_mut()
+            && let Err(e) = tun.flush().await
+        {
+            eprintln!("tun: {e}");
+            self.tun = None;
+        }
     }
 
     /// Match whatever arrived in `proto_inbox` against the questions still
@@ -492,6 +604,10 @@ impl Node {
                 let _ = respond.send(self.snapshot());
             }
             Cmd::Send { dest, bytes } => self.outbox.push((dest, bytes)),
+            Cmd::Tun { respond } => {
+                let answer = self.tun.as_ref().map(|t| (t.name().to_string(), t.mtu()));
+                let _ = respond.send(answer);
+            }
             Cmd::Remote { key, what, respond } => {
                 // The request goes out addressed to a node key, so the
                 // pathfinder picks the next hop — the same route any other
