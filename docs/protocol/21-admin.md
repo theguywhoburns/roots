@@ -533,25 +533,30 @@ platform default **config file** instead.
   refusals (`link schema unknown`, `invalid password supplied`,
   `peer is already configured`, `peer is not configured`,
   `priority value is invalid`) are Go's verbatim.
-- **A peering dialled both ways flaps, and `getPeers` is where it shows.** Go
-  keys its link map by URI (`link.go:43-44`) and ironwood keeps several links
-  per node key (`peers.go:47-62`), so both directions can be up at once and each
-  gets a row. Our `LinkSet` keeps **one slot per node public key**, and taking
-  that slot closes whatever held it (`src/link.rs:303-332`, the displaced link
-  is dropped at both call sites, `client/src/node.rs:324,357`). Measured
-  2026-09-25 with two nodes whose configs dial each other (`proof/8-getpeers.sh`
-  phase C, and the same arrangement between two of our own nodes): exactly one
-  direction is up at any instant, which direction that is flips between
-  one-second samples, and the accepted row leaves the list when its link dies and
-  comes back with a new socket address. Go's log says the same thing in its own
-  words — `Connected inbound` / `Disconnected outbound` alternating every two
-  seconds. So the row *set* matches Go's and the row *liveness* does not. The
-  fix is link-keying work, not admin work: either hold more than one link per
-  node key, or refuse the newcomer the way Go refuses a duplicate URI
-  (`link.go:544-548`) so the pair settles on one link instead of trading
-  closures. Recorded as a TODO. `client/tests/peer_rows.rs`
-  (`two_directions_to_one_peer_get_two_rows`) pins the one-live-row half of it,
-  and parks the redial with `?maxbackoff=600s` long enough to read the rows.
+- **A peering dialled both ways: two rows, one per direction, and no flap.**
+  This was a deviation and is not any more, so it is worth recording what the
+  answer looks like rather than deleting the note. Go keys its link map by URI
+  (`link.go:43-44`) and ironwood keeps several links per node key
+  (`peers.go:47-62`), so both directions are up at once and each gets a row.
+  Ours now does too: `LinkSet` is **one entry per link** with `LinkId` as the
+  addressing unit, so a second link to a key we already hold is a second entry
+  rather than a displacement. Measured 2026-09-30 with two nodes whose configs
+  dial each other, against a live Go 0.5.14 node on the other end
+  (`proof/8-getpeers.sh` phase C): both sides answer with **exactly two live
+  rows**, one per direction, the same two rows in every one-second sample, and
+  Go's log carries two `Connected` lines and no `Disconnected` churn.
+  `client/tests/peer_rows.rs`'s `two_directions_to_one_peer_get_two_rows` pins
+  our side and parks the redial with `?maxbackoff=600s` long enough to read the
+  rows.
+  The old measurement, for contrast: on 2026-09-25 exactly one direction was up
+  at any instant, which direction flipped between samples, the accepted row left
+  the list when its link died and came back with a new socket address, and Go's
+  log alternated `Connected inbound` / `Disconnected outbound` every two seconds.
+  So the row *set* had matched Go's while the row *liveness* had not.
+  **A proof script that encoded the bug as the expected answer** is what kept
+  this looking like a deviation for two days: phase C asserted "no answer may
+  report two live rows" and "Go must log the pair going up and down", and both
+  passed. It now asserts the Go behaviour instead.
 - **A quiet link reports `rate_recvd: 0` here and nothing at all in Go.** Both
   answers are true: Go's peer monitor only arms its keepalive in reply to a
   *non*-keepalive frame (ironwood `peers.go:161-175`), so a converged idle

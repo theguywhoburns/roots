@@ -317,11 +317,11 @@ impl crate::router::Router {
                     match s.decrypt(data) {
                         Some(payload) => {
                             *active = now;
-                            if let Some(e) = self.path.entries.get_mut(&from)
-                                && !e.broken
-                            {
-                                e.deadline = now + crate::pathfind::PATH_TIMEOUT;
-                            }
+                            // The path entry's deadline was refreshed on the way
+                            // in, in `handle_inbound_traffic`, where Go refreshes
+                            // it (`network/router.go:597`). Not here: a peer whose
+                            // frames never decrypt would otherwise age out of the
+                            // path table over a link that is plainly working.
                             // yggdrasil-go dispatches on the leading session
                             // packet-type byte (`Core.ReadFrom` in
                             // yggdrasil-go/src/core/core.go): 1 = TUN

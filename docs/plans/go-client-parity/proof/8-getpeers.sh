@@ -16,9 +16,8 @@
 #   4. `sort=cost` / `sort=uptime` answer with the same rows as no sort, in an
 #      order the mode's own key actually explains;
 #   5. phase C — a peering dialled both ways at once, on a second pair of nodes
-#      so nothing is torn down first: neither side ever answers with two live
-#      rows, and which one is live moves between samples. That is the flapping
-#      deviation `docs/protocol/21-admin.md` records.
+#      so nothing is torn down first: both sides hold two live rows, one per
+#      direction, and the pair does not flap.
 # Needs the installed yggdrasil/yggdrasilctl 0.5.14 — never a Go compiler, and
 # never in CI.
 set -e
@@ -96,6 +95,41 @@ onelive() { # label, file — no answer may report two live rows
         echo "ok    $1"
     else
         echo "FAIL  $1 (an answer listed two live rows, or none at all)"
+        fails=$((fails + 1))
+    fi
+}
+# Every answer must report exactly two live rows: one per direction.
+#
+# This replaces the old `onelive` for phase C, which asserted the *opposite*.
+# Phase C was written when our `LinkSet` kept one slot per node key, so taking a
+# second link to a peer we already held displaced the first and closed its
+# socket — and the pair traded closures forever, one live row at a time. That is
+# fixed: `LinkSet` is one entry per *link* and `LinkId` is the addressing unit, so
+# both directions stay up, which is what ironwood does with a map of peers per key
+# (`peers.go:47-62`). `client/tests/peer_rows.rs`'s
+# `two_directions_to_one_peer_get_two_rows` pins it on our side; this is the
+# Go-facing proof of the same thing, and it should hold on both sides.
+twolive() { # label, file
+    if awk 'BEGIN { bad = 0; n = 0; answers = 0 }
+        /"peers": \[/ { if (seen && n != 2) bad = 1; seen = 1; n = 0; answers++ }
+        /"up": true/ { n++ }
+        END { if (seen && n != 2) bad = 1; exit bad || (answers == 0) }' "$2"; then
+        echo "ok    $1"
+    else
+        echo "FAIL  $1 (an answer did not report exactly two live rows)"
+        fails=$((fails + 1))
+    fi
+}
+# The pair must settle: the *same* two rows, live, in every answer. A flap shows
+# up as an answer with one row, or with a different pair, between two that agree.
+stable() { # label, file
+    if awk '/"peers": \[/ { if (seen) print sig; sig = ""; seen = 0 }
+            /"remote"/ { r = $0; gsub(/.*: "|",$/, "", r); sig = sig r " " }
+            /"up": true/ { seen = 1 }
+            END { if (seen) print sig }' "$2" | sort -u | wc -l | grep -qx 1; then
+        echo "ok    $1 (one distinct live set across every answer)"
+    else
+        echo "FAIL  $1 (the live rows moved between answers: a flap)"
         fails=$((fails + 1))
     fi
 }
@@ -214,13 +248,19 @@ echo "== phase C: both directions to one peer, from a cold start =="
 # The phases above tear a link down before the next one is built, which hides the
 # crossed case. This uses a second pair whose *config* dials the other, so both
 # directions are attempted at once and neither side is cleaning up after itself.
-# What this measures is the deviation docs/protocol/21-admin.md records under
-# "A peering dialled both ways flaps": Go keys its link map by URI and ironwood
-# keeps several links per node key (`peers.go:47-62`), so Go *can* hold both
-# directions at once — but our `LinkSet` keeps one slot per node key and taking
-# it closes the link that held it, so the pair trades closures instead of
-# settling. Neither side ever shows two live rows here, and which one is live
-# changes between samples.
+#
+# Both sides should end up holding **two live rows**, one per direction, and stay
+# that way. That is what ironwood does — several links per node key
+# (`peers.go:47-62`) — and what we do since `LinkSet` became one entry per link
+# with `LinkId` as the addressing unit.
+#
+# This phase used to assert the opposite, and it passed. It said "no answer may
+# report two live rows" and "Go must log the pair going up and down", because at
+# the time our `LinkSet` keyed its slots by node public key: taking a second link
+# to a peer we already held displaced the first and closed its socket, so the pair
+# traded closures and one live row at a time was correct. Both assertions were
+# descriptions of a bug written as if they were requirements, and a proof script
+# that encodes a fixed bug as the expected answer is worse than no proof script.
 GK2=$(yggdrasil -genconf -json | grep -o '"PrivateKey": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{128\}')
 OK2=$(yggdrasil -genconf -json | grep -o '"PrivateKey": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{128\}')
 conf_x() { # key, admin, ifname, listen, peer, file
@@ -245,16 +285,35 @@ OURS2=$!
 sleep 10
 poll tcp://127.0.0.1:19002 "$D/c-go" 3
 poll tcp://127.0.0.1:19102 "$D/c-ours" 3
-echo "-- go, one line per answer: the row that is up"
+echo "-- go, one line per answer: the rows that are up"
 liverow "$D/c-go"
 echo "-- ours"
 liverow "$D/c-ours"
-onelive "Go never answers with both directions up" "$D/c-go"
-onelive "nor do we" "$D/c-ours"
+twolive "Go holds both directions at once" "$D/c-go"
+twolive "so do we" "$D/c-ours"
+stable "Go's live rows do not move between answers" "$D/c-go"
+stable "nor do ours" "$D/c-ours"
 need "both sides keep their own dial listed throughout" "$D/c-go" '"remote": "tcp://127.0.0.1:12404"' 3
 need "both sides keep their own dial listed throughout" "$D/c-ours" '"remote": "tcp://127.0.0.1:12403"' 3
-need "the accepted direction does get a row" "$D/c-ours" '"inbound": true' 1
-need "Go logs the pair going up and down" "$D/go2.log" "Connected \|Disconnected " 6
+# One row per direction, each reporting its own link's direction. Two live rows
+# with two `inbound: false` would mean the crossed dialling was refused rather
+# than accepted, which is a different thing entirely.
+need "we report one row per direction" "$D/c-ours" '"inbound": false' 1
+need "and the direction we did not dial is there too" "$D/c-ours" '"inbound": true' 1
+# The pair settles, so Go logs each direction coming up **once**. Six flap lines
+# in ten seconds is what the displaced-slot bug produced; the bound here is two
+# connections and nothing more, and a flap of even one extra shows up as a failure
+# rather than being averaged into a pass.
+atmost() { # label, file, pattern, max
+    n=$(grep -c "$3" "$2" || true)
+    if [ "$n" -le "$4" ]; then
+        echo "ok    $1 ($n)"
+    else
+        echo "FAIL  $1 ($n, want at most $4)"
+        fails=$((fails + 1))
+    fi
+}
+atmost "Go does not flap the pair" "$D/go2.log" "Connected \|Disconnected " 4
 echo "-- our node's own words about it"
 tail -2 "$D/ours2.log"
 

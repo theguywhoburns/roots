@@ -303,8 +303,22 @@ impl Config {
     /// then never matches it, so a typo there is a silent lockout — we reject
     /// anything that is not 32 bytes.
     ///
-    /// `GroupPassword` is deliberately not wired here: it filters *traffic* by
-    /// group membership, not links, and nothing in the library does that yet.
+    /// `GroupPassword` is accepted and ignored, which is the worst kind of gap: a
+    /// config key that parses, appears in `-genconf`, and does nothing.
+    ///
+    /// An earlier comment here said it "filters *traffic* by group membership,
+    /// not links", which described the intent and not the mechanism. The
+    /// mechanism is the **session signature preimage**: with a password set, Go
+    /// computes `sha256("ironwood/encrypted\x00" ‖ password)`
+    /// (`encrypted/crypto.go:149-157`) and folds it into the bytes that the
+    /// `init` and `ack` signatures cover (`encrypted/session.go:502` signing,
+    /// `:550` checking).
+    ///
+    /// So the consequence is concrete and silent: a node with `GroupPassword` set
+    /// will not verify our `init` or our `ack`, so no session is ever established,
+    /// so no payload ever crosses — and nothing says why. `SessionInit::encrypt_msg`
+    /// and `decrypt_msg` have no preimage parameter to pass it through, so this
+    /// needs a library change as well as a config one. Recorded in `TODO.md`.
     pub fn link_options(&self) -> Result<LinkOptions, ConfigError> {
         let mut allowed_keys = Vec::with_capacity(self.allowed_public_keys.len());
         for entry in &self.allowed_public_keys {

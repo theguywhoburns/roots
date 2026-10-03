@@ -23,19 +23,20 @@ Rules for these pages:
 | [10-envelope.md](10-envelope.md) | link frame envelope: uvarint size, packet type, all 10 types | **captured** from Go 0.5.14 | `go_link_frame_envelope_matches_captured` (4 frames), `frame_kinds_match_table_len` |
 | [20-handshake.md](20-handshake.md) | `meta` handshake: TLVs, keyed-hash signature, version check, flow | **captured** from Go 0.5.14, both password branches | `go_meta_handshake_bytes_match_captured`, `go_meta_password_binds_the_signature` |
 | [21-admin.md](21-admin.md) | admin socket: JSON value stream, `request`/`response` envelope, `keepalive`, all 14 commands | **captured** from Go 0.5.14 over TCP and `unix://`, 22 raw edge cases | `admin_unix_socket_matches_tcp`, `admin_body_field_order_matches_go`, `admin_keepalive_honours_second_request`, `admin_error_strings_match_go`, `admin_getpeers_reports_the_link_uri_not_the_operators`, `admin_argument_types_match_go`, `admin_gettun_on_a_node_with_no_tun_omits_the_name_and_the_mtu` |
-| — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured` |
-| — | `SigReq` / `SigRes` / `Announce` payloads | **captured** from Go 0.5.14 | `go_tree_payloads_match_captured` |
-| — | `SigRes.psig` and the announce `sig` preimage | **captured**, and the preimage is verified | same |
+| [30-tree.md](30-tree.md) | `SigReq` / `SigRes` / `Announce`, and both signature preimages | **captured** from Go 0.5.14, preimages verified | `go_tree_payloads_match_captured` |
+| [50-path.md](50-path.md) | `PathLookup` / `PathNotify` / `PathBroken`, `xkey` | **transcribed** from a Go generator | `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go` |
+| [60-traffic.md](60-traffic.md) | the `Traffic` frame and forwarding | **transcribed** from a Go generator | `traffic_vector_matches_go`, `a_path_is_refreshed_by_a_frame_we_cannot_read`, `a_forwarded_frame_does_not_refresh_the_forwarders_path` |
+| [70-session.md](70-session.md) | session `init` / `ack`, the type bytes, the e2c map | `init` **transcribed**; `ack` round-trip only; type bytes and e2c map from Go's source | `go_init_decrypts_with_b_key`, `session_handshake_roundtrip`, `packet_type_constants_match_go`, `e2c_pub_matches_go` |
+| [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | round-trip only, plus a non-Go KAT; **no captured beacon** | `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
+| — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured`, `validity` |
 | — | `BloomFilter` wire encoding | **captured** (which block is which) + **transcribed** (bit order within a byte) | `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
-| — | `PathLookup` / `PathNotify` / `PathBroken` | **transcribed** from a Go generator | `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go` |
-| — | `Traffic` | **transcribed** from a Go generator | `traffic_vector_matches_go` |
-| — | session `init` | **transcribed** from a Go generator | `go_init_decrypts_with_b_key` |
-| — | session `ack` | round-trip only | `session_handshake_roundtrip` |
-| — | session `key` (rotation) | **nothing** | — |
-| — | inner type bytes (traffic 1 / proto 2) | constants from Go's source | `packet_type_constants_match_go`, `packet_type_constants_match_go_core_types` |
-| — | ed25519→X25519 map | **transcribed** from a Go generator | `e2c_pub_matches_go` |
+| — | session rotation (there is no `key` message) | **nothing** | — |
 | — | `typeSessionProto` nodeinfo / debug | semantics only | `nodeinfo_size_cap_matches_go`, `debug_round_trips` |
-| — | multicast advertisement + membership hash | round-trip only, plus a non-Go KAT | `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
+
+Numbering follows the plan's list (`02-architecture.md`, "Documentation
+artifact"), so the gaps are visible: `00-overview`, `40-bloom`, `80-address` and
+`90-proto` are not written. `30-tree` is deliberately ahead of `40-bloom` — the
+tree payload is captured and therefore the more useful page first.
 
 ## The count, and what it means
 
@@ -56,14 +57,22 @@ The table above labels every row with the provenance it actually has, because a
 table that says "guarded" for a round-trip test is the same failure in a
 different font. Four things are worth naming:
 
-- **Session `ack` and `key` have no captured bytes at all**, and `key` — the
-  rotation path, `Session::maybe_rotate` — is not exercised by any test at all.
-  A session rides *inside* a `Traffic` frame (there is no session frame type:
-  the pathfinder is below the session layer, so the traffic frame's payload *is*
-  the session message), which means capturing one means answering Go's `init`.
-  The harness can: the payload is sealed to *our* key and we hold it. Go just
-  never opens one here, because the only thing it wants to say is nodeinfo and
-  that arrives through a `key` rotation first. That is the next capture.
+- **There is no session `key` message, and the inventory row is wrong about
+  one.** Ironwood declares four session types — Dummy, Init, Ack, Traffic
+  (`encrypted/session.go:27-32`) — and there is no fifth. Rotation on nonce
+  wraparound sends **nothing**: the keys are swapped locally and the peer learns
+  of it from the next traffic frame's first uvarint, which is why that header
+  carries two key sequences (`session.go:303-311`). So "session `key`" is
+  rotation *state*, not a message, and `Session::maybe_rotate` has no test.
+- **Session `ack` has no captured bytes.** A session rides *inside* a `Traffic`
+  frame — there is no session frame type, because the pathfinder is below the
+  session layer, so the traffic frame's payload *is* the session message — so
+  capturing one means answering Go's `init`. The harness can: the payload is
+  sealed to *our* key and we hold it. Go just never opens one in the current
+  capture, so this is the next capture and it is not written.
+- **`GroupPassword` is a config key we accept and ignore**, and a node with one
+  set will not verify our `init` or `ack`. That is a real interop hole rather
+  than a documentation gap; see `TODO.md`.
 - **The bloom's bit order within a flag byte** is pinned by a generator vector,
   not by the binary. Go's first filter is empty, and an all-ones flag block
   cannot tell MSB from LSB — measured, by reversion.
@@ -82,6 +91,10 @@ Reaching it means captures, not typing, and each one needs the Go binary inside
 crosses a link, but `21-admin.md` is written to the same rules because
 `yggdrasilctl` interoperability is a claim just as testable as a frame layout.
 
-The blank pages are the work list: each gets written when a slice captures real
-Go bytes for it. `docs/plans/go-client-parity/04-slices.md` tracks which slice
-owns which row.
+Eight of the formats have a page and fourteen do not. A page is written from a
+format's *evidence*, not from its absence: `30-tree.md` exists because the tree
+payload is captured, and `60-traffic.md` exists because the layering fact it
+leads with is the one that caused a bug. The blank pages are the work list, and
+the gap is deliberate rather than lazy — writing `80-address.md` from
+transcribed vectors would be a page that reads like evidence and is not.
+`docs/plans/go-client-parity/04-slices.md` tracks which slice owns which row.

@@ -33,32 +33,27 @@ Steps on a host with TUN privileges (root or `CAP_NET_ADMIN`, `iproute2`):
 Why it wasn't done in-sandbox: `unshare -Urn` (where `TUNSETIFF` succeeds) has no
 internet route for public peers.
 
-## One node key, one link slot: a peering dialled both ways never settles
+## `GroupPassword` is accepted and ignored, so it silently breaks sessions
 
-`LinkSet` (`src/link.rs`) keys its slots by **node public key**, so
-`add` displaces the incumbent and the node drops the returned `AnyConn`,
-closing that socket (`client/src/node.rs:324,357`). When two nodes each
-dial the other, the two directions trade slots forever.
+A config key we parse, print in `-genconf`, and do nothing with. Go folds
+`sha256("ironwood/encrypted\x00" ‖ password)` (`encrypted/crypto.go:149-157`)
+into the **session signature preimage** — `encrypted/session.go:502` signs with
+it, `:550` checks with it. A node with `GroupPassword` set therefore **will not
+verify our `init` or our `ack`**, so no session is ever established and no payload
+ever crosses. There is no error and nothing in the log: the frames arrive, the
+signatures simply do not match.
 
-Measured 2026-09-25 in `proof/8-getpeers.sh` phase C (Go↔ours) and with a
-two-of-ours pair: exactly one direction is up at any instant, the live
-row changes identity between samples, and the Go node logs 15
-`Connected`/`Disconnected` lines in ten seconds. `docs/protocol/21-admin.md`
-and the AGENTS.md gotcha record what `getPeers` shows meanwhile.
+`SessionInit::encrypt_msg` / `decrypt_msg` (`src/session.rs:97`, `:124`) take no
+preimage parameter, so this needs a library change before it needs a config one.
+An earlier comment in `client/src/config.rs` described the intent ("filters
+traffic by group membership, not links") rather than the mechanism; that is fixed,
+and it is worth writing down how easy it is to describe a mechanism you have not
+read.
 
-Decide one of:
-
-1. Multi-link per node key in the set (what ironwood does — a *map* of
-   peers per key, `network/peers.go:47-62`), which means the router must
-   stop assuming one link per peer; or
-2. Refuse the newcomer the way Go refuses a duplicate (`core/link.go:
-   544-548` closes a link whose key it already holds), so a crossed
-   peering settles on the direction that won instead of flapping.
-
-Either way `src/link.rs:303-332` and the two `node.rs` call sites are the
-change, and `two_directions_to_one_peer_get_two_rows` in
-`client/tests/peer_rows.rs` — which currently asserts one row `up` and
-says so — is the test to flip.
+Do: add a preimage parameter threaded from `Config::group_password` through
+`session_send_kind` into `encrypt_msg`/`decrypt_msg`, then prove it against a Go
+node with a password set — a `proof/` script that starts one Go node with
+`GroupPassword` and one of ours with the same, since the failure mode is silence.
 
 ## Why our `latency` and `cost` run far above a Go peer's
 

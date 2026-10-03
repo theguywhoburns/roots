@@ -129,10 +129,12 @@ Full statements, with the Go line each mirrors, are in the architecture map.
   `bloom.on_tree` on link death (Go's `removePeer` does), so any send addressed
   *from router state* must be soft `write_via` or iterate `links.peers()`; hard
   `write` is only for a link the caller just held.
-- `LinkSet` is one slot per **node key**, so a peering dialled both ways never
-  settles — the directions trade closures, measured, on ours and on Go. Never
-  assume a `LinkId` you hold stays live; `stats(id) == None` means "this row lost
-  the slot", not "the peer is gone". (`TODO.md`, not a parity slice.)
+- `LinkSet` is one entry per **link** and `LinkId` is the addressing unit, so a
+  second link to a key we already hold is a second entry, not a displacement. A
+  peering dialled both ways gives two live rows, one per direction, and does not
+  flap — measured against a live Go node (`proof/8-getpeers.sh` phase C). Never
+  assume a `LinkId` you hold stays live: `stats(id) == None` means *that
+  connection* is gone, not that the peer is. Read the peer off the row.
 - Session and proto payloads need their leading type byte (1 = traffic, 2 =
   proto); Go silently drops anything else, IPv6 included, and **exactly one
   layer adds it** — adding a second is just as fatal and looks right. The

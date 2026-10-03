@@ -58,8 +58,11 @@ pub struct Discovery {
     /// (`multicast.go:262-301`).
     socks: std::collections::BTreeMap<String, UdpSocket>,
     inner: Multicast,
-    /// The operator's `MulticastInterfaces`, in configuration order, because
-    /// the first matching row wins (`multicast.go:196-217`).
+    /// The operator's `MulticastInterfaces`, in configuration order.
+    ///
+    /// A `Vec` where Go has a `map` (`multicast.go:38`), so "the first matching
+    /// row wins" is deterministic here and unspecified there — see
+    /// [`config_for`].
     config: Vec<MulticastRow>,
     /// The bound listener's address per interface, which is what
     /// `getMulticastInterfaces` reports (`multicast/admin.go:40-42`).
@@ -474,10 +477,24 @@ impl Discovery {
 
     /// Which configured row applies to this interface name.
     ///
-    /// Go compiles each `MulticastInterface.Regex` and takes the **first** match,
-    /// in configuration order (`multicast.go:196-217` breaks out of the loop on
-    /// the first hit). So the first matching row wins, and a row with neither
-    /// `Beacon` nor `Listen` is skipped before matching at all.
+    /// Go breaks out of the match loop on the first hit
+    /// (`multicast.go:205-231`), so the **first** matching row wins, and a row
+    /// with neither `Beacon` nor `Listen` is skipped before matching at all.
+    ///
+    /// "First" is the interesting word. Go ranges
+    /// `m.config._interfaces`, which is a `map[MulticastInterface]struct{}`
+    /// (`multicast.go:38`, built at `:70`), and Go randomises map iteration — so
+    /// when two rows both match an interface, *which* one Go picks is
+    /// unspecified. Go's own configuration documentation says interfaces "use the
+    /// first configuration that they match against" (`config/config.go:50`), so
+    /// the intent is order and the implementation does not deliver it. This is a
+    /// `Vec` and we deliver it.
+    ///
+    /// That is a divergence we own and it is not worth matching: an operator who
+    /// writes two overlapping rows gets a stable answer here and a coin flip on a
+    /// Go node, and nothing sane depends on which of two overlapping rows wins.
+    /// The default config has one row (`defaults_linux.go:17`), so the question
+    /// does not arise unless someone writes the second one.
     fn config_for(&self, name: &str) -> Option<&MulticastRow> {
         config_for(&self.config, name)
     }
@@ -575,9 +592,19 @@ pub(crate) fn config_for<'a>(rows: &'a [MulticastRow], name: &str) -> Option<&'a
 /// silently fails to match an interface would stop us peering, and a wrong
 /// answer there is invisible.
 ///
-/// A pattern that does not compile is treated as matching nothing, because Go
-/// logs and skips that row (`multicast.go:196-205` continues past a `NewRegexp`
-/// failure) and an interface that does not match is simply absent.
+/// A pattern that does not compile is treated as matching nothing, and this is a
+/// **divergence Go does not have**: Go compiles every row with
+/// `regexp.MustCompile` at startup (`cmd/yggdrasil/main.go:259`) and *panics* on
+/// an invalid pattern. There is no `NewRegexp` failure path to continue past and
+/// no logging one — an earlier comment here claimed both and cited a line that
+/// does not exist.
+///
+/// Matching nothing is the right call anyway, and for the reason Go never has to
+/// face the question: a row that cannot compile cannot describe an interface, so
+/// the interface is simply absent from multicast. The difference is that a Go
+/// node refuses to start on a typo while this one starts with that interface
+/// quiet — the more useful failure, and a config error the operator can read off
+/// a log line instead of a stack.
 fn matches(pattern: &str, name: &str) -> bool {
     match regex::Regex::new(pattern) {
         Ok(re) => re.is_match(name),
@@ -712,8 +739,9 @@ fn bind_reuse() -> std::io::Result<UdpSocket> {
 mod tests {
     use super::*;
 
-    /// Go compiles the row's `Regex` and takes the first match, in
-    /// configuration order (`multicast.go:196-217`).
+    /// Go compiles the row's `Regex` and takes the first match — where "first"
+    /// is a map iteration, so it is only deterministic when exactly one row
+    /// matches. See `Discovery::config_for`.
     #[test]
     fn interface_patterns_behave_like_go_regexp_matchstring() {
         // `.*` is what our own default config carries, and it must match

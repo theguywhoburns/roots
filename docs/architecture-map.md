@@ -434,14 +434,15 @@ Client-side (the single-task rule):
   host to it (`link.go:514-524`), and a dead accepted row leaves the table while
   a dead dial row stays — the two `defer`s in `link.go` differ, not the admin
   layer.
-- **One node key is one link slot, so a crossed peering flaps.** `LinkSet::add`
-  displaces the incumbent and the node drops what comes back, closing that
-  socket; both directions then re-form and displace each other again. Measured
-  2026-09-25 (`proof/8-getpeers.sh` phase C, and two of our own nodes dialling
-  each other): exactly one row is live at any instant and it alternates. Go keys
-  by URI and ironwood keeps several links per key, so it can hold both. Treat a
-  `LinkId` as volatile and `stats(id) == None` as "lost the slot", not "peer
-  gone". The fix is link-keying work — TODO, not a parity slice.
+- **A `LinkId` is volatile; a node key is not.** `LinkSet` is one entry per
+  **link** and `LinkId` is the addressing unit, so a second link to a key we
+  already hold is a second entry rather than a displacement. Measured 2026-09-30
+  against a live Go node (`proof/8-getpeers.sh` phase C): a peering dialled both
+  ways gives **two live rows, one per direction, stable across samples, with no
+  flap**, which is what ironwood does with a map of peers per key
+  (`peers.go:47-62`). Before the link-keying change it was one row alternating
+  every second. So `stats(id) == None` now means *this connection* is gone, not
+  that the peer is — read the peer off the row, not off the id.
 - **The `getPeers` order is Go's, including the bug that makes it unsortable by
   Rust's sort.** Go's comparators `return int(a.Uptime - b.Uptime)` for a
   difference it already tested nonzero as a float, so two uptimes within a second
