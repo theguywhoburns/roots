@@ -208,3 +208,172 @@ for pair in "A:$A_ADMIN" "B:$B_ADMIN"; do
 done
 
 echo "PASS: two nodes with no configured peers found each other over multicast"
+
+# ---------------------------------------------------------------------------
+# The beacon's own bytes, from Go.
+#
+# Everything above proves the two directions *work* — our beacon reached a Go
+# node and our listener acted on a Go beacon — but neither side of that shows a
+# single Go byte, so the advertisement codec has never been checked against Go's.
+# It was round-tripped through our own encoder instead, which cannot catch a
+# layout that is self-consistent and wrong.
+#
+# The arrangement is deliberate. A Go node beacons on the veth with
+# `Listen: false`, and one of our nodes is the only listener: Go binds
+# `[::]:9001` whenever *either* flag is set (`multicast.go:96-101`), so a Go
+# listener would compete for the same datagrams and which socket got one would be
+# a kernel decision. With `Listen: false` there is exactly one socket on the
+# group, and `ROOTS_DBG_MULTICAST` prints what arrived.
+# ---------------------------------------------------------------------------
+echo
+echo "== Go's beacon bytes: a Go node beaconing, our node the only listener"
+GOA_IFACE=${GOA_IFACE:-mcg0}
+GOB_IFACE=${GOB_IFACE:-mcb1}
+GOB_ADMIN="unix://$WORK/gob.sock"
+
+# A third veth pair, so this does not disturb the pair under test: the beacon
+# has to arrive on an interface this node's own multicast row does not match, or
+# a peer that happens to match would be a coincidence rather than the beacon.
+ip link add "$GOA_IFACE" type veth peer name "$GOB_IFACE"
+ip link set "$GOA_IFACE" up
+ip link set "$GOB_IFACE" up
+ip -6 addr add fe80::c/64 dev "$GOA_IFACE" nodad
+ip -6 addr add fe80::d/64 dev "$GOB_IFACE" nodad
+
+GOB_KEY=$("$BIN" -genconf | grep -o '"PrivateKey": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{128\}')
+GOB_PUB=$(printf '%s' "$GOB_KEY" | cut -c65-128)
+# Beacon on, listen off. `Beacon: true` alone is what keeps Go from binding the
+# group port, and it is also the configuration an operator writes on the machine
+# that should advertise but not dial.
+cat >"$WORK/gob.conf" <<EOF
+{
+  "PrivateKey": "$GOB_KEY",
+  "AdminListen": "$GOB_ADMIN",
+  "Listen": [], "Peers": [], "InterfacePeers": {},
+  "MulticastInterfaces": [
+    { "Regex": "^$GOA_IFACE\$", "Beacon": true, "Listen": false, "Password": "" }
+  ],
+  "AllowedPublicKeys": [], "GroupPassword": "",
+  "IfName": "auto", "IfMTU": 65535,
+  "NodeInfoPrivacy": false, "NodeInfo": null
+}
+EOF
+
+# Our node, on the other end, beaconing on the veth too so it has a reason to open
+# its group socket. Discovery is 104 bytes (Slice 10's constant) and the beacon
+# has to clear Go's own ramp, which starts in seconds.
+cat >"$WORK/oursb.conf" <<EOF
+{
+  "PrivateKey": "$("$BIN" -genconf | grep -o '"PrivateKey": *"[0-9a-f]*"' | grep -o '[0-9a-f]\{128\}')",
+  "AdminListen": "unix://$WORK/oursb.sock",
+  "Listen": [], "Peers": [], "InterfacePeers": {},
+  "MulticastInterfaces": [
+    { "Regex": "^$GOB_IFACE\$", "Beacon": true, "Listen": true, "Password": "" }
+  ],
+  "AllowedPublicKeys": [], "GroupPassword": "",
+  "IfName": "auto", "IfMTU": 65535,
+  "NodeInfoPrivacy": false, "NodeInfo": null
+}
+EOF
+
+grep -q '"Listen": \[\]' "$WORK/gob.conf" || { echo "FAIL: the Go node has no configured peer" >&2; exit 1; }
+grep -q '"Listen": \[\]' "$WORK/oursb.conf" || { echo "FAIL: our node has no configured peer" >&2; exit 1; }
+
+ROOTS_DBG_MULTICAST=1 "$BIN" -useconffile "$WORK/oursb.conf" >"$WORK/oursb.log" 2>&1 &
+B_PID=$!
+yggdrasil -useconffile "$WORK/gob.conf" >"$WORK/gob.log" 2>&1 &
+GOB_PID=$!
+cleanup2() { kill "$B_PID" "$GOB_PID" 2>/dev/null || true; }
+
+# Go's beacon ramp starts in seconds, so give it room and stop as soon as one
+# arrives. Sixty is generous; the point is not to wait, it is not to miss it.
+beacon=""
+_waited=0
+while [ "$_waited" -lt 60 ]; do
+    # The trace line is `multicast: N bytes in on <zone> from <addr>: <hex> [...]`,
+    # and the zone is a link-local address, so it contains colons and no field can
+    # be split on them. Match only as far as the length and take the hex off the
+    # end.
+    beacon=$(grep -o 'multicast: [0-9]* bytes in on .*' "$WORK/oursb.log" | tail -1 || true)
+    [ -n "$beacon" ] && break
+    sleep 1
+    _waited=$((_waited + 1))
+done
+cleanup2
+
+if [ -z "$beacon" ]; then
+    echo "FAIL: no beacon from the Go node arrived in 60s" >&2
+    cat "$WORK/gob.log" >&2
+    cat "$WORK/oursb.log" >&2
+    exit 1
+fi
+echo "   $beacon"
+
+# The length is the first thing worth checking and the cheapest: our codec's
+# advertisement is a fixed 104 bytes (`src/multicast.rs`, and its
+# `advertisement_roundtrips_and_rejects` test), so anything else is a field count
+# or a width we have wrong, and no amount of reading the rest would help.
+beacon_len=$(echo "$beacon" | sed 's/^multicast: \([0-9]*\) bytes.*/\1/')
+if [ "$beacon_len" != "104" ]; then
+    echo "FAIL: Go's beacon is $beacon_len bytes and ours is 104" >&2
+    echo "   $beacon" >&2
+    exit 1
+fi
+echo "   104 bytes, as our codec says"
+
+# And the parts that have to agree for a beacon to be *accepted*: the key it
+# advertises is the node's own, and the magic and version are what our decoder
+# checks before anything else. `ACTED ON` versus `ignored` is the real assertion —
+# a beacon of the right length that our decoder refuses is a layout mismatch, and
+# the length alone would have passed.
+if ! grep -q 'ACTED ON' "$WORK/oursb.log"; then
+    echo "FAIL: a 104-byte beacon arrived and our decoder ignored it" >&2
+    grep 'bytes in on' "$WORK/oursb.log" | tail -3 >&2
+    exit 1
+fi
+echo "   and our decoder acted on it"
+
+# The hex is the last 104 characters of the line, because the address before it
+# is a link-local one and therefore also full of colons.
+beacon_hex=$(echo "$beacon" | grep -o '[0-9a-f]\{104\}')
+# The advertised key and the node's own key are printed **together, from this
+# run**, because each run generates a fresh key: pasting the hex from one run and
+# the pubkey from another produces a vector that fails on the key assertion for a
+# reason that has nothing to do with the codec.
+#
+# Everything below slices by *offset in bytes* through one `awk`, rather than
+# `cut`-ing a hex string by character and hoping. The layout is fixed
+# (`src/multicast.rs`): 4 bytes of version, 32 of key, 2 of port, 2 of hash
+# length, then the hash.
+gob_pub=$(grep -o 'Your public key is [0-9a-f]*' "$WORK/gob.log" | head -1 | awk '{print $NF}')
+gob_port=$(grep -o 'TLS listener started on .*' "$WORK/gob.log" | head -1 | sed 's/.*://')
+if [ -z "$gob_pub" ] || [ -z "$gob_port" ]; then
+    echo "FAIL: could not read the Go node's key and port from its log" >&2
+    cat "$WORK/gob.log" >&2
+    exit 1
+fi
+read -r beacon_key beacon_port_hex <<EOF
+$(printf '%s' "$beacon_hex" | awk '{
+    # awk substr is 1-based and this is hex, so byte n starts at char 2n-1. The
+    # layout is 4 bytes of version, 32 of key, 2 of port, 2 of hash length.
+    printf "%s %s\n", substr($0, 9, 64), substr($0, 73, 4)
+}')
+EOF
+if [ "$beacon_key" != "$gob_pub" ]; then
+    echo "FAIL: the beacon advertises $beacon_key but the node is $gob_pub" >&2
+    exit 1
+fi
+beacon_port=$(printf '%d' "0x$beacon_port_hex" 2>/dev/null || echo "")
+if [ "$beacon_port" != "$gob_port" ]; then
+    echo "FAIL: the beacon carries port '$beacon_port' but the listener bound '$gob_port'" >&2
+    exit 1
+fi
+echo "   it advertises that node's own key, and the port it actually bound ($gob_port)"
+
+echo
+echo "== paste into tests/go_vectors.rs"
+echo "GO_BEACON: $beacon_hex"
+echo "GO_BEACON_PUBKEY: $gob_pub"
+echo "GO_BEACON_PORT: $gob_port"
+echo
+echo "PASS: Go's beacon is 104 bytes and our decoder accepts it"

@@ -27,7 +27,7 @@ Rules for these pages:
 | [50-path.md](50-path.md) | `PathLookup` / `PathNotify` / `PathBroken`, `xkey` | **transcribed** from a Go generator | `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go` |
 | [60-traffic.md](60-traffic.md) | the `Traffic` frame and forwarding | **transcribed** from a Go generator | `traffic_vector_matches_go`, `a_path_is_refreshed_by_a_frame_we_cannot_read`, `a_forwarded_frame_does_not_refresh_the_forwarders_path` |
 | [70-session.md](70-session.md) | session `init` / `ack`, the type bytes, the e2c map | `init` **transcribed**; `ack` round-trip only; type bytes and e2c map from Go's source | `go_init_decrypts_with_b_key`, `session_handshake_roundtrip`, `packet_type_constants_match_go`, `e2c_pub_matches_go` |
-| [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | round-trip only, plus a non-Go KAT; **no captured beacon** | `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
+| [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | **captured** (a beacon a Go node sent) + a non-Go KAT | `a_captured_go_beacon_decodes_and_verifies`, `a_captured_go_beacon_is_rejected_only_where_go_rejects_it`, `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
 | — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured`, `validity` |
 | — | `BloomFilter` wire encoding | **captured** (which block is which) + **transcribed** (bit order within a byte) | `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
 | — | session rotation (there is no `key` message) | three tests; the nonce-wraparound branch is untested | `a_rotated_session_still_delivers_the_way_it_rotated`, `a_one_sided_rotation_carries_one_way_only`, `a_session_that_did_not_rotate_yet_keeps_its_key_sequences` |
@@ -40,10 +40,12 @@ tree payload is captured and therefore the more useful page first.
 
 ## The count, and what it means
 
-**Seven of 22 formats are guarded by bytes captured from the installed Go 0.5.14
-binary**, and every one of them is in `tests/go_vectors.rs`: the envelope, the
-two `meta` rows, and the four tree rows. That is the number this file's own rule
-supports — *a page here is a claim we are prepared to test*, and a vector is
+**Eight of 22 formats are guarded by bytes captured from the installed Go 0.5.14
+binary**: the envelope, the two `meta` rows and the four tree rows in
+`tests/go_vectors.rs`, and the multicast beacon in `src/multicast.rs`. A beacon is
+a UDP datagram rather than a link frame, so it is captured by a different harness
+and lives beside the codec that decodes it. That is the number this file's own
+rule supports — *a page here is a claim we are prepared to test*, and a vector is
 only worth pasting if it came from the binary rather than from Go's tests.
 
 The number this file used to claim, **14**, was frozen at Slice 2 and never
@@ -78,16 +80,20 @@ different font. Four things are worth naming:
 - **The bloom's bit order within a flag byte** is pinned by a generator vector,
   not by the binary. Go's first filter is empty, and an all-ones flag block
   cannot tell MSB from LSB — measured, by reversion.
-- **Multicast** has a round-trip test and a blake2b known-answer check that has
-  nothing to do with Go, and no captured beacon. `04-slices.md` promised a
-  `GO_MULTICAST_BEACON` constant; it does not exist.
+- **Multicast** now has a captured beacon — `proof/9-multicast.sh` runs a Go node
+  beaconing on a veth with our node as the only listener, and checks the length,
+  the advertised key, the bound port and that our decoder *accepts* it. A beacon
+  of the right length that the decoder refuses would be a layout mismatch, and the
+  length alone would have passed. What is still missing is the **keyed** branch:
+  every beacon we have takes the unkeyed one, so the group-password hash is
+  checked against CPython and nothing else.
 - **Address derivation** is a `V` in the frozen inventory table and a
   transcription in fact. The vectors are real Go bytes and they are worth having;
   they are just not bytes we *captured*, and an `address_test.go` line is a
   weaker oracle than a running node.
 
-So: **22 of 22 is not reached, and the honest split of the 22 is 7 captured, 6
-transcribed, 1 partial, 4 round-trip or semantics only, and 4 unguarded.**
+So: **22 of 22 is not reached, and the honest split of the 22 is 8 captured, 6
+transcribed, 1 partial, 3 round-trip or semantics only, and 4 unguarded.**
 Reaching it means captures, not typing, and each one needs the Go binary inside
 `unshare -Urn` — never CI. The admin socket is not one of the 22: it never
 crosses a link, but `21-admin.md` is written to the same rules because

@@ -510,6 +510,29 @@ fn query_escape(v: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// A beacon from the installed Go 0.5.14, captured 2026-10-03 by
+    /// `docs/plans/go-client-parity/proof/9-multicast.sh`: a Go node beaconing
+    /// on a veth with `ROOTS_DBG_MULTICAST` set on our side, so these are the
+    /// bytes a **Go node sent**, observed by our listener, on a link with no Go
+    /// compiler and no network.
+    ///
+    /// Before this the advertisement codec was only round-tripped through our own
+    /// encoder (`advertisement_roundtrips_and_rejects`), which cannot catch a
+    /// layout that is self-consistent and wrong. This is the first and only
+    /// captured Go beacon in the repository.
+    const GO_BEACON: &str = "00000005e9a8879fa21d058699d36c332644c93f6bc8bb6ae0bf547e8c24ea1ee2\
+09a6bc963f0040600c9bf1ff677296f329e644fa7bad5e64516dff7c0028d680bdc4a0750b2afc8dc422126\
+01fd9f0a91b3cfcd3a02e848643c9e1ff657278c192e75f6aa76141";
+    /// The Go node that sent it, from its own startup log **in the same run**, and
+    /// the port its listener bound. The script emits all three together and
+    /// asserts the beacon agrees with the other two, because each run generates
+    /// a fresh key: a vector assembled out of two runs fails on the key field for
+    /// a reason that has nothing to do with the codec, which is exactly what
+    /// happened the first time this was pasted.
+    const GO_BEACON_PUBKEY: &str =
+        "e9a8879fa21d058699d36c332644c93f6bc8bb6ae0bf547e8c24ea1ee209a6bc";
+    const GO_BEACON_PORT: u16 = 38463;
+
     /// A peer key of 0x00..=0x1f, the key the known-answer hashes are over.
     const PEER: [u8; KEY_LEN] = [
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
@@ -564,6 +587,95 @@ mod tests {
 
     fn expect_hash(hex_digest: &str) -> Vec<u8> {
         hex::decode(hex_digest).unwrap()
+    }
+
+    /// A beacon **Go sent**, decoded field by field.
+    ///
+    /// The vector that matters most in this module, because everything else here
+    /// is our encoder agreeing with our decoder. What each assertion buys that a
+    /// round trip does not:
+    ///
+    /// - **Version 0.5.** `major`/`minor` are the first four bytes, and a
+    ///   round trip puts back whatever it was given, so a swapped pair of widths
+    ///   would pass forever.
+    /// - **The key is the advertiser's own.** 32 bytes at offset 4, matching the
+    ///   key that node printed at startup — and a receiver *uses* this to recompute
+    ///   the membership hash, so a wrong offset here means a wrong hash input and a
+    ///   beacon that is 104 bytes and is nonetheless rejected by every peer.
+    /// - **The port is the real bound port, big-endian**, not the one asked for
+    ///   (Go fills it from `info.listener.LocalAddr()`, `multicast.go:355`). A
+    ///   round trip cannot tell a real port from the configured one.
+    /// - **The hash is 64 bytes and is the *unkeyed* blake2b-512 of the
+    ///   advertised key.** This is the one that earns the module's membership
+    ///   check: recomputing it is exactly what every receiving node does, so a
+    ///   difference between our hash and Go's would show up here as a beacon no
+    ///   peer accepts. `multicast_hash_over_peer_key` pins the hash function; this
+    ///   pins it against Go's own output.
+    #[test]
+    fn a_captured_go_beacon_decodes_and_verifies() {
+        let raw: Vec<u8> = (0..GO_BEACON.len() / 2)
+            .map(|i| u8::from_str_radix(&GO_BEACON[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        assert_eq!(raw.len(), 104, "a beacon is a fixed 104 bytes");
+
+        let adv = Advertisement::decode(&raw).expect("decode Go's beacon");
+        assert_eq!((adv.major, adv.minor), (0, 5), "Go 0.5.x");
+        assert_eq!(
+            hex::encode(adv.pubkey),
+            GO_BEACON_PUBKEY,
+            "the advertised key is the advertising node's own"
+        );
+        assert_eq!(
+            adv.port, GO_BEACON_PORT,
+            "the port is the one the listener actually bound, big-endian"
+        );
+        assert_eq!(adv.hash.len(), 64, "blake2b-512");
+
+        // The membership check, against Go's own bytes. An empty group password
+        // takes the unkeyed branch, which is what `blake2b.New512(nil)` computes
+        // (`multicast.go:213-217`) — so this is the exact value every receiving
+        // node recomputes before it will dial.
+        assert_eq!(
+            adv.hash,
+            membership_hash(b"", &adv.pubkey).to_vec(),
+            "the hash is blake2b-512 over the advertised key, unkeyed"
+        );
+
+        assert_eq!(
+            adv.encode(),
+            raw,
+            "our encoder must reproduce Go's beacon byte for byte"
+        );
+    }
+
+    /// A beacon Go sent, run through the *rejection* paths: our decoder must be
+    /// as unwilling as Go's on the same inputs, and no more.
+    ///
+    /// Go's text for all three is "invalid multicast beacon"
+    /// (`advertisement.go:28-43`), so a divergence is a node that silently
+    /// ignores a corrupt beacon where Go logs about it — or worse, accepts one.
+    #[test]
+    fn a_captured_go_beacon_is_rejected_only_where_go_rejects_it() {
+        let raw: Vec<u8> = (0..GO_BEACON.len() / 2)
+            .map(|i| u8::from_str_radix(&GO_BEACON[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        // Shorter than the 40-byte header.
+        assert!(
+            Advertisement::decode(&raw[..HEADER_LEN - 1]).is_err(),
+            "a truncated header is refused"
+        );
+        // The hash length field claims more than the buffer holds. This one has a
+        // byte pattern Go would never send, which is the point: the field is
+        // attacker-controlled and the bounds check is the whole defence.
+        let mut lying = raw.clone();
+        lying[6 + KEY_LEN] = 0xff;
+        assert!(
+            Advertisement::decode(&lying).is_err(),
+            "a hash length past the end is refused, not trusted"
+        );
+        // And the exact bytes Go sent are accepted, so the three rejections above
+        // are rejections of the *fields* and not of the beacon.
+        assert!(Advertisement::decode(&raw).is_ok());
     }
 
     #[test]

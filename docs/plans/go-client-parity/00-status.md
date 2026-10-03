@@ -62,7 +62,7 @@ should not have. Slice 13's real output is a table that labels every format with
 the provenance it actually has (`docs/protocol/README.md`), and the honest split
 of the 22 is:
 
-**7 captured · 6 transcribed · 1 partial · 4 round-trip or semantics only ·
+**8 captured · 6 transcribed · 1 partial · 3 round-trip or semantics only ·
 4 unguarded**
 
 Three findings are worth keeping:
@@ -87,11 +87,21 @@ Three findings are worth keeping:
    vector, and `examples/go_capture.rs` records why the binary cannot supply it:
    answering Go's `Announce` does not make it re-advertise a non-empty filter.
 
-Still open, and each is a *capture* rather than a typing job: session `ack` and
-`key` have no captured bytes and `key` is exercised by no test at all; multicast
-has a round-trip test and a non-Go blake2b KAT but no captured beacon
-(`04-slices.md` promised a `GO_MULTICAST_BEACON` that was never written); and 17
-of the 22 formats still have no page.
+Still open, and each is a *capture* rather than a typing job: **session `ack`**
+has no captured bytes, which means answering Go's `init` from
+`examples/go_capture.rs` — the payload is sealed to *our* key, so the harness
+holds it, but Go never opens one here; the **keyed** multicast hash branch rests
+on CPython rather than on Go, because every beacon we have — including the one
+`proof/9-multicast.sh` now captures from a Go node beaconing on a veth — takes
+the unkeyed branch; and 17 of the 22 formats still have no page.
+
+Session *rotation* is no longer on that list and never should have been written
+that way: there is no `key` message in ironwood 0.5.14, so "rotation is
+exercised by no test" was never a capture gap. It was a typing gap, and it is
+now closed — three tests in `src/session.rs`, four of four mutants killed, plus
+the finding that a one-sided rotation is a window in which only the rotated
+direction carries traffic. Go's own source carries a `// TODO test this` beside
+that arm, so the claim it makes is the claim Go can make.
 
 ## Slice 14 — what a real device found
 
