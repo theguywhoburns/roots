@@ -73,6 +73,10 @@ wire; there is no release process, and CI is three local commands.
   **rebuilding the binary first** (a stale `target/debug/roots` fakes a green
   run): `unshare -Un --map-root-user sh docs/plans/go-client-parity/proof/{7-admin,7-admin-raw,8-getpeers,9-multicast,10-tun}.sh`
   (each re-execs itself into the namespace, so `sh proof/N.sh` is enough).
+  `11-metrics.sh` is the odd one out: it **measures** rather than asserting —
+  it samples both ends of one link for `METRICS_SECONDS` (default 180) and
+  prints a series, because the `latency`/`cost` question needs time rather than
+  a pass or a fail.
   `yggdrasilctl` selects the socket with `-endpoint` (no `-admin_socket`; with
   none set it talks to the host's service node). `10-tun.sh` is the only one that
   needs `CAP_NET_ADMIN` *and* two namespaces, so it builds a veth pair and moves

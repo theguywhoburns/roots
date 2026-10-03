@@ -69,23 +69,49 @@ Do: add a preimage parameter threaded from `Config::group_password` through
 `--group` capture **with our side also set**, which currently cannot form a
 session and is the test that would have to turn green.
 
-## Why our `latency` and `cost` run far above a Go peer's
+## Our `latency` sits about one node tick above Go's — cause not isolated
 
-Slice 8 filled both fields from Go's formulas and a single pair of samples
-disagreed by ~100×: on one loopback link our node reported
-`cost: 106` / `latency: 53070000` ns while the Go node on the other end of
-the *same* link reported `cost: 160` / `latency: 520000`.
+**Measured 2026-10-03** by `proof/11-metrics.sh`, which holds one loopback link
+up and samples both ends every 5 s. Four runs, three of which agree:
 
-Neither number is a measured RTT, which is why no single sample proves
-either side wrong: `cost` is a lag EWMA seeded at `rtt*2` and eased 7/8
-toward the stored timestamps (ironwood `network/router.go:221-228`,
-`:431-441`) and `latency` is `srrt - srst` over timestamps that age
-between queries (`src/core/debug.go:84-86`). What is still open is the
-*magnitude* — the EWMA seed, the 50 ms node tick, and the lazy keepalive
-that arms `srrt` are the three candidates.
+| run | ours `latency` | Go `latency` | ratio |
+|-----|---------------:|-------------:|------:|
+| 25 s | 50 880 000 ns | 600 000 ns | 84× |
+| 25 s | 53 570 000 ns | 450 000 ns | 119× |
+| 30 s | 53 670 000 ns | 410 000 ns | 130× |
+| 180 s | 12 310 000 ns | 91 950 000 ns | **0.13×** |
 
-Do: run two of ours and two Go nodes against the same fixture for a few
-minutes and watch the two numbers converge or not (`proof/8-getpeers.sh`
-phase A already prints both sides; it just needs repeating over time).
-Record the answer in `docs/protocol/21-admin.md`, which currently states
-the numbers and the open question.
+Three findings, and the first two are about the question rather than the
+numbers:
+
+**1. Neither number moves.** Frozen for the whole 180 s window. `latency` is
+`srrt - srst`, and both are armed only by a **non-keepalive** receive (ironwood
+`network/peers.go:161-175`); the only traffic on this link is our two-byte
+keepalive. So both values are the seeds from establishing the link. **There is
+nothing to converge**, which is why a single sample could never have settled
+this.
+
+**2. The seeds move a lot between runs, and the sign of the disagreement
+flips.** The 180 s run has *Go* 7× higher. So "ours runs ~100× above" is one
+sample of a distribution, not a property of either implementation.
+
+**3. When it does not flip, ours is 50–54 ms and Go's is 0.4–0.6 ms** on the
+same link — and 50 ms is exactly `DEFAULT_TICK` (`client/src/node.rs:23`).
+
+What is *not* established: that the tick is the cause. The arithmetic is right —
+`src/tree.rs`'s own test asserts the value is "the gap since the send, not a
+fixed number", in a 19–60 ms band after a 20 ms sleep — so the 50 ms is real
+elapsed time between our `write_all` returning and our read of the `SigRes`.
+Both ends of that interval are already correct individually: `write_frame` does
+`write_all` + `flush` before `sent_at` is stamped, and `handle_response` stamps
+`srrt` inline in the read path. So the candidate is *scheduling* — the serve
+slice parking somewhere between the two — and the way to settle it is to run the
+same fixture at a different `Node::with_tick` and see whether the number follows.
+
+Do: `Node::from_client` already takes a tick (`client/src/node.rs:227`), and the
+CLI hardcodes `DEFAULT_TICK` (`client/src/main.rs:112`), so a `--tick` flag or a
+config key is all that is needed to make this a two-run experiment instead of a
+hypothesis. If the reported latency tracks the tick, it is the tick.
+
+Record the answer in `docs/protocol/21-admin.md`, which currently states the
+numbers and the open question.

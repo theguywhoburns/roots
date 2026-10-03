@@ -440,16 +440,28 @@ configured. Four field-level facts survive the diff:
 - `uptime` is a float both ways; Go happens to print `7.069074106` with a
   fraction, and writes a whole number without one (`"uptime": 4`), which
   `serde_json` never does.
-- `cost` and `latency` are the two fields no single sample proves anything
-  about. Both come from the router's own `SigReq` timing: `cost` is the lag EWMA
-  in whole milliseconds (`_getCost`, `router.go:221-228`), seeded at `rtt * 2`
-  by the first reply and then eased `7/8` towards each new one
-  (`router.go:431-441`), and `latency` is the gap between two *stored*
-  timestamps (`debug.go:84-86`), so it keeps ageing between requests. Go read
-  160 and 0.52 ms, we read 106 and 53 ms, on a loopback where the socket
-  round trip is a fraction of a millisecond. The formulas are the same and the
-  magnitudes are the same order; why our sample sits two orders above Go's is a
-  driver-timing question, recorded on the slice list rather than answered here.
+- `cost` and `latency` are the two fields **no sample proves anything about** —
+  and that is now measured rather than suspected. `proof/11-metrics.sh` holds one
+  loopback link up and samples both ends every 5 s, and the result is that
+  **neither number ever moves**: `latency` is `srrt - srst` and both timestamps
+  are armed only by a *non-keepalive* receive (`network/peers.go:161-175`), while
+  the only traffic on that link is our two-byte keepalive. Both values are seeds
+  from establishing the link.
+
+  Worse for a single sample, the seeds move between runs and **the sign of the
+  disagreement flips**: in three of four runs we read 50–54 ms against Go's
+  0.4–0.6 ms (84×–130×, the magnitude Slice 8 recorded), and in one 180 s run Go
+  read 91.95 ms against our 12.31 ms. So "ours runs two orders above Go's" was a
+  property of one sample.
+
+  The formulas are the same — `cost` is the lag EWMA in whole milliseconds
+  (`_getCost`, `router.go:221-228`), seeded at `rtt * 2` and eased `7/8` per
+  reply (`router.go:431-441`), and `latency` is the gap between two *stored*
+  timestamps (`debug.go:84-86`) — and `src/tree.rs`'s own test pins the value as
+  "the gap since the send, not a fixed number". So the ~50 ms is real elapsed
+  time between our `write_all` returning and our read of the `SigRes`, and 50 ms
+  is exactly `DEFAULT_TICK`. **That the tick is the cause is not established**;
+  see `TODO.md`, which says how to settle it in two runs.
 
 `getSelf` for the same pair, to show the six fields in order:
 
