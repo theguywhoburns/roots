@@ -30,7 +30,7 @@ Rules for these pages:
 | [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | round-trip only, plus a non-Go KAT; **no captured beacon** | `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
 | — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured`, `validity` |
 | — | `BloomFilter` wire encoding | **captured** (which block is which) + **transcribed** (bit order within a byte) | `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
-| — | session rotation (there is no `key` message) | **nothing** | — |
+| — | session rotation (there is no `key` message) | three tests; the nonce-wraparound branch is untested | `a_rotated_session_still_delivers_the_way_it_rotated`, `a_one_sided_rotation_carries_one_way_only`, `a_session_that_did_not_rotate_yet_keeps_its_key_sequences` |
 | — | `typeSessionProto` nodeinfo / debug | semantics only | `nodeinfo_size_cap_matches_go`, `debug_round_trips` |
 
 Numbering follows the plan's list (`02-architecture.md`, "Documentation
@@ -63,7 +63,9 @@ different font. Four things are worth naming:
   wraparound sends **nothing**: the keys are swapped locally and the peer learns
   of it from the next traffic frame's first uvarint, which is why that header
   carries two key sequences (`session.go:303-311`). So "session `key`" is
-  rotation *state*, not a message, and `Session::maybe_rotate` has no test.
+  rotation *state*, not a message. Rotation now has three tests (four mutants
+  killed); the nonce-wraparound branch of `encrypt`, which is Go's *other*
+  rotation trigger, does not.
 - **Session `ack` has no captured bytes.** A session rides *inside* a `Traffic`
   frame — there is no session frame type, because the pathfinder is below the
   session layer, so the traffic frame's payload *is* the session message — so

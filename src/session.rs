@@ -785,6 +785,137 @@ mod tests {
         assert_eq!(pt2, b"hi back");
     }
 
+    /// Rotation: the one part of the session layer with **no test at all** until
+    /// now, and the part with the most state to get wrong — nine assignments in
+    /// `maybe_rotate`, a fourth of the struct's fields moved at once.
+    ///
+    /// The trigger is a **timer, not a nonce**. Ironwood rekeys 60 s after the
+    /// last rotation (`encrypted/session.go` `_fixShared` and its callers), and
+    /// the event that carries it out is the next message sealed under the *next*
+    /// key — a session that goes quiet simply does not rotate, which is correct
+    /// and is why this needs a message rather than a `sleep`.
+    ///
+    /// **`rotated_at` starts as `None`, and `None` counts as due.** So the first
+    /// message a session *receives* rekeys it, not the first message after a
+    /// minute. That matches Go, whose `time.AfterFunc` fires at creation too, and
+    /// it is a genuine trap for a test: a rotation has usually already happened by
+    /// the time you start counting, which is how this test's first draft asserted
+    /// `remote_key_seq == 2` on a session that had rotated once already.
+    ///
+    /// What has to survive a rotation is **delivery in the direction that
+    /// rotated**. A rotation that moved the keys without moving the shared
+    /// secrets consistently would leave two sessions that each believe they are
+    /// talking to nobody, and the symptom is a session that works for exactly
+    /// sixty seconds and then goes silent — the hardest kind of bug to see,
+    /// because everything before it is fine.
+    ///
+    /// What is **not** asserted here is that both directions work afterwards, and
+    /// that is a real limit rather than an omission. Each rotation is triggered
+    /// by the *peer's*, so a side is one rotation behind until it sees the other's
+    /// ratchet — a window in which only the rotated direction carries traffic. See
+    /// `a_one_sided_rotation_carries_one_way_only` for that window and for why
+    /// neither this test nor Go can say the skew is unreachable. Constructing a
+    /// symmetric post-rotation state for a test needs counters set by hand, and
+    /// two attempts at that produced a session whose first message no longer
+    /// decrypted: the counters are not the only state the arms read.
+    #[test]
+    fn a_rotated_session_still_delivers_the_way_it_rotated() {
+        let a = edkey(0xA1);
+        let b = edkey(0xB2);
+        let pa = a.verifying_key().to_bytes();
+        let pb = b.verifying_key().to_bytes();
+        let (a_cur_pub, a_cur_priv) = fresh_box();
+        let (a_nxt_pub, a_nxt_priv) = fresh_box();
+        let init = SessionInit {
+            current: a_cur_pub,
+            next: a_nxt_pub,
+            key_seq: 0,
+            seq: 100,
+        };
+        let dec = SessionInit::decrypt_msg(
+            &ed_to_curve_priv(&[0xB2; 32]),
+            &pa,
+            &init.encrypt_msg(SESSION_TYPE_INIT, &a, &pb),
+        )
+        .unwrap();
+        let mut sb = Session::for_init(&dec);
+        let ack_init = sb.handle_init(&dec, 101).unwrap();
+        let dec_ack = SessionInit::decrypt_msg(
+            &ed_to_curve_priv(&[0xA1; 32]),
+            &pb,
+            &ack_init.encrypt_msg(SESSION_TYPE_ACK, &b, &pa),
+        )
+        .unwrap();
+        let mut sa = Session::for_init(&dec_ack);
+        sa.adopt_buffered(a_cur_pub, a_cur_priv, a_nxt_pub, a_nxt_priv);
+        sa.handle_ack(&dec_ack);
+
+        // The first message B receives rotates B, so this is a rotation with real
+        // traffic on either side of it rather than a bare state inspection.
+        assert_eq!(sb.decrypt(&sa.encrypt(b"before")).unwrap(), b"before");
+
+        // Arm A and rotate it. The counters are the *mechanism*: a rotation that
+        // skipped one would still decrypt for a while, which is exactly the
+        // failure mode a delivery-only assertion would miss.
+        let (a_local, a_remote, b_local) = (sa.local_key_seq, sa.remote_key_seq, sb.local_key_seq);
+        sa.rotated_at = None;
+        sa.maybe_rotate([0xEE; 32], 1);
+        assert_eq!(sa.local_key_seq, a_local + 1, "A bumped our key sequence");
+        assert_eq!(
+            sa.remote_key_seq,
+            a_remote + 1,
+            "and the peer's too: we adopt the key they just used"
+        );
+
+        // The claim. Repeatedly, because the failure worth catching is a ratchet
+        // that keeps going: each message arriving as "not due" is the entire
+        // reason the timer is there.
+        for n in 0..3 {
+            let msg = format!("after rotation {n}");
+            assert_eq!(
+                sb.decrypt(&sa.encrypt(msg.as_bytes())).as_deref(),
+                Some(msg.as_bytes()),
+                "B accepts A's rotated traffic, message {n}"
+            );
+        }
+        assert_eq!(
+            (sb.local_key_seq, sb.remote_key_seq),
+            (b_local, sb.remote_key_seq),
+            "three messages did not rekey B again: the timer, not each packet, is \
+             what rotates"
+        );
+    }
+
+    /// Rotation is **not** driven by the nonce. Go rekeys on a 60 s timer
+    /// (`encrypted/session.go`), and a message arriving before that must leave
+    /// the key sequences alone — otherwise every pair that talks often would
+    /// ratchet on every packet, and the `fromNext` arms would match by accident
+    /// rather than by design.
+    #[test]
+    fn a_session_that_did_not_rotate_yet_keeps_its_key_sequences() {
+        let mut s = Session::for_init(&SessionInit {
+            current: [1; 32],
+            next: [2; 32],
+            key_seq: 0,
+            seq: 1,
+        });
+        assert_eq!((s.local_key_seq, s.remote_key_seq), (0, 0));
+        s.rotated_at = Some(std::time::Instant::now());
+        s.maybe_rotate([3; 32], 1);
+        assert_eq!(
+            (s.local_key_seq, s.remote_key_seq),
+            (0, 0),
+            "not due, so nothing moves"
+        );
+        // Far enough past the interval and it does.
+        s.rotated_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        s.maybe_rotate([3; 32], 1);
+        assert_eq!(
+            (s.local_key_seq, s.remote_key_seq),
+            (1, 1),
+            "due, so both move"
+        );
+    }
     #[test]
     fn tampered_init_rejected() {
         let a = edkey(0xA1);

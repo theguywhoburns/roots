@@ -121,6 +121,35 @@ Four shared secrets are precomputed per session, not two — `recv`, `send`,
 `next`-as-send, `next`-as-receive (`_fixShared`, `:241-248`; ours `shared4`,
 `:172-189`) — because the receiver cannot know which way the peer ratcheted.
 
+### The skew window, and why `rotated` starts empty
+
+Two details decide *when* a rotation happens, and both are easy to get backwards.
+
+**The trigger is the 60-second timer, not the nonce.** `maybe_rotate` is reached
+only from `decrypt`, and only from its two `fromNext` arms — so a session that
+goes quiet never rotates at all, and one that talks constantly rotates about once
+a minute rather than once per message. That is the whole reason the nonce is a
+`u64` and rotation is not nonce-wraparound-driven.
+
+**`rotated_at` starts as `None`, and `None` counts as due.** So the *first* traffic
+frame a session receives rekeys it, not the first frame after a minute. Go's
+`time.AfterFunc` fires at creation too, so this matches, and it is the detail that
+makes a test's arithmetic surprising: by the time you look, a rotation has usually
+already happened.
+(`a_rotated_session_still_delivers_the_way_it_rotated`.)
+
+**The skew window.** Because each rotation is triggered by the *peer's*, a side is
+one rotation behind until it sees the other's ratchet, and in that window only the
+rotated direction carries traffic: a frame from a peer whose `localKeySeq` is one
+ahead on *both* counters satisfies neither `toRecv` (`lks + 1 == localKeySeq`) nor
+`toSend` (`lks == localKeySeq`), so it is dropped. Our code reproduces Go's
+arithmetic exactly — `maybe_rotate` field for field against `:383-397`. Whether Go
+can actually reach that state is a question about Go, and Go's own source carries a
+`//panic("DEBUG") // TODO test this` beside that arm, which is the author saying
+they did not know either. `a_one_sided_rotation_carries_one_way_only` pins the
+behaviour with the citation inline, and it is the only thing this repository can
+say about a window it cannot show is unreachable.
+
 ## `traffic` — 52 bytes minimum
 
 | offset | length | field |
@@ -223,7 +252,8 @@ Sessions and buffers both expire after one minute (`session.go:20`, `:250-261`; 
 | the ed25519→X25519 map | **Go source**, `e2c.go:21-55`, pinned by constants from a Go generator rather than by bytes: `e2c_pub_matches_go` (`:723-726`), `e2c_priv_is_sha512_seed_prefix` (`:729-736`). `E2C_PUBA`/`E2C_PUBB`/`E2C_PRIVB` (`:709-711`) are transcribed |
 | the in-band type bytes 1 and 2 | **Go source**, `src/core/types.go:4-8`, asserted by `packet_type_constants_match_go` (`src/proto.rs:405-409`) and `packet_type_constants_match_go_core_types` (`src/session.rs:812-820`), the latter also asserting that 1 and 2 are *not* the session's own `3`. No bytes behind them |
 | **`ack`** | **round-trip only.** `session_handshake_roundtrip` (`src/session.rs:751-786`) builds an ack, decodes it and runs traffic both ways. No captured bytes, and nothing pins an ack's `keySeq` to Go's post-increment value |
-| **rotation, and the `key` field's only carrier** | **no test at all.** `Session::maybe_rotate` (`src/session.rs:678-699`) is never reached: no test drives a nonce wraparound, a `remoteKeySeq + 1` traffic frame, or a repair init. `keySeq` is asserted exactly once, as the literal 3 in the transcribed init |
+| **rotation** | **three tests, four mutants killed.** `a_rotated_session_still_delivers_the_way_it_rotated` (delivery survives, counters move, repeated messages do not rekey), `a_one_sided_rotation_carries_one_way_only` (the skew window, with Go's arms cited), `a_session_that_did_not_rotate_yet_keeps_its_key_sequences` (the timer gate). All three drive `maybe_rotate` through `decrypt`, so none of them constructs a rotation by calling it out of band and then asserting the result |
+| **nonce wraparound (`doSend`'s swap)** | **no test.** `src/session.rs`'s `encrypt` wraparound branch is unreachable in a test without driving `send_nonce` to `u64::MAX`, and Go's does the same thing in `doSend`. `keySeq` is otherwise asserted exactly once, as the literal 3 in the transcribed init |
 | the traffic layout and the field-order trap | Go source (`:314-318` against `:343-344`). No traffic frame has been captured from Go; `tests/mesh3.rs` and `tests/resolve_queue.rs` exercise ours end to end and would pass with the three uvarints in any order both ends agreed on |
 | the decrypt-failure repair and the unknown-peer throwaway init | Go source (`:425-429`, `:443-448`, `:127-140`). Both are a silence plus a message we would have to answer with Go to observe; `tests/mesh3.rs` drops a link, which is the link layer, not this |
 | the single-slot pre-session buffer | Go source (`:154-178`, last write wins at `:167`). `tests/resolve_queue.rs` covers the queued-and-flushed path on our side; Go's overwrite-the-payload behaviour has no test on either side |
