@@ -121,6 +121,36 @@ impl SessionInit {
     }
 
     /// Decrypt with our box private key; verifies the ed signature from `from`.
+    /// The sealed plaintext, **without** verifying Go's signature over it.
+    ///
+    /// This exists to answer one question that `decrypt_msg` cannot: when a
+    /// peer's session message is refused, *which* check refused it? The two have
+    /// nothing to do with each other —
+    ///
+    /// * the box is keyed by `DH(e2c(recipient), fromPub)` and by nothing else,
+    ///   so a failure here means the message is not addressed to us, or the
+    ///   ephemeral key or the nonce handling is wrong;
+    /// * the signature covers a preimage that **may** include the group-password
+    ///   hash, so a failure there with the box open is exactly the
+    ///   `GroupPassword` case, and the one that produces total silence.
+    ///
+    /// An interop bug with no log line and no counter is the hardest kind to
+    /// chase, and "the box opened" versus "the box did not open" is the
+    /// difference between two investigations and one.
+    ///
+    /// **The returned bytes are not trusted input.** The signature is not checked,
+    /// so nothing here has been authenticated; use it only to inspect. It is
+    /// `pub` because the caller that needs it is a diagnostic harness outside this
+    /// crate, not because anything should be built on it.
+    pub fn unsealed_plaintext(our_box_priv: &[u8; 32], data: &[u8]) -> Option<Vec<u8>> {
+        if data.len() != SESSION_INIT_SIZE {
+            return None;
+        }
+        let eph_pub: [u8; 32] = data[1..33].try_into().ok()?;
+        let shared = salsa_box(&eph_pub, our_box_priv);
+        box_open(&shared, 0, &data[33..])
+    }
+
     pub fn decrypt_msg(
         our_box_priv: &[u8; 32],
         from_ed: &[u8; KEY_LEN],
@@ -798,6 +828,74 @@ mod tests {
     const GO_SESSION_NEXT: &str =
         "35b03ead4395bdcb67dec583b6810d72678649c72c5b4acbbdaa1d909e002e2c";
     const GO_SESSION_SEQ: u64 = 1791046450;
+
+    /// The diagnostic that says *which* half of the open failed.
+    ///
+    /// `decrypt_msg` returns one `None` for "not for us", "wrong ephemeral key",
+    /// "not an init", "wrong length", "signature does not verify" and "a
+    /// `GroupPassword` is set" — six causes, one answer, and the last is the
+    /// expensive one to find because it is completely silent on both ends.
+    ///
+    /// So `unsealed_plaintext` exists to split the box from the signature, and
+    /// this pins both halves: on Go's captured bytes it returns **exactly the
+    /// 144 plaintext bytes** the layout implies, while `decrypt_msg` succeeds
+    /// too — and if the signature were computed over something we do not have,
+    /// the plaintext would still open, which is the whole reason the split is
+    /// possible.
+    ///
+    /// The negative half matters as much: a box opened with the **wrong** key must
+    /// fail, so this cannot degenerate into "returns something for any input".
+    #[test]
+    fn the_unsealed_plaintext_says_the_box_opened_even_when_the_signature_will_not() {
+        let raw = hex::decode(GO_SESSION_INIT).expect("hex");
+        let our_box_priv = ed_to_curve_priv(&[0x2b; 32]);
+
+        let pt = SessionInit::unsealed_plaintext(&our_box_priv, &raw)
+            .expect("the box opens: it is keyed by DH alone");
+        assert_eq!(
+            pt.len(),
+            64 + 32 + 32 + 8 + 8,
+            "144 bytes, which is what the field widths imply and nothing else"
+        );
+        // The signature is the first 64 bytes of that plaintext and it is Go's,
+        // so a reader can tell what was refused.
+        assert_ne!(&pt[..64], &[0u8; 64][..], "a real signature, not padding");
+
+        // And `decrypt_msg` on the same bytes does succeed, so the two halves are
+        // complementary rather than one shadowing the other.
+        assert!(
+            SessionInit::decrypt_msg(&our_box_priv, &key(GO_SESSION_PUB), &raw).is_some(),
+            "with no group password the signature verifies too"
+        );
+
+        // The negative: the box is keyed, so a wrong key fails at the box, which
+        // is what distinguishes "not addressed to us" from "signature refused".
+        assert!(
+            SessionInit::unsealed_plaintext(&ed_to_curve_priv(&[0xFF; 32]), &raw).is_none(),
+            "the wrong box key must not open it"
+        );
+        // And a wrong length is refused before any crypto, so a truncated
+        // message cannot be reported as a signature problem.
+        assert!(SessionInit::unsealed_plaintext(&our_box_priv, &raw[..100]).is_none());
+        // Nor can a message whose length is right but whose type byte is neither
+        // `init` nor `ack` be diagnosed by *silently* succeeding:
+        // `unsealed_plaintext` deliberately does not check the type, because the
+        // caller wants the plaintext precisely in order to find out. Say so, so
+        // the choice is not mistaken for an oversight.
+        //
+        // The byte has to be one `decrypt_msg` rejects: `2` would not do, since
+        // that is `ack` and the framing is otherwise identical.
+        let mut not_a_session = raw.clone();
+        not_a_session[0] = 3;
+        assert!(
+            SessionInit::unsealed_plaintext(&our_box_priv, &not_a_session).is_some(),
+            "deliberately type-agnostic: the caller is diagnosing, not trusting"
+        );
+        assert!(
+            SessionInit::decrypt_msg(&our_box_priv, &key(GO_SESSION_PUB), &not_a_session).is_none(),
+            "while `decrypt_msg` still refuses it, because it is the trusting path"
+        );
+    }
 
     /// Go's own `init`, opened with our box key, field by field.
     ///

@@ -70,15 +70,23 @@ const OUR_SEED: [u8; 32] = [0x2b; 32];
 /// Non-empty password takes the keyed branch of the membership hash; empty
 /// takes the unkeyed one. Both signatures must match Go's.
 const PASSWORD: &str = "roots-capture";
+/// Group password for the `--group` mode, which exists to **measure** the claim in
+/// `client/src/config.rs` and `TODO.md` rather than keep asserting it. Go folds
+/// `sha256("ironwood/encrypted\\x00" ‖ password)` into the session signature
+/// preimage (`encrypted/crypto.go:149-157`), so a node with `GroupPassword` set
+/// should refuse to verify our `init` — silently, with frames arriving and the
+/// counter moving. If `--group` opens a session anyway, the claim is wrong and
+/// the docs need fixing.
+const GROUP_PASSWORD: &str = "roots-group";
 
-fn go_config(priv_hex: &str, port: u16, password: &str) -> String {
+fn go_config(priv_hex: &str, port: u16, password: &str, group: &str) -> String {
     let listen = if password.is_empty() {
         format!("tcp://127.0.0.1:{port}")
     } else {
         format!("tcp://127.0.0.1:{port}?password={password}")
     };
     format!(
-        r#"{{"PrivateKey":"{priv_hex}","Listen":["{listen}"],"Peers":[],"InterfacePeers":{{}},"AllowedPublicKeys":[],"MulticastInterfaces":[],"AdminListen":"tcp://127.0.0.1:{ADMIN_PORT}","IfName":"auto","IfMTU":65535,"NodeInfoPrivacy":false,"NodeInfo":{{"name":"gocap","software":"go0.5.14","build":"capture","protocol":7,"link":"tcp://127.0.0.1:1"}}}}"#
+        r#"{{"PrivateKey":"{priv_hex}","Listen":["{listen}"],"Peers":[],"InterfacePeers":{{}},"AllowedPublicKeys":[],"GroupPassword":"{group}","MulticastInterfaces":[],"AdminListen":"tcp://127.0.0.1:{ADMIN_PORT}","IfName":"auto","IfMTU":65535,"NodeInfoPrivacy":false,"NodeInfo":{{"name":"gocap","software":"go0.5.14","build":"capture","protocol":7,"link":"tcp://127.0.0.1:1"}}}}"#
     )
 }
 
@@ -295,11 +303,11 @@ async fn read_frame_raw<S: AsyncRead + Unpin>(
     Some((raw, ftype, payload))
 }
 
-async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
+async fn capture(password: &str, port: u16, frames: bool, group: &str) -> Vec<u8> {
     let sk = SigningKey::from_bytes(&SEED);
     let pk = sk.verifying_key().to_bytes();
     let priv_hex = hex::encode([SEED.as_slice(), pk.as_slice()].concat());
-    let _node = spawn_go(&go_config(&priv_hex, port, password));
+    let _node = spawn_go(&go_config(&priv_hex, port, password, group));
     let mut stream = dial(port).await;
 
     let theirs = read_meta(&mut stream).await;
@@ -742,7 +750,35 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
                                 init.key_seq,
                                 init.seq
                             ),
-                            None => println!("(could not open Go's session message)"),
+                            None => {
+                                // Say *which* check failed, because the two have
+                                // completely different causes and only one of them
+                                // is the group password.
+                                //
+                                // The box is keyed by `DH(e2c(recipient), fromPub)`
+                                // and nothing else, so a password cannot affect it.
+                                // If the plaintext opens and the signature does not
+                                // verify, the preimage is in the signature — which
+                                // is the claim under test. If the box itself fails,
+                                // the message is not addressed to us, or the
+                                // ephemeral key or the nonce handling is wrong, and
+                                // the group password is a red herring.
+                                match roots::session::SessionInit::unsealed_plaintext(
+                                    &our_box_priv,
+                                    &tr.payload,
+                                ) {
+                                    Some(pt) => println!(
+                                        "(signature refused, but the box OPENED: {} \
+                                         plaintext bytes — so this is the preimage, \
+                                         not the key exchange)",
+                                        pt.len()
+                                    ),
+                                    None => println!(
+                                        "(the box did not open either: not addressed \
+                                         to us, or the ephemeral key is wrong)"
+                                    ),
+                                }
+                            }
                         }
                     }
                     Err(e) => println!("(traffic decode failed: {e})"),
@@ -780,12 +816,37 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
 #[tokio::main]
 async fn main() {
     let frames = std::env::args().skip(1).any(|a| a == "--frames");
+    let group = std::env::args().any(|a| a == "--group");
     assert_private_netns();
     ensure_loopback();
-    let unkeyed = capture("", PORTS[0], false).await;
-    let keyed = capture(PASSWORD, PORTS[1], frames).await;
+    let unkeyed = capture("", PORTS[0], false, "").await;
+    let keyed = capture(PASSWORD, PORTS[1], frames, "").await;
     assert_ne!(unkeyed, keyed, "the password must change the signature");
     println!("=== paste into tests/go_vectors.rs ===");
     println!("GO_META_UNKEYED: {}", hex::encode(&unkeyed));
     println!("GO_META_KEYED:   {}", hex::encode(&keyed));
+
+    if group {
+        // Measure the `GroupPassword` claim rather than assert it.
+        //
+        // `client/src/config.rs` and `TODO.md` both say a node with
+        // `GroupPassword` set will not verify our `init`, because Go folds
+        // `sha256("ironwood/encrypted\0" ‖ password)` into the session
+        // signature preimage (`encrypted/crypto.go:149-157`, used at
+        // `encrypted/session.go:502` and `:550`). That was read off the source,
+        // and a source reading is exactly the kind of claim this repository has
+        // been wrong about before — twice, in this very harness.
+        //
+        // So: the same capture, with only the group password added to Go's side.
+        // Everything else is identical, so a session that forms here would mean
+        // the preimage is *not* in the signature and the docs are wrong.
+        println!("\n=== group password: Go has GroupPassword, we do not ===");
+        println!(
+            "the claim under test: no session forms, silently.\n\
+             our side sends no preimage either way, so the only variable is Go's\n\
+             configuration.\n"
+        );
+        capture(PASSWORD, PORTS[1], true, GROUP_PASSWORD).await;
+        println!("(look for GO_SESSION above: absent means the claim holds)");
+    }
 }

@@ -314,11 +314,23 @@ impl Config {
     /// `init` and `ack` signatures cover (`encrypted/session.go:502` signing,
     /// `:550` checking).
     ///
-    /// So the consequence is concrete and silent: a node with `GroupPassword` set
-    /// will not verify our `init` or our `ack`, so no session is ever established,
-    /// so no payload ever crosses — and nothing says why. `SessionInit::encrypt_msg`
-    /// and `decrypt_msg` have no preimage parameter to pass it through, so this
-    /// needs a library change as well as a config one. Recorded in `TODO.md`.
+    /// So the consequence is concrete and silent, and **measured** (2026-10-03, the
+    /// `--group` mode of `examples/go_capture.rs`):
+    ///
+    /// - The **box is unaffected** — it is keyed by `DH(e2c(recipient), fromPub)`
+    ///   and nothing else, so the message still opens to 144 plaintext bytes.
+    /// - The **signature is refused**. So we cannot verify *theirs*.
+    /// - Symmetrically Go cannot verify ours, so no session forms in either
+    ///   direction, and nothing says why on either side.
+    ///
+    /// Note the direction, because the first version of this comment had it
+    /// backwards: it read as though only the peer's verification failed, so a
+    /// diagnostic checking whether the peer accepts our bytes would have found
+    /// nothing wrong. **Ours fails first.**
+    ///
+    /// `SessionInit::encrypt_msg` and `decrypt_msg` have no preimage parameter to
+    /// pass it through, so this needs a library change as well as a config one.
+    /// Recorded in `TODO.md`.
     pub fn link_options(&self) -> Result<LinkOptions, ConfigError> {
         let mut allowed_keys = Vec::with_capacity(self.allowed_public_keys.len());
         for entry in &self.allowed_public_keys {

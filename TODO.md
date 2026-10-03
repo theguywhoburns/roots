@@ -35,25 +35,39 @@ internet route for public peers.
 
 ## `GroupPassword` is accepted and ignored, so it silently breaks sessions
 
-A config key we parse, print in `-genconf`, and do nothing with. Go folds
-`sha256("ironwood/encrypted\x00" ‖ password)` (`encrypted/crypto.go:149-157`)
-into the **session signature preimage** — `encrypted/session.go:502` signs with
-it, `:550` checks with it. A node with `GroupPassword` set therefore **will not
-verify our `init` or our `ack`**, so no session is ever established and no payload
-ever crosses. There is no error and nothing in the log: the frames arrive, the
-signatures simply do not match.
+A config key we parse, print in `-genconf`, and do nothing with.
 
-`SessionInit::encrypt_msg` / `decrypt_msg` (`src/session.rs:97`, `:124`) take no
-preimage parameter, so this needs a library change before it needs a config one.
-An earlier comment in `client/src/config.rs` described the intent ("filters
-traffic by group membership, not links") rather than the mechanism; that is fixed,
-and it is worth writing down how easy it is to describe a mechanism you have not
-read.
+**Measured 2026-10-03** with `unshare -Urn cargo run -q --example go_capture --
+--frames --group`: the same capture twice, changing only Go's `GroupPassword`.
+The mechanism is confirmed and the *direction* was wrong in the first version of
+this note.
+
+Go folds `sha256("ironwood/encrypted\x00" ‖ password)`
+(`encrypted/crypto.go:149-157`) into the **session signature preimage** —
+`encrypted/session.go:502` signs with it, `:550` checks with it. So:
+
+- **The box is unaffected.** It is keyed by `DH(e2c(recipient), fromPub)` and
+  nothing else, so the message opens to **144 plaintext bytes** — exactly what
+  the field widths imply. Measured, with
+  `SessionInit::unsealed_plaintext`.
+- **The signature is what fails.** So a node with `GroupPassword` set *can* open
+  a link, *does* send a session `init`, and we **cannot verify it**.
+- Symmetrically, Go cannot verify our `init`, so no session ever forms in either
+  direction, and **nothing is logged on either side** — the frames arrive and the
+  counter moves.
+
+The correction matters because the earlier note said the failure lands on Go's
+side ("a node with `GroupPassword` set will not verify our `init`"). It lands on
+**ours first**, and a diagnostic that only looks at whether the peer accepts our
+bytes would find nothing wrong.
+
+`SessionInit::encrypt_msg` / `decrypt_msg` (`src/session.rs`) take no preimage
+parameter, so this needs a library change before it needs a config one.
 
 Do: add a preimage parameter threaded from `Config::group_password` through
-`session_send_kind` into `encrypt_msg`/`decrypt_msg`, then prove it against a Go
-node with a password set — a `proof/` script that starts one Go node with
-`GroupPassword` and one of ours with the same, since the failure mode is silence.
+`session_send_kind` into `encrypt_msg`/`decrypt_msg`, then prove it with the
+`--group` capture **with our side also set**, which currently cannot form a
+session and is the test that would have to turn green.
 
 ## Why our `latency` and `cost` run far above a Go peer's
 
