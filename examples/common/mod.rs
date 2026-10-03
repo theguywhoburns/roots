@@ -224,3 +224,83 @@ pub fn icmp6_echo_reply(request: &[u8]) -> Option<Vec<u8>> {
     reply[6] = 58;
     Some(reply)
 }
+
+// ------------------------------------------------------- link plumbing ----
+//
+// Seven copies of "dial, wrap, register, make a one-link set" and six of
+// "serve until the tree has a parent". Both were rewritten by hand at least once
+// and drifted: the converge budgets are 30 s in some examples and 60 s in
+// others, one loop is spelled "convergence timed out" and another "mesh
+// convergence timed out", and `mesh_tcp.rs` does not call `serve` at all — it
+// has its own `drive`.
+//
+// These are example code on purpose. A `converge()` on `Router` would be node
+// policy in the library, which is the one thing the library must not have.
+
+/// Dial one peer and bring it up as a single-link set.
+pub async fn join_one(
+    key: &ed25519_dalek::SigningKey,
+    opts: &roots::LinkOptions,
+    uri: &str,
+) -> Result<(roots::Router, roots::LinkSet, roots::LinkId), roots::Error> {
+    join(roots::link::dial(uri, key, opts).await?, key).await
+}
+
+/// Register a finished handshake and put it in a one-link set.
+///
+/// Split from [`join_one`] because `proto_probe.rs` dials through every
+/// transport in turn and already holds a `PeerConn<T>` by the time it gets
+/// here; making it dial again would have thrown away the point of that example.
+///
+/// `register` runs before the connection joins the set, exactly as a caller that
+/// registers once per link must — the bloom and the signature request go out
+/// through the connection itself.
+///
+/// The `LinkId` comes back too because `Router::resolve` takes one: it is a
+/// liveness handle, and a caller that held the connection but not its id would
+/// have to fish it out of the set afterwards.
+pub async fn join<T: roots::Transport>(
+    conn: roots::PeerConn<T>,
+    key: &ed25519_dalek::SigningKey,
+) -> Result<(roots::Router, roots::LinkSet, roots::LinkId), roots::Error> {
+    let peer = conn.remote_key;
+    let mut conn = roots::link::AnyConn::new(conn);
+    let id = conn.id;
+    let mut router = roots::Router::new(key.clone());
+    router.register(&mut conn, peer, id).await?;
+    // One set for the whole run: per-link send clocks must survive slices, or
+    // lazy keepalives stop firing and the peer reads the link out at ~4 s.
+    Ok((router, roots::LinkSet::single(conn), id))
+}
+
+/// Serve slices until the router has a parent, or `budget` runs out.
+///
+/// Returns whether it converged, so the caller decides the message: a demo wants
+/// a panic and a probe wants a line. The outbox is this function's own — nothing
+/// application-level is being sent while the tree settles.
+///
+/// A dropped link is a non-convergence, not a hang: the loop would otherwise
+/// spin out its whole budget against a dead socket, which is the shape of a demo
+/// that appears to wait a minute for a network that is not there.
+pub async fn converge(
+    router: &mut roots::Router,
+    links: &mut roots::LinkSet,
+    budget: std::time::Duration,
+) -> bool {
+    let end = std::time::Instant::now() + budget;
+    let mut no_out: Vec<([u8; 32], Vec<u8>)> = Vec::new();
+    while router.parent().is_none() && std::time::Instant::now() < end {
+        if router
+            .serve(
+                links,
+                Some(std::time::Duration::from_millis(250)),
+                &mut no_out,
+            )
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    router.parent().is_some()
+}

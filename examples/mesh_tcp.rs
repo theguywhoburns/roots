@@ -45,42 +45,21 @@ async fn main() {
 
     // Both nodes converge first (sequential dials avoid burst limits).
     let ca = Client::new(a_sk);
-    let a_conn = ca.connect(&peer_uri).await.expect("A dial");
-    let a_peer = a_conn.remote_key;
-    let mut a_conn = roots::link::AnyConn::new(a_conn);
-    let a_id = a_conn.id;
-    let mut ra = Router::new(ca.key);
-    ra.register(&mut a_conn, a_peer, a_id)
+    let (mut ra, mut a_links, _a_id) = common::join_one(&ca.key, &ca.opts, &peer_uri)
         .await
-        .expect("A register");
-    let mut a_links = roots::LinkSet::single(a_conn);
-    let mut no_out = Vec::new();
-    let end = Instant::now() + Duration::from_secs(60);
-    while ra.parent().is_none() && Instant::now() < end {
-        if !drive(&mut ra, &mut a_links, &mut no_out).await {
-            eprintln!("A link dropped");
-            std::process::exit(1);
-        }
-    }
-    assert!(ra.parent().is_some(), "A converge timeout");
+        .expect("A dial");
+    assert!(
+        common::converge(&mut ra, &mut a_links, Duration::from_secs(60)).await,
+        "A converge timeout"
+    );
     let cb = Client::new(b_sk);
-    let b_conn = cb.connect(&peer_uri).await.expect("B dial");
-    let b_peer = b_conn.remote_key;
-    let mut b_conn = roots::link::AnyConn::new(b_conn);
-    let b_id = b_conn.id;
-    let mut rb = Router::new(cb.key);
-    rb.register(&mut b_conn, b_peer, b_id)
+    let (mut rb, mut b_links, _b_id) = common::join_one(&cb.key, &cb.opts, &peer_uri)
         .await
-        .expect("B register");
-    let mut b_links = roots::LinkSet::single(b_conn);
-    let end = Instant::now() + Duration::from_secs(60);
-    while rb.parent().is_none() && Instant::now() < end {
-        if !drive(&mut rb, &mut b_links, &mut no_out).await {
-            eprintln!("B link dropped");
-            std::process::exit(1);
-        }
-    }
-    assert!(rb.parent().is_some(), "B converge timeout");
+        .expect("B dial");
+    assert!(
+        common::converge(&mut rb, &mut b_links, Duration::from_secs(60)).await,
+        "B converge timeout"
+    );
     println!("both converged");
 
     // Stacks: A client -> B server port 80.

@@ -4,11 +4,12 @@
 //!
 //! Run: `cargo run -q --example listen_ping -- tcp://bode.theender.net:42069`
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 
-use roots::{Client, Router};
+mod common;
+use roots::Client;
 
 #[tokio::main]
 async fn main() {
@@ -18,26 +19,15 @@ async fn main() {
     let mut rng = rand::thread_rng();
     let client = Client::new(SigningKey::generate(&mut rng));
     println!("local  addr {}", client.address());
-    let conn = client.connect(&uri).await.expect("dial");
-    let peer_key = conn.remote_key;
-    let mut conn = roots::link::AnyConn::new(conn);
-    let id = conn.id;
-    let mut router = Router::new(client.key);
-    router
-        .register(&mut conn, peer_key, id)
+    let (mut router, mut links, _link) = common::join_one(&client.key, &client.opts, &uri)
         .await
-        .expect("register");
-    // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(conn);
-    let mut no_out = Vec::new();
-    let end = Instant::now() + Duration::from_secs(30);
-    while router.parent().is_none() && Instant::now() < end {
-        router
-            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
-            .await
-            .expect("link up");
-    }
+        .expect("dial");
+    assert!(
+        common::converge(&mut router, &mut links, Duration::from_secs(30)).await,
+        "convergence timed out"
+    );
     println!("converged, listening (Ctrl-C to stop)");
+    let mut no_out = Vec::new();
     loop {
         if let Err(e) = router
             .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)

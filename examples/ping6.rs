@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 
-use roots::{Client, Router};
+use roots::Client;
 
 mod common;
 
@@ -29,27 +29,13 @@ async fn main() {
     let peer_uri = std::env::args()
         .nth(2)
         .unwrap_or_else(|| "tcp://bode.theender.net:42069".to_string());
-    let conn = client.connect(&peer_uri).await.expect("dial public peer");
-    let peer_key = conn.remote_key;
-    let mut router = Router::new(client.key);
-    let mut conn = roots::link::AnyConn::new(conn);
-    let link = conn.id;
-    router
-        .register(&mut conn, peer_key, link)
+    let (mut router, mut links, link) = common::join_one(&client.key, &client.opts, &peer_uri)
         .await
-        .expect("register");
-    // One set for the whole run: per-link send clocks must survive slices.
-    let mut links = roots::LinkSet::single(conn);
-    let mut no_out = Vec::new();
-
-    let end = Instant::now() + Duration::from_secs(60);
-    while router.parent().is_none() && Instant::now() < end {
-        router
-            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
-            .await
-            .expect("link up");
-    }
-    assert!(router.parent().is_some(), "convergence timed out");
+        .expect("dial public peer");
+    assert!(
+        common::converge(&mut router, &mut links, Duration::from_secs(60)).await,
+        "convergence timed out"
+    );
 
     let key = router
         .resolve(&mut links, link, &target_addr, Duration::from_secs(60))

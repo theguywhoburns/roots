@@ -11,6 +11,8 @@
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
+
+mod common;
 use roots::{Client, Router, proto::*};
 
 #[tokio::main]
@@ -62,15 +64,10 @@ async fn run_probe<T: roots::Transport>(client: Client, conn: roots::PeerConn<T>
         .expect("register");
     // One set for the whole run (per-link send clocks must survive slices).
     let mut links = roots::LinkSet::single(conn);
-    let mut no_out = Vec::new();
-    let end = Instant::now() + Duration::from_secs(30);
-    while router.parent().is_none() && Instant::now() < end {
-        router
-            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
-            .await
-            .expect("link up");
-    }
-    assert!(router.parent().is_some(), "mesh convergence timed out");
+    assert!(
+        common::converge(&mut router, &mut links, Duration::from_secs(30)).await,
+        "mesh convergence timed out"
+    );
     println!("converged");
 
     router

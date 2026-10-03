@@ -15,7 +15,7 @@ use smoltcp::iface::SocketSet;
 use smoltcp::socket::tcp;
 use smoltcp::wire::{IpAddress, IpEndpoint};
 
-use roots::{Client, Router};
+use roots::Client;
 
 #[tokio::main]
 async fn main() {
@@ -36,29 +36,13 @@ async fn main() {
     let client = Client::new(SigningKey::generate(&mut rng));
     println!("local  addr {}", client.address());
     let our_ip = Ipv6Addr::from(client.address().0);
-    let conn = client.connect(&peer).await.expect("dial public peer");
-    let peer_key = conn.remote_key;
-    let mut router = Router::new(client.key);
-    let mut conn = roots::link::AnyConn::new(conn);
-    let link = conn.id;
-    router
-        .register(&mut conn, peer_key, link)
+    let (mut router, mut links, link) = common::join_one(&client.key, &client.opts, &peer)
         .await
-        .expect("register");
-    // One set for the whole run: per-link send clocks must survive
-    // slices, or lazy keepalives never fire and the peer times us out.
-    let mut links = roots::LinkSet::single(conn);
-    let mut no_out = Vec::new();
-
-    // Converge: short serve slices until we have a parent.
-    let end = Instant::now() + Duration::from_secs(60);
-    while router.parent().is_none() && Instant::now() < end {
-        router
-            .serve(&mut links, Some(Duration::from_millis(250)), &mut no_out)
-            .await
-            .expect("link up");
-    }
-    assert!(router.parent().is_some(), "mesh convergence timed out");
+        .expect("dial public peer");
+    assert!(
+        common::converge(&mut router, &mut links, Duration::from_secs(60)).await,
+        "mesh convergence timed out"
+    );
     println!("converged, resolving {target} ...");
 
     // Address -> full node key over the DHT.
