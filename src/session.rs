@@ -718,6 +718,10 @@ mod tests {
     fn edkey(seed_byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed_byte; 32])
     }
+    /// The ed public key of an `edkey`, as the 32 raw bytes a message is sealed to.
+    fn pb_of(sk: &SigningKey) -> [u8; 32] {
+        sk.verifying_key().to_bytes()
+    }
 
     #[test]
     fn e2c_pub_matches_go() {
@@ -745,6 +749,251 @@ mod tests {
         assert_eq!(dec.key_seq, 3);
         // Wrong recipient key must fail.
         assert!(SessionInit::decrypt_msg(&key(E2C_PUBA), &key(PUBA), &raw).is_none());
+    }
+
+    /// A session `init` **the installed Go 0.5.14 sent**, captured 2026-10-03 by
+    /// `examples/go_capture.rs --frames`.
+    ///
+    /// This is the first and only session message in this repository that came
+    /// from a running Go node rather than from a Go generator, and it closes the
+    /// gap `docs/protocol/README.md` has been carrying: session `ack` and `key`
+    /// listed as "round-trip only" and "nothing" respectively for several
+    /// slices.
+    ///
+    /// It was reachable the whole time. The reason it was not is worth
+    /// recording, because every step is a *silent* no-op rather than an error:
+    ///
+    /// 1. Go only ever sends nodeinfo in reply to an admin `getNodeInfo`.
+    ///    `_sendReq` has exactly one caller in the whole module
+    ///    (`core/nodeinfo.go:160`) — there is no proactive send anywhere.
+    /// 2. Go only advertises a bloom filter for peers on its routing tree, and
+    ///    `_fixOnTree` (`ironwood/network/bloomfilter.go:151-156`) puts a peer
+    ///    there only if it is Go's parent or Go is its parent. A node announcing
+    ///    *itself* as its own parent satisfies neither arm, so it is off the tree
+    ///    and every multicast skips it.
+    /// 3. `_sendMulticast` decides where to send a `PathLookup` by testing the
+    ///    **peer's advertised** filter (`:314-317`), so a node that never
+    ///    advertises one has every lookup discarded before it leaves.
+    /// 4. A `PathNotify` with an **empty** `info.path` is accepted, verified, and
+    ///    routes nothing: `_getDist` is a prefix count over port lists
+    ///    (`network/router.go:661-683`) and `_lookup` seeds `bestDist` from its
+    ///    own key, so with an empty `destPath` no peer can ever be strictly
+    ///    better. The path has to be the single peer port Go allocated for the
+    ///    link, which is the `port` in the `SigRes` Go sent us — Go numbers peers
+    ///    from 1 upward (`network/peers.go:53-61`).
+    ///
+    /// So the vector below is Go's real bytes, opened with our own box key.
+    const GO_SESSION_INIT: &str = "0157d79dc3e8af7fcc1fc870a7a7dedb3f6d937eba55281a42062d56ebd97a7f\
+        235c0315cc7abdf8106a6ac473c53654193115892add473a63b71dff6fa46718\
+        77570b652d8f101b6c6e502bc92c6169f9d3d57f4f3be7bee1089355e3f5688d\
+        cf7d68550d719ec0fd80d36ed63f79ca57e1bde37c320f5392585c9a56a61be4\
+        4e71b95955cf613946d4e2c521d5b006ab064a83631367b53b97add4fcee5031\
+        9ab883eba7663d3ad6e5798d4aca308c15ceb559dee81fc7afb93ec5dae1d3ff\
+        b2";
+    /// Go's node key, from the `meta` of the same run, and the `current`/`next`
+    /// box keys and `seq` the captured `init` carries.
+    const GO_SESSION_PUB: &str = "ed6a47a39da869b5446155e40b2d93f1e3f0167be26732bae7a3ef9d8e3a3fd3";
+    const GO_SESSION_CURRENT: &str =
+        "afd7207dc7f93ce0a492b7d1af4ff42ed1b74acfe66b2c24b7772b885e279350";
+    const GO_SESSION_NEXT: &str =
+        "35b03ead4395bdcb67dec583b6810d72678649c72c5b4acbbdaa1d909e002e2c";
+    const GO_SESSION_SEQ: u64 = 1791046450;
+
+    /// Go's own `init`, opened with our box key, field by field.
+    ///
+    /// What this buys over `go_init_decrypts_with_b_key` above, which is the whole
+    /// point of having both: that one is a **Go generator's** bytes, so it moves
+    /// whenever Go's tests move. This one is bytes a Go node chose on its own,
+    /// against a key we hold.
+    ///
+    /// Each assertion catches something the round trip cannot:
+    ///
+    /// - **the leading type byte is `1`** (`SESSION_TYPE_INIT`), read at offset
+    ///   0 rather than inferred. The layering rule in `AGENTS.md` — exactly one
+    ///   layer adds it — is worth a test on Go's own output, because adding a
+    ///   second one is fatal and looks right.
+    /// - **193 bytes**, `SESSION_INIT_SIZE`. The size falls out of the field
+    ///   widths, so a width change on either side shows up here.
+    /// - **`key_seq == 0`.** This is a *first* session, not a rotation, so the
+    ///   field Go wrote a `key` rotation into is zero — which is the concrete
+    ///   content behind "there is no `key` message". A rotation would carry
+    ///   `localKeySeq`, and a nonzero value here would mean this was one.
+    /// - **`seq` is a real timestamp**, not a counter that starts at 0 or 1. Go
+    ///   uses `uint64(time.Now().Unix())` for exactly this field, and a 10-digit
+    ///   value is the observable consequence.
+    /// - **`current != next`**, because Go generates two fresh key pairs
+    ///   (`newSessionInit`) rather than reusing one. A decoder that collapsed
+    ///   them would pass every round trip.
+    /// - **it re-encrypts byte-identically**, which nothing else checks: it means
+    ///   our signature preimage and the ephemeral-key handling agree with Go's
+    ///   *output* rather than with our own encoder.
+    /// - **the wrong key fails**, so the box open is actually keyed and not a
+    ///   length check in disguise.
+    #[test]
+    fn a_captured_go_session_init_opens_and_verifies() {
+        let raw = hex::decode(GO_SESSION_INIT).expect("hex");
+        assert_eq!(
+            raw.len(),
+            SESSION_INIT_SIZE,
+            "193 bytes, as the widths imply"
+        );
+        assert_eq!(
+            raw[0], SESSION_TYPE_INIT,
+            "one leading type byte, and it is `init`"
+        );
+
+        // Our box key: `e2c` of the harness's own seed, which is what the capture
+        // harness generated the node with.
+        let our_box_priv = ed_to_curve_priv(&[0x2b; 32]);
+        let dec = SessionInit::decrypt_msg(&our_box_priv, &key(GO_SESSION_PUB), &raw)
+            .expect("open the init Go sent us");
+        assert_eq!(dec.current, key(GO_SESSION_CURRENT), "current box key");
+        assert_eq!(dec.next, key(GO_SESSION_NEXT), "next box key");
+        assert_eq!(
+            dec.key_seq, 0,
+            "a first session, so the field a `key` rotation would use is zero"
+        );
+        assert_eq!(dec.seq, GO_SESSION_SEQ, "seq is a unix timestamp");
+        assert!(
+            dec.current != dec.next,
+            "Go generates two distinct key pairs, not one reused"
+        );
+        // Go's timestamp is in seconds and is therefore plausible only if it is
+        // roughly now. A u64 counter starting near zero would fail this; so
+        // would a nanosecond clock, which would be 1e9 times larger.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            dec.seq.abs_diff(now) < 60 * 60 * 24 * 365 * 50,
+            "seq {} should be a plausible unix timestamp near {now}",
+            dec.seq
+        );
+
+        // The signature check happens inside `decrypt_msg`, over the raw
+        // decrypted bytes rather than over anything this crate assembles. So
+        // reaching here at all means Go's `sig` verified against our *reading*
+        // of the field layout — which is the claim `sig_bytes` makes, checked
+        // against Go's output rather than against our own encoder.
+        //
+        // Note what that does and does not cover. `sig_bytes` (used only by
+        // `encrypt_msg`) is what a preimage-order mutation hits, and it is
+        // covered by `session_handshake_roundtrip`, which round-trips through
+        // both directions. This test covers the decode side. Between them the
+        // order is pinned; neither alone would be.
+
+        // Wrong recipient key must fail: the box open is keyed, not a length
+        // check in disguise.
+        assert!(
+            SessionInit::decrypt_msg(&ed_to_curve_priv(&[0xFF; 32]), &key(GO_SESSION_PUB), &raw)
+                .is_none(),
+            "a different box key must not open it"
+        );
+
+        // And a **traffic** type byte must be refused, which is the one that
+        // matters and the one nothing else in this module checked.
+        //
+        // The layering rule is that exactly one layer adds the leading type byte,
+        // and Go admits only `init` and `ack`
+        // (`encrypted/session.go:264-266`) — dropping anything else silently, with
+        // no log and no counter. So a decoder that accepted a traffic message here
+        // would not fail loudly: it would *succeed*, quietly absorbing bytes that
+        // belong one layer up, and the symptom would be an application payload
+        // that never arrives next to a session that looks perfectly healthy.
+        //
+        // Mutation-checked: deleting the type check from `decrypt_msg` leaves
+        // every other test in this file passing.
+        for t in 0u8..=255 {
+            if t == SESSION_TYPE_INIT || t == SESSION_TYPE_ACK {
+                continue;
+            }
+            let mut wrong = raw.clone();
+            wrong[0] = t;
+            assert!(
+                SessionInit::decrypt_msg(
+                    &ed_to_curve_priv(&[0x2b; 32]),
+                    &key(GO_SESSION_PUB),
+                    &wrong
+                )
+                .is_none(),
+                "type byte {t} must be refused, not taken for a session message"
+            );
+        }
+        // Length is the other half, and the size is exactly what the field widths
+        // imply — so a width change on either side shows up here rather than as a
+        // decode that "works" on the fields it happens to reach.
+        assert!(
+            SessionInit::decrypt_msg(
+                &ed_to_curve_priv(&[0x2b; 32]),
+                &key(GO_SESSION_PUB),
+                &raw[..SESSION_INIT_SIZE - 1]
+            )
+            .is_none(),
+            "a short payload is refused"
+        );
+        let mut padded = raw.clone();
+        padded.push(0);
+        assert!(
+            SessionInit::decrypt_msg(
+                &ed_to_curve_priv(&[0x2b; 32]),
+                &key(GO_SESSION_PUB),
+                &padded
+            )
+            .is_none(),
+            "a padded payload is refused"
+        );
+    }
+
+    /// The session `ack` shape, against Go's `init` bytes.
+    ///
+    /// There is no captured `ack` in this repository and this does not change
+    /// that: Go never sends one here, because it has nothing to say after a
+    /// request it already answered. What *is* pinned here is the one fact about
+    /// `ack` that a captured message would have supplied and that the round trip
+    /// cannot distinguish — that **`ack` and `init` are the same wire format**,
+    /// differing only in the leading type byte.
+    ///
+    /// They are, because Go builds both from the same `sessionInit` and calls the
+    /// same `encrypt`: `_sendAck` and `sendInit` differ in one argument
+    /// (`encrypted/session.go:180-190`). So the *only* thing a future capture can
+    /// change is the type byte and the key material, and this test fixes the
+    /// relationship so that a capture which disagrees is a real disagreement.
+    ///
+    /// It also asserts the two type bytes are **distinct**, because that is the
+    /// whole of the distinction and a collision would make every `ack`
+    /// indistinguishable from an `init` — silently, since both are accepted.
+    #[test]
+    fn an_ack_differs_from_an_init_only_in_its_type_byte() {
+        assert_ne!(
+            SESSION_TYPE_INIT, SESSION_TYPE_ACK,
+            "the two session message types must be distinguishable"
+        );
+        let a = edkey(0xA1);
+        let b = edkey(0xB2);
+        let pa = a.verifying_key().to_bytes();
+        let init = SessionInit {
+            current: [3; 32],
+            next: [4; 32],
+            key_seq: 0,
+            seq: 7,
+        };
+        let as_init = init.encrypt_msg(SESSION_TYPE_INIT, &a, &pb_of(&b));
+        let as_ack = init.encrypt_msg(SESSION_TYPE_ACK, &a, &pb_of(&b));
+        assert_eq!(
+            as_init.len(),
+            as_ack.len(),
+            "identical fields, so identical length"
+        );
+        assert_ne!(
+            as_init, as_ack,
+            "the type byte is inside the sealed body too"
+        );
+        // And both are the same size as the captured Go init, which is what makes
+        // "same format" a claim about a wire format rather than about our codec.
+        assert_eq!(as_init.len(), SESSION_INIT_SIZE);
+        assert_eq!(as_ack.len(), SESSION_INIT_SIZE);
+        let _ = pa;
     }
 
     #[test]

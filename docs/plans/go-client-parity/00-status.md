@@ -62,7 +62,7 @@ should not have. Slice 13's real output is a table that labels every format with
 the provenance it actually has (`docs/protocol/README.md`), and the honest split
 of the 22 is:
 
-**9 captured · 6 transcribed · 3 round-trip or semantics only ·
+**10 captured · 5 transcribed · 3 round-trip or semantics only ·
 4 unguarded**
 
 Three findings are worth keeping:
@@ -104,12 +104,14 @@ Three findings are worth keeping:
    filter" was true of the *harness*, not of Go.
 
 Still open, and each is a *capture* rather than a typing job: **session `ack`**
-has no captured bytes, which means answering Go's `init` from
-`examples/go_capture.rs` — the payload is sealed to *our* key, so the harness
-holds it, but Go never opens one here; the **keyed** multicast hash branch rests
-on CPython rather than on Go, because every beacon we have — including the one
-`proof/9-multicast.sh` now captures from a Go node beaconing on a veth — takes
-the unkeyed branch; and 17 of the 22 formats still have no page.
+has no captured bytes, and now for a real reason — Go sends nodeinfo only in
+reply to an admin `getNodeInfo` (`core/nodeinfo.go:160` is the only caller of
+`_sendReq`), and by the time it has been asked it has nothing left to say. What
+is pinned instead is that `ack` and `init` are the same wire format differing
+only in the type byte. The **keyed** multicast hash branch rests on CPython
+rather than on Go, because every beacon we have — including the one
+`proof/9-multicast.sh` captures from a Go node beaconing on a veth — takes the
+unkeyed branch. And 17 of the 22 formats still have no page.
 
 Session *rotation* is no longer on that list and never should have been written
 that way: there is no `key` message in ironwood 0.5.14, so "rotation is
@@ -118,6 +120,34 @@ now closed — three tests in `src/session.rs`, four of four mutants killed, plu
 the finding that a one-sided rotation is a window in which only the rotated
 direction carries traffic. Go's own source carries a `// TODO test this` beside
 that arm, so the claim it makes is the claim Go can make.
+
+### The capture gap that was a harness defect
+
+The session `init` capture is the second time a documented gap turned out to be
+our harness rather than the protocol, and both times the harness failed
+*silently* — which is why the gap survived being written down.
+
+The four that mattered, none of which raised an error:
+
+1. The Go node **died at startup**, at `Admin socket failed to listen` —
+   `-genconf` omits `AdminListen`, Go substitutes an unwritable default, and
+   treats the failure as fatal. So no Go node in this harness had ever run a
+   pathfinder; every capture before was of the handshake, which happens first.
+2. The link was **killed by our own silence** after about four seconds, and the
+   resulting `early eof` was printed as "no session was opened".
+3. A node announcing **itself as its own parent** is off Go's tree, so Go never
+   advertises a filter for it and never multicasts it a `PathLookup`.
+4. A `PathNotify` with an **empty path** is accepted, verified, and routes
+   nothing, because `_getDist` is a prefix count over port lists and an empty
+   one can never be beaten.
+
+The first two are fixed and committed on their own. The second two are what the
+non-empty bloom and the session `init` rest on.
+
+The generalisable part: a session that never forms, a filter that never fills,
+and a link that closes at four seconds all print as "no bytes". Only running a
+real node — with the bug in *our* code, on *our* side of the wire — tells them
+apart, and that is the argument for `proof/` scripts existing at all.
 
 ## Slice 14 — what a real device found
 

@@ -50,6 +50,32 @@ the init seals to the recipient's `e2c` key and signs with the sender's ed key
 
 ## `init` and `ack` — 193 bytes
 
+Captured 2026-10-03, from a Go node, on a live link. The table below is the
+capture read off, and the constants are in `src/session.rs` next to the test
+that pins them.
+
+```text
+01                                    init
+edb70e0d…8fa3  (fromPub, ephemeral)
+…  box.Seal(nonce 0) …                opened with DH(e2c(ours), fromPriv)
+
+opened:  keySeq = 0                    a first session, so the field a
+        seq   = 1791045914              rotation would write is zero
+        current ≠ next                 Go generates two fresh pairs
+```
+
+**Go retransmits it, and the retransmit is not byte-identical.** Two inits
+arrived in the same capture with identical `current`, `next`, `keySeq` and `seq`
+and **different `fromPub`** — a fresh ephemeral box keypair per message, which is
+what Go's `newSessionInit`/`newBoxKeys` do. So a duplicate init is
+distinguishable only by its `seq`, and the receiver's rule is `if init.seq <=
+info.seq { return }` (`encrypted/session.go:263-266`), which is what we mirror in
+`Session::handle_init`. That is worth stating explicitly because the alternative
+— comparing the bytes — would treat a legitimate retransmission as new and reset
+the peer's key state. It also means a capture of "the same" init twice gives two
+different 193-byte strings, so the vector is pinned by *field* values plus the
+hex, not by "re-running gives the same bytes".
+
 The *seal* column is the offset inside the 144-byte plaintext; the seal's extra 16
 bytes are the box overhead.
 
@@ -223,6 +249,80 @@ the peer is real it acks and the exchange self-heals (`src/session.rs:347-360`).
 Sessions and buffers both expire after one minute (`session.go:20`, `:250-261`; ours
 `SESSION_TIMEOUT`, swept in `src/driver.rs:353-355`).
 
+## Getting Go to send one at all
+
+A session rides **inside** a `Traffic` frame — there is no session frame type,
+because the pathfinder sits below the session layer and the traffic frame's
+payload *is* the session message. So no session bytes means no `Traffic` frame,
+and "make Go send one" is four separate problems, each of which fails silently.
+
+Every one of these was in the way for several slices, and each was recorded as a
+property of the protocol rather than of the harness. They are worth listing
+together because the pattern is the lesson: **a session that never forms looks
+exactly like a codec that is wrong.**
+
+1. **Go sends nodeinfo only in reply to an admin `getNodeInfo`.**
+   `nodeinfo._sendReq` has exactly one caller in the whole module — the
+   `getNodeInfo` admin handler (`core/nodeinfo.go:160`) — and it does a single
+   `WriteTo` whose error is discarded (`:113`). There is no proactive send
+   anywhere. A node with nodeinfo configured will still say nothing, for ever,
+   unless something asks.
+
+2. **Go advertises a bloom filter only for peers on its routing tree**, and
+   `_fixOnTree` (`network/bloomfilter.go:145-174`) is narrower than it reads:
+
+   ```go
+   if selfInfo.parent == pk { pbi.onTree = true }
+   else if info, isIn := bs.router.infos[pk]; isIn {
+       if info.parent == selfKey { pbi.onTree = true }
+   }
+   ```
+
+   A node announcing **itself as its own parent** — the shape a node with no
+   upstream uses — satisfies neither arm. It is not Go's parent, and its parent
+   is not Go. So it sits off the tree and every multicast skips it.
+
+3. **`_sendMulticast` routes by the *peer's advertised* filter**
+   (`:314-317`), so a node that never advertises one has every `PathLookup`
+   discarded before it leaves. "Nothing" is a legitimate answer to "what do you
+   care about?", and it is indistinguishable from never having implemented the
+   question.
+
+4. **A `PathNotify` with an empty `info.path` is accepted, verified, and routes
+   nothing.** `_getDist` (`network/router.go:661-683`) is a **prefix count over
+   port lists**, not an XOR distance:
+
+   ```go
+   dist := uint64(len(keyPath) + len(destPath))
+   for idx := 0; idx < end; idx++ {
+       if keyPath[idx] == destPath[idx] { dist -= 2 } else { break }
+   }
+   ```
+
+   and `_lookup` seeds `bestDist` from its own key, so with `destPath = []` that
+   is `0` and **no peer can ever be strictly better**. An empty path is
+   unroutable by construction. The value that works is the single peer port Go
+   allocated for the link — which is the `port` in the `SigRes` Go already sent,
+   because Go numbers peers from 1 upward (`network/peers.go:53-61`). It is not
+   a guess and it is not our TCP port; it is Go's own numbering, read back out
+   of Go's signature.
+
+Two more that are not about the session at all, and cost just as much:
+
+- **The Go node was dying at startup.** `-genconf -json` omits `AdminListen`
+  (`omitempty`), so Go substituted `unix:///var/run/yggdrasil/yggdrasil.sock`,
+  which is unwritable in a user namespace — and Go treats that as fatal, exiting
+  before the TUN and before the pathfinder. An empty `AdminListen` does not help;
+  Go substitutes the default for an empty value too. Every capture taken before
+  this was of the handshake, which happens first.
+- **The link was being killed by our own silence.** Go gives every link read a
+  deadline (`core/link.go:274-291`) and closes on expiry — about four seconds.
+  The harness sent `SigReq` and `Announce` and then only listened, and printed
+  the resulting `early eof` as "no session was opened".
+
+`examples/go_capture.rs --frames` now runs a live Go node end to end and prints
+the hex, the opened fields, and the constant ready to paste.
+
 ## Deviations from Go
 
 - **No group password.** Go folds `groupAuth.preimage()` — SHA-256 of
@@ -246,12 +346,13 @@ Sessions and buffers both expire after one minute (`session.go:20`, `:250-261`; 
 
 | what | from |
 |------|------|
-| the four session types, the 193-byte init, the 52-byte traffic floor, the four shared secrets, the `_handleUpdate` key dance | Go source read line by line against `encrypted/session.go` and `crypto.go`. **Nothing on this page has been seen from the Go binary**, and nothing about the session layer appears in `tests/go_vectors.rs` |
-| the `GO_INIT` vector, 193 bytes, `keySeq = 3` | **transcribed** from a local Go generator (`TestZZVectors`, whose harness is gone), *not* captured from the installed Go 0.5.14 binary. `go_init_decrypts_with_b_key` (`src/session.rs:739-748`) opens it with the right key, asserts `key_seq == 3`, and requires failure under the wrong one |
-| the preimage `fromPub ‖ current ‖ next ‖ keySeq ‖ seq` | Go source (`:490-502`, `:547-550`); the vector verifies only in that order, and `tampered_init_rejected` (`:789-809`, one flipped bit at offset 40) is the check |
-| the ed25519→X25519 map | **Go source**, `e2c.go:21-55`, pinned by constants from a Go generator rather than by bytes: `e2c_pub_matches_go` (`:723-726`), `e2c_priv_is_sha512_seed_prefix` (`:729-736`). `E2C_PUBA`/`E2C_PUBB`/`E2C_PRIVB` (`:709-711`) are transcribed |
-| the in-band type bytes 1 and 2 | **Go source**, `src/core/types.go:4-8`, asserted by `packet_type_constants_match_go` (`src/proto.rs:405-409`) and `packet_type_constants_match_go_core_types` (`src/session.rs:812-820`), the latter also asserting that 1 and 2 are *not* the session's own `3`. No bytes behind them |
-| **`ack`** | **round-trip only.** `session_handshake_roundtrip` (`src/session.rs:751-786`) builds an ack, decodes it and runs traffic both ways. No captured bytes, and nothing pins an ack's `keySeq` to Go's post-increment value |
+| the four session types, the 52-byte traffic floor, the four shared secrets, the `_handleUpdate` key dance | Go source read line by line against `encrypted/session.go` and `crypto.go` |
+| **the 193-byte `init` Go sent** | **captured** 2026-10-03 by `examples/go_capture.rs --frames` — a Go node's own `init`, opened with our box key. `a_captured_go_session_init_opens_and_verifies` (`src/session.rs`) |
+| the `GO_INIT` vector, 193 bytes, `keySeq = 3` | **transcribed** from a local Go generator (`TestZZVectors`, whose harness is gone), *not* captured from the installed Go 0.5.14 binary. `go_init_decrypts_with_b_key` opens it with the right key, asserts `key_seq == 3`, and requires failure under the wrong one. Kept because it is the only vector with a **non-zero** `keySeq`, and a captured one has `keySeq = 0` — where little-endian and big-endian encodings are the same eight bytes, so a width mistake there is invisible to the captured vector |
+| the preimage `fromPub ‖ current ‖ next ‖ keySeq ‖ seq` | Go source (`:490-502`, `:547-550`); both vectors verify only in that order, and `tampered_init_rejected` (one flipped bit at offset 40) is the check |
+| the ed25519→X25519 map | **Go source**, `e2c.go:21-55`, pinned by constants from a Go generator rather than by bytes: `e2c_pub_matches_go`, `e2c_priv_is_sha512_seed_prefix`. `E2C_PUBA`/`E2C_PUBB`/`E2C_PRIVB` are transcribed |
+| the in-band type bytes 1 and 2 | **Go source**, `src/core/types.go:4-8`, asserted by `packet_type_constants_match_go` and `packet_type_constants_match_go_core_types`, the latter also asserting that 1 and 2 are *not* the session's own `3`. **Now also behind real bytes:** the captured `init` starts with `01`, and `a_captured_go_session_init_opens_and_verifies` walks all 256 type bytes and requires every one except 1 and 2 to be refused — mutation-checked, and the type check is the one that was previously undefended |
+| **`ack`** | **no captured bytes, and Go never sends one here** — it has nothing to say after a request it already answered. What *is* pinned is the one fact a capture would have supplied and a round trip cannot: `ack` and `init` are the **same wire format**, differing only in the leading type byte, because Go builds both from the same `sessionInit` through the same `encrypt` (`encrypted/session.go:180-190`). `an_ack_differs_from_an_init_only_in_its_type_byte` fixes that, and asserts the two bytes are distinct — a collision would make every `ack` indistinguishable from an `init`, silently, since both are accepted |
 | **rotation** | **three tests, four mutants killed.** `a_rotated_session_still_delivers_the_way_it_rotated` (delivery survives, counters move, repeated messages do not rekey), `a_one_sided_rotation_carries_one_way_only` (the skew window, with Go's arms cited), `a_session_that_did_not_rotate_yet_keeps_its_key_sequences` (the timer gate). All three drive `maybe_rotate` through `decrypt`, so none of them constructs a rotation by calling it out of band and then asserting the result |
 | **nonce wraparound (`doSend`'s swap)** | **no test.** `src/session.rs`'s `encrypt` wraparound branch is unreachable in a test without driving `send_nonce` to `u64::MAX`, and Go's does the same thing in `doSend`. `keySeq` is otherwise asserted exactly once, as the literal 3 in the transcribed init |
 | the traffic layout and the field-order trap | Go source (`:314-318` against `:343-344`). No traffic frame has been captured from Go; `tests/mesh3.rs` and `tests/resolve_queue.rs` exercise ours end to end and would pass with the three uvarints in any order both ends agreed on |

@@ -26,7 +26,7 @@ Rules for these pages:
 | [30-tree.md](30-tree.md) | `SigReq` / `SigRes` / `Announce`, and both signature preimages | **captured** from Go 0.5.14, preimages verified | `go_tree_payloads_match_captured` |
 | [50-path.md](50-path.md) | `PathLookup` / `PathNotify` / `PathBroken`, `xkey` | **transcribed** from a Go generator | `lookup_vector_matches_go`, `notify_vector_matches_go`, `broken_vector_matches_go` |
 | [60-traffic.md](60-traffic.md) | the `Traffic` frame and forwarding | **transcribed** from a Go generator | `traffic_vector_matches_go`, `a_path_is_refreshed_by_a_frame_we_cannot_read`, `a_forwarded_frame_does_not_refresh_the_forwarders_path` |
-| [70-session.md](70-session.md) | session `init` / `ack`, the type bytes, the e2c map | `init` **transcribed**; `ack` round-trip only; type bytes and e2c map from Go's source | `go_init_decrypts_with_b_key`, `session_handshake_roundtrip`, `packet_type_constants_match_go`, `e2c_pub_matches_go` |
+| [70-session.md](70-session.md) | session `init` / `ack`, the type bytes, the e2c map | `init` **captured** from a live Go node; `ack` never sent by Go (the page says why); type bytes and e2c map from Go's source | `a_captured_go_session_init_opens_and_verifies`, `an_ack_differs_from_an_init_only_in_its_type_byte`, `go_init_decrypts_with_b_key`, `session_handshake_roundtrip`, `packet_type_constants_match_go`, `e2c_pub_matches_go` |
 | [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | **captured** (a beacon a Go node sent) + a non-Go KAT | `a_captured_go_beacon_decodes_and_verifies`, `a_captured_go_beacon_is_rejected_only_where_go_rejects_it`, `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
 | — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured`, `validity` |
 | — | `BloomFilter` wire encoding | **captured**, including the flag bit order — a non-empty filter, 96 bytes | `a_go_bloom_payload_round_trips_through_our_codec`, `the_flag_bit_order_matches_a_go_payload`, `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
@@ -40,7 +40,7 @@ tree payload is captured and therefore the more useful page first.
 
 ## The count, and what it means
 
-**Nine of 22 formats are guarded by bytes captured from the installed Go 0.5.14
+**Ten of 22 formats are guarded by bytes captured from the installed Go 0.5.14
 binary**: the envelope, the two `meta` rows and the four tree rows in
 `tests/go_vectors.rs`, plus the multicast beacon and the non-empty bloom filter
 in `src/multicast.rs` and `src/bloom.rs`. A beacon is
@@ -69,12 +69,14 @@ different font. Four things are worth naming:
   rotation *state*, not a message. Rotation now has three tests (four mutants
   killed); the nonce-wraparound branch of `encrypt`, which is Go's *other*
   rotation trigger, does not.
-- **Session `ack` has no captured bytes.** A session rides *inside* a `Traffic`
-  frame — there is no session frame type, because the pathfinder is below the
-  session layer, so the traffic frame's payload *is* the session message — so
-  capturing one means answering Go's `init`. The harness can: the payload is
-  sealed to *our* key and we hold it. Go just never opens one in the current
-  capture, so this is the next capture and it is not written.
+- **Session `init` is now captured** from a live Go node, and reaching it took
+  four things that each failed silently. Session **`ack`** still has no captured
+  bytes, and now for a real reason rather than a hopeful one: Go sends nodeinfo
+  only in reply to an admin `getNodeInfo` — `_sendReq` has exactly one caller in
+  the whole module (`core/nodeinfo.go:160`) — and by then it has nothing left to
+  say, because it already answered the request that opened the session. What is
+  pinned instead is that `ack` and `init` are the same wire format, differing
+  only in the leading type byte. `70-session.md` lists all four steps.
 - **`GroupPassword` is a config key we accept and ignore**, and a node with one
   set will not verify our `init` or `ack`. That is a real interop hole rather
   than a documentation gap; see `TODO.md`.
@@ -98,7 +100,7 @@ different font. Four things are worth naming:
   they are just not bytes we *captured*, and an `address_test.go` line is a
   weaker oracle than a running node.
 
-So: **22 of 22 is not reached, and the honest split of the 22 is 9 captured, 6
+So: **22 of 22 is not reached, and the honest split of the 22 is 10 captured, 5
 transcribed, 3 round-trip or semantics only, and 4 unguarded.** There is no
 "partial" left: the last one was the bloom, which was captured for its block
 order and transcribed for its bit order until the non-empty filter closed it.

@@ -400,6 +400,39 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
             sigres.req.seq, sigres.port
         );
 
+        // Advertise a bloom filter of our own, and this is not optional.
+        //
+        // `_sendMulticast` decides where to send a `PathLookup` by testing the
+        // **peer's advertised** filter against the transformed destination
+        // (`ironwood/network/bloomfilter.go:314-317`):
+        //
+        // ```go
+        // if !pbi.recv.filter.Test(xform[:]) { continue }
+        // ```
+        //
+        // `pbi.recv` is what the *peer* told us, so an empty filter from us means
+        // every lookup Go generates is discarded before it leaves the node. Go
+        // has no way to complain: our filter is a legitimate answer to the
+        // question "what do you care about?", and "nothing" is one of the
+        // answers. It is also the answer a node that never learned the multicast
+        // protocol would give, which is precisely the state this harness was in.
+        //
+        // The keys go in **transformed** (`bloom::xkey`), because that is what
+        // the sender tests against: `xKey(toKey)` where `toKey` is the
+        // destination of the packet. Advertising raw keys would compile fine and
+        // match nothing — another silent one, and the same shape as the
+        // announce-parent problem above.
+        let mut our_filter = roots::bloom::BloomFilter::new();
+        our_filter.add(&roots::bloom::xkey(&our_pk));
+        our_filter.add(&roots::bloom::xkey(&go_pk));
+        let filter_bytes = our_filter.encode();
+        println!(
+            "ours(BloomFilter) {} bytes, keys added: ours + go (both xkey)",
+            filter_bytes.len()
+        );
+        roots::link::write_frame_to(&mut stream, FrameType::BloomFilter, &filter_bytes)
+            .await
+            .expect("send a BloomFilter");
         // Answer Go's `Announce` with one of our own, so Go accepts us as a tree
         // peer rather than dropping the link for want of an upstream. Built by
         // hand rather than by a router because this harness is the byte-level
@@ -526,7 +559,34 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
         // for the length of the admin call, which is exactly the race that
         // stopped the lookup from ever being answered. The answer is collected
         // after the loop.
-        let ask = tokio::spawn(ask_go_about_us(our_pk));
+        //
+        // Retried, because the request is a **single attempt with no retry of
+        // its own**. `_sendReq` does one `WriteTo` (`core/nodeinfo.go:113`), the
+        // pathfinder turns that into at most one multicast `PathLookup`, and if
+        // that multicast is skipped — because our bloom filter has not been
+        // merged yet, or `onTree` is not yet set for us, or the tree has not
+        // converged — the attempt is simply gone. The admin handler then waits
+        // its 6 s and reports a timeout, and a second call is the only way to
+        // try again.
+        //
+        // So the timing that matters is not "ask early" or "ask late" but "ask
+        // until something answers", which is also how a person would use it.
+        let ask = tokio::spawn(async move {
+            let mut last = String::new();
+            for attempt in 1..=6 {
+                if attempt > 1 {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                }
+                match ask_go_about_us(our_pk).await {
+                    Ok(answer) if !answer.contains("\"status\": \"error\"") => {
+                        return format!("attempt {attempt}: {answer}");
+                    }
+                    Ok(answer) => last = format!("attempt {attempt}: {answer}"),
+                    Err(e) => last = format!("attempt {attempt}: {e}"),
+                }
+            }
+            last
+        });
 
         // Generous, and it stays in place because the report at the end says
         // what did *not* arrive: a second bloom, or a session. Both are open
@@ -573,7 +633,36 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_secs())
                                 .unwrap_or(0),
-                            path: Vec::new(),
+                            // Our own path, which is NOT empty: it is the single
+                            // peer port Go allocated for this link. An empty path
+                            // looks right — "we are our own root" — and is the
+                            // reason a `PathNotify` can arrive, be accepted, and
+                            // still route nothing.
+                            //
+                            // `_getDist` (`ironwood/network/router.go:661-683`) is
+                            // a **prefix count over port lists**, not an XOR
+                            // distance:
+                            //
+                            // ```go
+                            // dist := uint64(len(keyPath) + len(destPath))
+                            // for idx := 0; idx < end; idx++ {
+                            //     if keyPath[idx] == destPath[idx] { dist -= 2 } else { break }
+                            // }
+                            // ```
+                            //
+                            // and `_lookup` seeds `bestDist` from its own key, so
+                            // with `destPath = []` that is `0` and **no peer can
+                            // ever be strictly better**. An empty path is
+                            // unroutable by construction.
+                            //
+                            // The right value is `sigres.port`: Go allocates
+                            // `peerPort` from 1 upward per peer
+                            // (`ironwood/network/peers.go:53-61`), so the port in
+                            // the `SigRes` Go sent us *is* Go's next hop back to
+                            // this link. It is not a guess and it is not our TCP
+                            // port — it is Go's own numbering, read back out of
+                            // Go's signature.
+                            path: vec![sigres.port],
                             sig: [0u8; 64],
                         };
                         info.sign(&our_sk);
@@ -610,11 +699,51 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
                 match roots::traffic::Traffic::decode(&payload) {
                     Ok(tr) => {
                         println!(
-                            "GO_SESSION src={} n={}",
+                            "GO_SESSION src={} n={} type={}",
                             hex::encode(tr.source),
-                            tr.payload.len()
+                            tr.payload.len(),
+                            tr.payload.first().copied().unwrap_or(0xff)
                         );
                         println!("GO_SESSION_HEX {}", hex::encode(&tr.payload));
+                        // Emit the constant **already wrapped and escaped**, so
+                        // pasting it cannot silently drop or double a hex digit.
+                        // Wrapping a 193-byte value by hand across lines is
+                        // exactly the kind of edit that compiles, passes a
+                        // length assertion, and is wrong — which is what
+                        // happened the first time.
+                        if tr.payload.len() == roots::session::SESSION_INIT_SIZE {
+                            let h = hex::encode(&tr.payload);
+                            println!("PASTE const GO_SESSION_INIT: &str = \"{}\\\\", h);
+                            for chunk in h.as_bytes().chunks(64) {
+                                println!("PASTE     {}\\", std::str::from_utf8(chunk).unwrap());
+                            }
+                            println!("PASTE END_OF_CONST");
+                        }
+                        // And open it, because we can: the payload is sealed to
+                        // *our* box key and the harness generated it. This is the
+                        // one place a peer's session message is readable, and it
+                        // is what turns the hex above into fields worth pinning.
+                        let our_box_priv = {
+                            use sha2::{Digest, Sha512};
+                            let seed = Sha512::digest(OUR_SEED);
+                            let mut k = [0u8; 32];
+                            k.copy_from_slice(&seed[..32]);
+                            k
+                        };
+                        match roots::session::SessionInit::decrypt_msg(
+                            &our_box_priv,
+                            &tr.source,
+                            &tr.payload,
+                        ) {
+                            Some(init) => println!(
+                                "GO_SESSION_INIT current={} next={} key_seq={} seq={}",
+                                hex::encode(init.current),
+                                hex::encode(init.next),
+                                init.key_seq,
+                                init.seq
+                            ),
+                            None => println!("(could not open Go's session message)"),
+                        }
                     }
                     Err(e) => println!("(traffic decode failed: {e})"),
                 }
@@ -640,8 +769,7 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
         // printing it before the loop would claim an outcome that had not
         // happened yet.
         match ask.await {
-            Ok(Ok(answer)) => println!("GO_ADMIN getNodeInfo {answer}"),
-            Ok(Err(e)) => println!("(getNodeInfo did not answer: {e})"),
+            Ok(answer) => println!("GO_ADMIN getNodeInfo {answer}"),
             Err(e) => println!("(getNodeInfo task failed: {e})"),
         }
     }
