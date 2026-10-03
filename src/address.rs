@@ -109,7 +109,7 @@ pub fn key_for_subnet(snet: &Subnet) -> [u8; KEY_LEN] {
 /// routed subnet address (`03…/64`), mirroring Go's
 /// `sendToAddress`/`sendToSubnet` split (`ipv6rwc.writePC`).
 pub fn lookup_key_for_addr(addr: &Address) -> [u8; KEY_LEN] {
-    if addr.0[0] == NODE_PREFIX | SUBNET_BIT {
+    if addr.is_subnet() {
         let mut raw = [0u8; SUBNET_LEN];
         raw.copy_from_slice(&addr.0[..SUBNET_LEN]);
         key_for_subnet(&Subnet(raw))
@@ -119,8 +119,29 @@ pub fn lookup_key_for_addr(addr: &Address) -> [u8; KEY_LEN] {
 }
 
 impl Address {
+    /// Is this a **node** address, `02…`?
+    ///
+    /// The mirror of `Subnet::is_valid`, and Go has the same pair
+    /// (`address.Address.IsValid`, `address.Subnet.IsValid`), because the two
+    /// types are distinguished by exactly that bit and Go's
+    /// `ipv6rwc.writePC` asks both in turn to decide node-address-or-subnet.
     pub fn is_valid(&self) -> bool {
         self.0[0] == NODE_PREFIX
+    }
+
+    /// Is this a **subnet** address, `03…`?
+    ///
+    /// The other half of `is_valid`, and the one with three production callers:
+    /// `lookup_key_for_addr` picks the lossy key differently for each, and the
+    /// two address-to-key lookups in `driver.rs` have to match a subnet against a
+    /// node's `/64` rather than its whole address. All four were writing the byte
+    /// test out by hand, which is four places to forget the `SUBNET_BIT`.
+    ///
+    /// Note this is *not* `!is_valid()`: an address whose first byte is neither
+    /// `02` nor `03` — a documentation prefix, say — is neither a node address
+    /// nor a subnet, and only this says so correctly.
+    pub fn is_subnet(&self) -> bool {
+        self.0[0] == NODE_PREFIX | SUBNET_BIT
     }
 }
 
@@ -173,12 +194,32 @@ mod tests {
         assert_eq!(subnet_for_key(&PUB).0, [3, 0, 132, 138, 96, 79, 187, 126]);
     }
 
+    /// The two predicates are **complementary only on real mesh addresses**,
+    /// which is the trap worth pinning: `!Address::is_valid()` is not
+    /// `Address::is_subnet()`, because an address whose first byte is neither
+    /// `02` nor `03` is neither. `key_for_addr` and `lookup_key_for_addr` both
+    /// branch on that difference, and `is_subnet` is the other half of Go's
+    /// `writePC` node-or-subnet question (`ipv6rwc.go:306-311`).
     #[test]
     fn validity() {
         assert!(addr_for_key(&PUB).is_valid());
         assert!(subnet_for_key(&PUB).is_valid());
         assert!(!Address([NODE_PREFIX | SUBNET_BIT; ADDR_LEN]).is_valid());
         assert!(!Subnet([NODE_PREFIX; SUBNET_LEN]).is_valid());
+
+        let node = addr_for_key(&PUB);
+        let mut padded = [0u8; ADDR_LEN];
+        padded[..SUBNET_LEN].copy_from_slice(&subnet_for_key(&PUB).0);
+        let subnet = Address(padded);
+        assert!(subnet.is_subnet());
+        assert!(!subnet.is_valid(), "a subnet address is not a node address");
+        assert!(!node.is_subnet(), "and a node address is not a subnet");
+        // Neither: a documentation prefix, which is the case the two predicates
+        // would get wrong if either were written as the other's negation.
+        for neither in ["2001:db8::1", "fe80::1", "ff02::1", "::1"] {
+            let a = Address(neither.parse::<std::net::Ipv6Addr>().unwrap().octets());
+            assert!(!a.is_valid() && !a.is_subnet(), "{neither} is neither");
+        }
     }
 
     #[test]

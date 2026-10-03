@@ -169,7 +169,7 @@ impl Router {
                 }
             }
             let want = addr.0;
-            let want_subnet = addr.0[0] == crate::address::NODE_PREFIX | crate::address::SUBNET_BIT;
+            let want_subnet = addr.is_subnet();
             if let Some(k) = self
                 .path
                 .entries
@@ -292,7 +292,7 @@ impl Router {
     /// the path entry that opened it.
     fn key_for_addr(&self, addr: &crate::address::Address) -> Option<[u8; KEY_LEN]> {
         let want = addr.0;
-        let want_subnet = want[0] == crate::address::NODE_PREFIX | crate::address::SUBNET_BIT;
+        let want_subnet = addr.is_subnet();
         self.path
             .entries
             .keys()

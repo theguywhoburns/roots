@@ -947,7 +947,7 @@ mod tests {
         target_raw[..8].copy_from_slice(&b_snet.0);
         target_raw[15] = 0x41;
         let target = crate::address::Address(target_raw);
-        assert!(target.0[0] == crate::address::NODE_PREFIX | crate::address::SUBNET_BIT);
+        assert!(target.is_subnet());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {

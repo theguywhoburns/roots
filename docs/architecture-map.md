@@ -51,7 +51,7 @@ Go-origin column is taken from each module's own port header and checked against
 | File | Job | Go origin |
 |---|---|---|
 | `lib.rs` | crate root, `Client` sugar (`new`, per-scheme dial, listen/accept), re-exports — no node loop (Slice 3) | — |
-| `router.rs` | `Router` struct composing the five tables; `new`, `pubkey`, `next_init_seq`, `announces_*`, `peer_kind`, `is_roots_peer`; `MAINTENANCE_INTERVAL`, `UNKNOWN_LATENCY` | — (facade) |
+| `router.rs` | `Router` struct composing the five tables; `new`, `pubkey`, `next_init_seq`, `announces_*`, `forget_link`; `MAINTENANCE_INTERVAL`, `UNKNOWN_LATENCY` | — (facade) |
 | `driver.rs` | link I/O orchestration: `register` `resolve` `maintain` `dispatch_frame` `serve` `serve_links`, keepalive, dead-link eviction, `fatal_link_error` | `network/router.go` peer upkeep |
 | `views.rs` | read-only snapshots: `parent` `root_and_depth` `known_nodes` `dump` `has_path` `has_session` `path_details` `get_paths` `get_sessions` `link_peers` `dropped_no_link` `tree_entries` + `Snapshot` impl | diagnostic funcs |
 | `traits.rs` | `Snapshot` trait (25 lines) | — |
@@ -227,7 +227,9 @@ reports. `examples/tun_ping.rs` is gone too (Slice 14), for the same reason, and
 `&mut Router` and `&mut LinkSet`, and it is a field on `Node` rather than a task
 precisely so it does not need a lock over the one thing here that must not have
 one. `tun` moved to `client/Cargo.toml` with it; `smoltcp` stays in the root
-manifest while `examples/common/` and `tests/tcp_loopback.rs` still want it.
+manifest while `examples/common/` still wants it — the shared ICMPv6 builders and
+link plumbing there serve `ping6`, `mesh_tcp`, `http_fetch`, `irc_watch` and
+`tests/mesh_ping.rs`.
 
 ## The client's node loop (Slices 5 and 7)
 

@@ -97,8 +97,9 @@ wire; there is no release process, and CI is three local commands.
   `client/src/main.rs` builds one too, but only in the demo probe (no config).
 - Cargo forbids `[[bin]]` from using `[dev-dependencies]`, which is why the
   workspace exists. `smoltcp` stays in the root manifest for `examples/common/`
-  and `tests/tcp_loopback.rs`; `tun` moved to `client/` with Slice 14, the last
-  thing that opened a device.
+  (shared by `ping6`, `mesh_tcp`, `http_fetch`, `irc_watch` and the live
+  `mesh_ping` test); `tun` moved to `client/` with Slice 14, the last thing that
+  opened a device.
 - Root `examples/` and `tests/` are demo/debug scaffolding around the lib. When
   one turns out to be node behaviour it **moves into `client/src/` and the
   example is deleted** (Slice 7 deleted `examples/admin.rs`, Slice 14 deleted
