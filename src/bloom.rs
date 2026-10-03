@@ -448,8 +448,127 @@ mod tests {
     const PPUB: &str = "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394";
     const BLOOM: &str = "dbeffffbfffff7fbdf7f7ffdfedfdfbf0000000000000000000000000000000000000000000000080000000000040000000000000040000000000000000080000040000000000000000002000000000000008000040000000000000200000000000000000000000400000000040000000000000000002000002000000000004000000000004000000008000000000000";
 
+    /// A bloom payload **the installed Go 0.5.14 sent**, captured 2026-10-03
+    /// by `examples/go_capture.rs --frames`. Deterministic across runs, which is
+    /// what makes it a vector rather than a sample.
+    ///
+    /// This is the one that closes a gap Slice 13 wrote down as unclosable. The
+    /// first captured bloom was all-ones flags followed by all-zero flags — Go's
+    /// filter over an empty routing table — and **an all-ones flag block has
+    /// every position set**, so MSB-first and LSB-first encoders produce
+    /// identical bytes for it. The bit order within a byte therefore could not be
+    /// pinned from the binary, and the page said so.
+    ///
+    /// Getting a *non-empty* filter out of Go took making ourselves a real tree
+    /// peer: announce Go as our parent rather than ourselves as our own parent,
+    /// because `_fixOnTree` puts a peer on the tree only if it is Go's parent or
+    /// Go is its parent (`network/bloomfilter.go:151-156`). A self-parented peer
+    /// satisfies neither arm, sits off the tree, and is skipped by every
+    /// multicast — silently, which is why it took reading the source rather than
+    /// waiting longer.
+    ///
+    /// 96 bytes, against 144 for the two-key generator vector above: the encoding
+    /// is variable-length and emits a data word only for a word that is neither
+    /// all-zero nor all-ones, so a filter over one peer is shorter. That length
+    /// difference is itself worth having checked, because a decoder that always
+    /// expected 144 would reject this and a decoder that always expected 96
+    /// would reject the other.
+    const GO_BLOOM: &str = "feefdefff7ff7dfffffffffffffdffff00000000000000000000000000000000\
+0000000000000010000000400000000000000000002000000000200000000000\
+0000000100000000004000000000000000000000000040000000000000000400";
+
     fn key(s: &str) -> [u8; KEY_LEN] {
         hexbytes(s).try_into().unwrap()
+    }
+
+    /// The bloom a Go node actually sent, round-tripped through our decoder and
+    /// back out through our encoder.
+    ///
+    /// What this buys over the generator vector above, which is the whole point:
+    /// the generator vector proves our *hash* matches Go's, because it is Go's
+    /// own test data. This proves our *codec* accepts bytes Go chose on its own,
+    /// with no Go test in the loop.
+    ///
+    /// The three assertions each catch a different mistake:
+    ///
+    /// - **decodes**, which is where a wrong flag/data order would surface first:
+    ///   the two 16-byte flag blocks are read at fixed offsets, so a swap parses
+    ///   "successfully" and then puts the data words in the wrong places.
+    /// - **the data words survive**, so a decoder that read them but assigned them
+    ///   by position instead of by flag index cannot pass.
+    /// - **re-encodes byte-identically**, which is the one that closes the loop:
+    ///   it rules out a re-encode that is merely *equivalent*, such as emitting an
+    ///   all-ones word as a data word where Go used a flag bit. Go's canonical
+    ///   form is part of the wire format, not a presentation detail — a peer
+    ///   compares bytes in a bloom test result.
+    #[test]
+    fn a_go_bloom_payload_round_trips_through_our_codec() {
+        let raw = hexbytes(GO_BLOOM);
+        assert_eq!(raw.len(), 96, "the captured payload is 96 bytes");
+        let b = BloomFilter::decode_exact(&raw).expect("decode a bloom Go sent");
+        assert_eq!(
+            hex::encode(b.encode()),
+            GO_BLOOM,
+            "our encoder must reproduce Go's bloom byte for byte"
+        );
+        // And the payload is genuinely interesting: the empty captured filter was
+        // all-ones, so a filter that came back with every word zero would mean we
+        // parsed the flags as data. Assert some content rather than trusting it.
+        assert!(
+            b.words.iter().any(|w| *w != 0 && *w != u64::MAX),
+            "Go's filter has data words, which is the whole reason for capturing it"
+        );
+    }
+
+    /// The bit order *within* a flag byte, against the installed binary.
+    ///
+    /// This is the half `bloom_vector_matches_go` cannot reach, and the reason is
+    /// not that the format is unknowable — it is that every *other* vector we had
+    /// was degenerate for it. The generator vector was transcribed from Go's own
+    /// tests, so it moves when Go's tests move; the first captured filter was
+    /// all-ones flags, where every position is set and MSB-first and LSB-first
+    /// encoders agree by construction.
+    ///
+    /// `GO_BLOOM` is neither. Its `flags0` is `fe ef de ff f7 ff 7d ff ff ff
+    /// ff ff ff fd ff ff` and its `flags1` is all zero, so the *positions* of the
+    /// clear bits — the ones that decide which words get data — are visible, and
+    /// getting the bit order backwards moves them.
+    ///
+    /// So: decode Go's bytes and check that the set bits land exactly where the
+    /// format's own rules say the data words are, by walking the words and reading
+    /// the flags the way `decode_exact` does. A `0x80 >>` versus `1 <<` swap is
+    /// the mutation this kills, and it is now killed by the *binary's* output
+    /// rather than by a hand-written expectation.
+    #[test]
+    fn the_flag_bit_order_matches_a_go_payload() {
+        let raw = hexbytes(GO_BLOOM);
+        let (flags0, rest) = raw.split_at(BLOOM_FLAGS);
+        let (flags1, _) = rest.split_at(BLOOM_FLAGS);
+        let b = BloomFilter::decode_exact(&raw).expect("decode a bloom Go sent");
+        let mut words_with_data = 0usize;
+        for (idx, w) in b.words.iter().enumerate() {
+            let f0 = flags0[idx / 8] & (0x80 >> (idx % 8)) != 0;
+            let f1 = flags1[idx / 8] & (0x80 >> (idx % 8)) != 0;
+            match (f0, f1) {
+                (true, false) => assert_eq!(*w, 0, "word {idx} flagged clear"),
+                (false, true) => assert_eq!(*w, u64::MAX, "word {idx} flagged set"),
+                (false, false) => {
+                    // Go emits a data word only when the word is neither all-zero
+                    // nor all-ones, so *anything* here is real content.
+                    assert!(
+                        *w != 0 && *w != u64::MAX,
+                        "word {idx} has a data word that is all-zero or all-ones, \\
+                         which Go would have flagged instead"
+                    );
+                    words_with_data += 1;
+                }
+                (true, true) => unreachable!("decode_exact rejects both flags"),
+            }
+        }
+        assert!(
+            words_with_data > 4,
+            "Go's filter should carry many data words, found {words_with_data}"
+        );
     }
 
     #[test]
@@ -470,14 +589,15 @@ mod tests {
     ///
     /// The bit order *within* a byte is deliberately **not** claimed here:
     /// flipping `0x80 >>` to `1 <<` in both directions is self-consistent and
-    /// passes. That half is carried by `bloom_vector_matches_go` above, against
-    /// bytes from a Go generator — and the captured empty filter in
-    /// `tests/go_vectors.rs` cannot help with it, because an all-ones flag block
-    /// has every position set, so MSB-first and LSB-first encoders produce
-    /// identical bytes for it (measured). A second, non-empty bloom from the Go
-    /// binary would settle it against the installed version rather than a
-    /// generator; `examples/go_capture.rs --frames` says why it cannot get one,
-    /// and that is a real gap in the evidence rather than a stylistic one.
+    /// passes. That half lives in `the_flag_bit_order_matches_a_go_payload`
+    /// above, and it is worth saying why it could not live here. It needs a
+    /// filter whose *flag positions* are visible, and for a long time every
+    /// filter we had was degenerate for it: the one in `tests/go_vectors.rs` is
+    /// all-ones then all-zero, so every position is set and MSB-first and
+    /// LSB-first encoders produce identical bytes (measured), and the generator
+    /// vector is transcribed from Go's own tests rather than captured. The
+    /// captured non-empty filter fixed that — see `GO_BLOOM` for what it took to
+    /// get one out of Go at all.
     #[test]
     fn the_flag_layout_is_flags_then_data() {
         let mut b = BloomFilter::new();

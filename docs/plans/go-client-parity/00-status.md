@@ -62,7 +62,7 @@ should not have. Slice 13's real output is a table that labels every format with
 the provenance it actually has (`docs/protocol/README.md`), and the honest split
 of the 22 is:
 
-**8 captured · 6 transcribed · 1 partial · 3 round-trip or semantics only ·
+**9 captured · 6 transcribed · 3 round-trip or semantics only ·
 4 unguarded**
 
 Three findings are worth keeping:
@@ -79,13 +79,29 @@ Three findings are worth keeping:
    *block order* — which nothing else did, because swapping the two blocks is
    self-consistent. That swap is now killed by
    `the_flag_layout_is_flags_then_data`.
-3. **The bloom's bit order *within* a byte cannot be captured from this harness,
-   and the code now says so rather than implying otherwise.** Go's first filter
-   is empty, and an all-ones flag block has every position set, so MSB-first and
-   LSB-first encoders produce identical bytes — measured, by reversion, against
-   a comment that claimed otherwise. The bit order is pinned by a generator
-   vector, and `examples/go_capture.rs` records why the binary cannot supply it:
-   answering Go's `Announce` does not make it re-advertise a non-empty filter.
+3. **The bloom's bit order *within* a byte could not be captured from this
+   harness — and then it could, once the harness was fixed.** Go's first filter
+   was empty, and an all-ones flag block has every position set, so MSB-first and
+   LSB-first encoders produce identical bytes — measured, by reversion, against a
+   comment that claimed otherwise. At the time the harness could not get a
+   non-empty filter at all, and the honest answer was a generator vector.
+
+   The reason it could not is `_fixOnTree` (`ironwood/network/bloomfilter.go:145-174`),
+   which puts a peer on the routing tree only if it is Go's parent or Go is its
+   parent. A node announcing **itself as its own parent** — what the harness
+   sent, because that is the shape a node with no upstream uses — satisfies
+   neither arm, sits off the tree, and is skipped by every multicast
+   (`:306-308`). So Go's filter stayed empty and said nothing about bit order.
+
+   Announce Go as our parent instead, reuse the `SigRes` Go already sent us for
+   the `psig`, and Go advertises a filter with 8 data words in it, 96 bytes,
+   deterministically. `the_flag_bit_order_matches_a_go_payload` now pins the bit
+   order against the **installed binary**; three mutants killed, including the
+   `0x80 >>` versus `1 <<` swap that no earlier vector could touch.
+
+   The lesson is the one from phase C: a documented gap is sometimes a harness
+   defect wearing a protocol costume. "Go will not re-advertise a non-empty
+   filter" was true of the *harness*, not of Go.
 
 Still open, and each is a *capture* rather than a typing job: **session `ack`**
 has no captured bytes, which means answering Go's `init` from

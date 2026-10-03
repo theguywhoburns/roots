@@ -129,6 +129,58 @@ Captured on one link, in the order Go sent them: `SigReq`, `BloomFilter`,
 `44 03` = length 0x44‖2-bit-continued = 67, then `03` = `FrameType::SigRes`,
 then 67 bytes of payload.
 
+## Getting a *non-empty* bloom out of Go
+
+The first captured `BloomFilter` was empty: Go's own routing table had nothing
+in it, so every word was all-zero and the payload was two flag blocks — all ones
+then all zeros. That is degenerate for the format's most interesting question.
+**An all-ones flag block has every position set**, so an MSB-first and an
+LSB-first encoder emit identical bytes for it, and the bit order within a flag
+byte could not be pinned from the binary at all. Slice 13 recorded that as a gap
+it could not close.
+
+It closes like this. Go only advertises a filter for peers that are **on its
+routing tree**, and `_fixOnTree` (`ironwood/network/bloomfilter.go:145-174`) is
+narrower than it looks:
+
+```go
+if selfInfo.parent == pk { pbi.onTree = true }
+else if info, isIn := bs.router.infos[pk]; isIn {
+    if info.parent == selfKey { pbi.onTree = true }
+}
+```
+
+A node that announces **itself as its own parent** — the shape a node with no
+upstream uses, and the shape the capture harness had been sending — satisfies
+*neither* arm. It is not Go's parent, and its parent is not Go. So it sits off
+the tree, and `_sendMulticast` skips every peer with `!pbi.onTree`
+(`:306-308`): the filter stays empty and the node is never told about anything.
+
+The fix is to announce **Go** as our parent, which is also the honest thing — Go
+genuinely is our upstream for the length of the link. The cost is that the
+announce's `res.psig` must then be signed by Go, so the harness reuses the
+`SigRes` Go already sent us rather than making a second one.
+
+With that, Go sends a filter with real content, deterministically across runs:
+
+```text
+feefdefff7ff7dfffffffffffffdffff  flags0
+00000000000000000000000000000000  flags1
+… 8 data words, 96 bytes total
+```
+
+**96 bytes, against 144 for the two-key generator vector.** The encoding is
+variable-length: a word appears in the data section only if it is neither
+all-zero nor all-ones, so a filter over one peer is shorter than a filter over
+two. Both lengths are now checked, because a decoder that hard-coded either one
+would reject the other.
+
+And the *flag positions* in that `flags0` are visible, which is what makes
+`the_flag_bit_order_matches_a_go_payload` a real test: a `0x80 >>` versus
+`1 <<` swap moves the data words and fails. Measured, by reversion, three times
+over — block swap, bit-order swap, and data words assigned by position rather
+than by flag index.
+
 ## Provenance
 
 | what | from |
@@ -136,6 +188,8 @@ then 67 bytes of payload.
 | all three payloads, both signatures verified | captured, Go 0.5.14, `tests/go_vectors.rs` |
 | the `psig` preimage order | captured **and** checked — the vector only verifies with `node ‖ parent ‖ req ‖ port` in that order, and the test also asserts it does *not* verify with Go's key on both sides |
 | `port` is the requester's | captured, and the value is 1, which is the port the harness's own link was given |
-| the only announce shape available | captured: a Go node with one peer is a root, so `key == parent`, `port == 0` and `sig == psig`. **An announce from a node with an upstream has not been captured**, and its non-zero `port` and a separately-computed `sig` are the only things that would differ |
+| the only announce shape available | **captured twice, and the two shapes are the whole point.** A node with no upstream is a root: `key == parent`, `port == 0`, `sig == psig`. A node *with* an upstream — which is what the harness had to become to get a non-empty bloom — sends `parent` = Go's key, a `psig` **Go signed**, and a separately-computed `sig`. Both are captured; see the section above |
+| a non-empty `BloomFilter`, 96 bytes | captured, Go 0.5.14, deterministic across runs, `GO_BLOOM` in `src/bloom.rs` |
+| the flag bit order within a byte | captured, against the non-empty filter. Previously pinned only by a Go *generator* vector, because every earlier captured filter was degenerate for it |
 | `sigCache` dropping a repeated request | Go source, `network/peers.go` — a silence, so nothing captures it |
 | the 10-byte nonce | captured, and Go's `uint64` source is what makes it plausible rather than a bug |

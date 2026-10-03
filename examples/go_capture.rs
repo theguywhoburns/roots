@@ -369,11 +369,71 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
             .await
             .expect("send a SigReq");
 
+        // Read Go's answer to that request, and keep it. This is the `SigRes`
+        // whose `psig` is signed by **Go** over (our key, Go's key) — and that
+        // is exactly the preimage an announce naming Go as our parent needs, so
+        // it is reusable rather than a second signature to forge. Go's key is
+        // the one from its `meta`, which we already decoded above.
+        let go_pk = decoded.public_key;
+        let (sigres, _) = loop {
+            let Some((_, ftype, payload)) = read_frame_raw(&mut stream).await else {
+                panic!("Go hung up before answering our SigReq");
+            };
+            if ftype == FrameType::SigRes {
+                break roots::tree::SigRes::decode(&payload).expect("decode Go's SigRes");
+            }
+        };
+        assert!(
+            sigres.check(&our_pk, &go_pk),
+            "Go's SigRes must verify against (our key, Go's key) before we reuse it"
+        );
+        println!(
+            "go(SigRes) {}",
+            hex::encode(&{
+                let mut b = Vec::new();
+                sigres.encode(&mut b);
+                b
+            })
+        );
+        println!(
+            "go(SigRes) req={} port={} — Go's idea of the port it can reach us on",
+            sigres.req.seq, sigres.port
+        );
+
         // Answer Go's `Announce` with one of our own, so Go accepts us as a tree
         // peer rather than dropping the link for want of an upstream. Built by
         // hand rather than by a router because this harness is the byte-level
         // oracle and a router in the loop would make the capture depend on the
         // thing under test.
+        //
+        // **Go is our parent, and that is load-bearing.** The obvious choice —
+        // announce ourselves as our own parent, the shape Go used for its own
+        // root announce — is accepted and is *not* enough, and the symptom is
+        // entirely silent: Go never sends a `PathLookup`, so nothing it wants to
+        // tell us ever arrives.
+        //
+        // The reason is `_fixOnTree` (`network/bloomfilter.go:145-174`), which
+        // decides whether a peer sits on the routing tree:
+        //
+        // ```go
+        // if selfInfo.parent == pk { pbi.onTree = true }
+        // else if info, isIn := bs.router.infos[pk]; isIn {
+        //     if info.parent == selfKey { pbi.onTree = true }
+        // }
+        // ```
+        //
+        // A self-parented peer satisfies neither arm: it is not Go's parent, and
+        // its parent is not Go. And `_sendMulticast` skips every peer with
+        // `!pbi.onTree` (`bloomfilter.go:306-308`) — so the `PathLookup` Go
+        // generates for us when the admin socket asks it about us is multicast
+        // into a room with nobody in it. `_sendLookup` does not send a unicast
+        // lookup at all; the bloom filter is the *whole* decision
+        // (`network/pathfinder.go:27-42`).
+        //
+        // So the announce has to name Go as the parent, which is also the
+        // honest thing: Go genuinely is our upstream for the length of this
+        // link. The cost is that `res` must be Go's own signature, which is why
+        // the `SigRes` above is read and reused rather than made here.
         //
         // MEASURED: this does *not* produce a second, non-empty bloom. Go accepts
         // the announce, keeps the link open, and does not re-advertise its
@@ -390,25 +450,13 @@ async fn capture(password: &str, port: u16, frames: bool) -> Vec<u8> {
         // (`router.go:409-416`).
         let our_sk = SigningKey::from_bytes(&OUR_SEED);
         let our_pk = our_sk.verifying_key().to_bytes();
-        // We are our own parent, since we have no upstream: the same shape as
-        // the root announce Go sent us, and `Announce::check` requires exactly
-        // this (`port == 0 && key == parent`).
-        //
-        // So `psig` is signed over *our* key as both `node` and `parent` — which
-        // is not the preimage of the `SigRes` Go sent us above. That one is
-        // signed over (our key, Go's key), because Go answers a request with a
-        // preimage naming the *requester* (`network/router.go:412`). An announce
-        // carries a `SigRes` about its own `key`, and a node with no upstream
-        // answers its own request.
-        let sigreq = roots::tree::SigReq { seq: 1, nonce: 0 };
-        let sigres = roots::tree::SigRes::seal(sigreq, 0, &our_pk, &our_sk, &our_pk);
         // The outer `sig` covers the same preimage as `psig` — node ‖ parent ‖
         // req ‖ port — signed by the announcer rather than by the parent
         // (`Announce::check` verifies both over `res.bytes_for_sig`).
-        let preimage = sigres.bytes_for_sig(&our_pk, &our_pk);
+        let preimage = sigres.bytes_for_sig(&our_pk, &go_pk);
         let ann = roots::tree::Announce {
             key: our_pk,
-            parent: our_pk,
+            parent: go_pk,
             res: sigres,
             sig: our_sk.sign(&preimage).to_bytes(),
         };

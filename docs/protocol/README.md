@@ -29,7 +29,7 @@ Rules for these pages:
 | [70-session.md](70-session.md) | session `init` / `ack`, the type bytes, the e2c map | `init` **transcribed**; `ack` round-trip only; type bytes and e2c map from Go's source | `go_init_decrypts_with_b_key`, `session_handshake_roundtrip`, `packet_type_constants_match_go`, `e2c_pub_matches_go` |
 | [a0-multicast.md](a0-multicast.md) | multicast advertisement + membership hash + the config row | **captured** (a beacon a Go node sent) + a non-Go KAT | `a_captured_go_beacon_decodes_and_verifies`, `a_captured_go_beacon_is_rejected_only_where_go_rejects_it`, `advertisement_roundtrips_and_rejects`, `multicast_hash_over_peer_key` |
 | — | address derivation (`src/address.rs`) | **transcribed** from `address_test.go`; the *text* Go prints is captured | `addr_vector_matches_go`, `subnet_vector_matches_go`, `getkey_lossy_vectors_match_go`, `go_address_and_subnet_strings_match_captured`, `validity` |
-| — | `BloomFilter` wire encoding | **captured** (which block is which) + **transcribed** (bit order within a byte) | `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
+| — | `BloomFilter` wire encoding | **captured**, including the flag bit order — a non-empty filter, 96 bytes | `a_go_bloom_payload_round_trips_through_our_codec`, `the_flag_bit_order_matches_a_go_payload`, `go_tree_payloads_match_captured`, `bloom_vector_matches_go`, `the_flag_layout_is_flags_then_data` |
 | — | session rotation (there is no `key` message) | three tests; the nonce-wraparound branch is untested | `a_rotated_session_still_delivers_the_way_it_rotated`, `a_one_sided_rotation_carries_one_way_only`, `a_session_that_did_not_rotate_yet_keeps_its_key_sequences` |
 | — | `typeSessionProto` nodeinfo / debug | semantics only | `nodeinfo_size_cap_matches_go`, `debug_round_trips` |
 
@@ -40,9 +40,10 @@ tree payload is captured and therefore the more useful page first.
 
 ## The count, and what it means
 
-**Eight of 22 formats are guarded by bytes captured from the installed Go 0.5.14
+**Nine of 22 formats are guarded by bytes captured from the installed Go 0.5.14
 binary**: the envelope, the two `meta` rows and the four tree rows in
-`tests/go_vectors.rs`, and the multicast beacon in `src/multicast.rs`. A beacon is
+`tests/go_vectors.rs`, plus the multicast beacon and the non-empty bloom filter
+in `src/multicast.rs` and `src/bloom.rs`. A beacon is
 a UDP datagram rather than a link frame, so it is captured by a different harness
 and lives beside the codec that decodes it. That is the number this file's own
 rule supports — *a page here is a claim we are prepared to test*, and a vector is
@@ -77,9 +78,14 @@ different font. Four things are worth naming:
 - **`GroupPassword` is a config key we accept and ignore**, and a node with one
   set will not verify our `init` or `ack`. That is a real interop hole rather
   than a documentation gap; see `TODO.md`.
-- **The bloom's bit order within a flag byte** is pinned by a generator vector,
-  not by the binary. Go's first filter is empty, and an all-ones flag block
-  cannot tell MSB from LSB — measured, by reversion.
+- **The bloom's bit order within a flag byte** was the one format question no
+  vector could answer, because every filter we had was degenerate for it: Go's
+  first was empty, and an all-ones flag block cannot tell MSB from LSB. It is now
+  captured. Getting a *non-empty* filter out of Go needed the harness to become
+  a real tree peer — announce Go as our parent rather than ourselves as our own
+  parent, because `_fixOnTree` only puts a peer on the tree if it is Go's parent
+  or Go is its parent, and a self-parented peer satisfies neither arm and is
+  skipped by every multicast. `30-tree.md` has the source and the captured bytes.
 - **Multicast** now has a captured beacon — `proof/9-multicast.sh` runs a Go node
   beaconing on a veth with our node as the only listener, and checks the length,
   the advertised key, the bound port and that our decoder *accepts* it. A beacon
@@ -92,8 +98,10 @@ different font. Four things are worth naming:
   they are just not bytes we *captured*, and an `address_test.go` line is a
   weaker oracle than a running node.
 
-So: **22 of 22 is not reached, and the honest split of the 22 is 8 captured, 6
-transcribed, 1 partial, 3 round-trip or semantics only, and 4 unguarded.**
+So: **22 of 22 is not reached, and the honest split of the 22 is 9 captured, 6
+transcribed, 3 round-trip or semantics only, and 4 unguarded.** There is no
+"partial" left: the last one was the bloom, which was captured for its block
+order and transcribed for its bit order until the non-empty filter closed it.
 Reaching it means captures, not typing, and each one needs the Go binary inside
 `unshare -Urn` — never CI. The admin socket is not one of the 22: it never
 crosses a link, but `21-admin.md` is written to the same rules because
