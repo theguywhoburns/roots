@@ -25,7 +25,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async, client_async};
 
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::link::{DIAL_TIMEOUT, LinkOptions, PeerConn, Scheme, Transport, parse_link_uri};
 
 /// Required WebSocket subprotocol (Go `link_ws.go` accept path + dial).
@@ -225,7 +225,7 @@ where
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if agreed != WS_SUBPROTOCOL {
-        return Err(Error::BadSubprotocol);
+        return Err(Error::Core(CoreError::BadSubprotocol));
     }
     Ok(WsStream::new(ws))
 }

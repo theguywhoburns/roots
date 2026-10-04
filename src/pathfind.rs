@@ -10,7 +10,7 @@
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::frame::{FrameType, append_path, append_uvarint, read_uvarint, split_path};
 use crate::link::LinkSet;
 
@@ -92,7 +92,7 @@ impl PathLookup {
 
     pub fn decode_exact(buf: &[u8]) -> Result<Self, Error> {
         if buf.len() < 2 * KEY_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut source = [0u8; KEY_LEN];
         let mut dest = [0u8; KEY_LEN];
@@ -144,7 +144,7 @@ impl NotifyInfo {
         let (path, m) = split_path(&buf[n..]).ok_or(Error::InvalidLength)?;
         let rest = &buf[n + m..];
         if rest.len() < 64 {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut sig = [0u8; 64];
         sig.copy_from_slice(&rest[..64]);
@@ -179,7 +179,7 @@ impl PathNotify {
         let (watermark, m) = read_uvarint(&buf[n..]).ok_or(Error::InvalidLength)?;
         let rest = &buf[n + m..];
         if rest.len() < 2 * KEY_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut source = [0u8; KEY_LEN];
         let mut dest = [0u8; KEY_LEN];
@@ -187,7 +187,7 @@ impl PathNotify {
         dest.copy_from_slice(&rest[KEY_LEN..2 * KEY_LEN]);
         let (info, k) = NotifyInfo::decode(&rest[2 * KEY_LEN..])?;
         if k != rest[2 * KEY_LEN..].len() {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         Ok(Self {
             path,
@@ -220,7 +220,7 @@ impl PathBroken {
         let (watermark, m) = read_uvarint(&buf[n..]).ok_or(Error::InvalidLength)?;
         let rest = &buf[n + m..];
         if rest.len() != 2 * KEY_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut source = [0u8; KEY_LEN];
         let mut dest = [0u8; KEY_LEN];

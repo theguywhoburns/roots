@@ -7,10 +7,21 @@
 //! never serves admin, and never builds a `Router` for a caller — that policy
 //! lives in the `roots-client` package (`client/`).
 
-pub mod address;
 pub mod bloom;
-pub mod driver;
 pub mod error;
+
+/// The address module, now living in `roots-core`.
+///
+/// Kept as a `pub use` of the core module rather than deleted so that the 34
+/// internal `crate::address::…` paths across this crate keep resolving **and so
+/// that `roots::address::…` keeps working for downstream callers**. That is the
+/// whole design of this slice: the module moved, the path did not.
+///
+/// A `pub use` of a module re-exports its public items, so `roots::address` and
+/// `roots_core::address` are the *same* module — there is one `Address` type, not
+/// two, and the constants (`KEY_LEN`, `SUBNET_LEN`) come from one place.
+pub use roots_core::address;
+pub mod driver;
 pub mod frame;
 pub mod handshake;
 pub mod link;
@@ -29,8 +40,31 @@ pub mod tree;
 pub mod views;
 pub mod ws;
 
-pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
+// `address` and `error` moved to `roots-core` (no_std, no alloc) and are
+// re-exported here, so **no call site in this crate or in `roots-client`
+// changed**. That is the whole point of slice 1 of the separation: the boundary
+// is real and the diff is zero at the use sites.
+//
+// `error` is re-exported rather than re-wrapped, which means `roots::Error` is
+// `roots_core::Error` — one type, two paths — and that is deliberate. A wrapper
+// enum with `Core(CoreError)` would have been the tidier-looking choice and the
+// worse one: every `?` in every module below would need a `From` conversion, and
+// a caller matching on errors would have to arm both halves. What `roots` adds
+// on top is `Io(std::io::Error)`, and it does that by *extending* the core enum
+// in the one place a crate can: a newtype that keeps the core variants
+// reachable. See `error` below.
 pub use error::Error;
+pub use roots_core::address::{Address, Subnet, addr_for_key, subnet_for_key};
+/// The `no_std` protocol-only error, for callers that need to match on it
+/// without the wrapper's `Io` and `BadUri` arms.
+///
+/// `roots::Error` is a *superset* — it contains this — so a caller reaching for
+/// `CoreError` is usually a caller that wants to name the protocol refusal
+/// specifically. The one place that matters today is `match` patterns, where a
+/// wrapper arm is `Error::Core(CoreError::Timeout)` rather than the
+/// `Error::Timeout` construction shorthand.
+pub use roots_core::error::Error as CoreError;
+
 pub use frame::FrameType;
 pub use handshake::Meta;
 pub use link::{

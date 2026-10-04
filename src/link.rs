@@ -13,7 +13,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::frame::{self, FrameType, MAX_MESSAGE_SIZE};
 use crate::handshake::{HEADER_LEN, Meta};
 
@@ -455,7 +455,7 @@ impl LinkSet {
         if self.send(target, ftype, payload).await? {
             Ok(())
         } else {
-            Err(Error::NoLink)
+            Err(Error::Core(CoreError::NoLink))
         }
     }
 
@@ -471,7 +471,7 @@ impl LinkSet {
     ) -> Result<(), Error> {
         let targets = self.links_to(&peer);
         if targets.is_empty() {
-            return Err(Error::NoLink);
+            return Err(Error::Core(CoreError::NoLink));
         }
         for id in targets {
             self.write(id, ftype, payload).await?;
@@ -627,7 +627,7 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
     } else if let Some(r) = uri.strip_prefix("quic://") {
         (Scheme::Quic, r)
     } else {
-        return Err(Error::UnrecognisedSchema);
+        return Err(Error::Core(CoreError::UnrecognisedSchema));
     };
     let (authority, query) = match rest.split_once('?') {
         Some((a, q)) => (a, q),
@@ -659,7 +659,7 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
                 // (`if len(p) > blake2b.Size`, `link.go:201`), so an escape
                 // that makes it longer is refused here too.
                 if v.len() > crate::handshake::MAX_PASSWORD_LEN {
-                    return Err(Error::PasswordInvalid);
+                    return Err(Error::Core(CoreError::PasswordInvalid));
                 }
                 out.password = v.as_bytes().to_vec();
             }
@@ -669,7 +669,7 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
             "key" => {
                 let raw = hex::decode(v).map_err(|_| Error::PinnedKeyInvalid)?;
                 if raw.len() != KEY_LEN {
-                    return Err(Error::PinnedKeyInvalid);
+                    return Err(Error::Core(CoreError::PinnedKeyInvalid));
                 }
                 let mut key = [0u8; KEY_LEN];
                 key.copy_from_slice(&raw);
@@ -679,7 +679,7 @@ pub fn parse_link_uri(uri: &str) -> Result<(Scheme, PeerUri), Error> {
             "maxbackoff" => {
                 let d = parse_go_duration(v).map_err(|_| Error::MaxBackoffInvalid)?;
                 if d < MIN_MAX_BACKOFF {
-                    return Err(Error::MaxBackoffInvalid);
+                    return Err(Error::Core(CoreError::MaxBackoffInvalid));
                 }
                 out.max_backoff = Some(d);
             }
@@ -758,7 +758,7 @@ where
     let mut header = [0u8; HEADER_LEN];
     stream.read_exact(&mut header).await?;
     if &header[..4] != b"meta" {
-        return Err(Error::InvalidPreamble);
+        return Err(Error::Core(CoreError::InvalidPreamble));
     }
     let body_len = u16::from_be_bytes([header[4], header[5]]) as usize;
     let mut msg = vec![0u8; HEADER_LEN + body_len];
@@ -777,18 +777,18 @@ where
     let theirs = Meta::decode(&msg, &opts.password)?;
     theirs.check()?;
     if theirs.public_key == local_key {
-        return Err(Error::SelfDial);
+        return Err(Error::Core(CoreError::SelfDial));
     }
     if let Some(pin) = opts.pinned_key
         && pin != theirs.public_key
     {
-        return Err(Error::PinnedMismatch);
+        return Err(Error::Core(CoreError::PinnedMismatch));
     }
     if is_inbound
         && !opts.allowed_keys.is_empty()
         && !opts.allowed_keys.contains(&theirs.public_key)
     {
-        return Err(Error::KeyNotAllowed);
+        return Err(Error::Core(CoreError::KeyNotAllowed));
     }
     Ok((
         theirs.public_key,
@@ -830,12 +830,12 @@ pub async fn read_frame_from<S: AsyncRead + Unpin>(
             break;
         }
         if prefix.len() >= 10 {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
     }
     let (len, _) = frame::read_uvarint(&prefix).ok_or(Error::InvalidLength)?;
     if len == 0 || len as usize > MAX_MESSAGE_SIZE {
-        return Err(Error::InvalidLength);
+        return Err(Error::Core(CoreError::InvalidLength));
     }
     let mut body = vec![0u8; len as usize];
     stream.read_exact(&mut body).await.map_err(|e| {
@@ -1353,7 +1353,7 @@ mod tests {
         });
         let uri = format!("tcp://{addr}");
         let res = dial(&uri, &sk, &LinkOptions::default()).await;
-        assert!(matches!(res, Err(Error::SelfDial)));
+        assert!(matches!(res, Err(Error::Core(CoreError::SelfDial))));
         let _ = server.await;
     }
 
@@ -1393,7 +1393,7 @@ mod tests {
         assert!(
             matches!(
                 links.write(absent, FrameType::KeepAlive, &[]).await,
-                Err(Error::NoLink)
+                Err(Error::Core(CoreError::NoLink))
             ),
             "hard send must report the missing link"
         );
@@ -1405,7 +1405,10 @@ mod tests {
             "soft send must report the drop without failing"
         );
         assert!(
-            matches!(links.read_frame(absent).await, Err(Error::NoLink)),
+            matches!(
+                links.read_frame(absent).await,
+                Err(Error::Core(CoreError::NoLink))
+            ),
             "the set's only read path reports a missing link too"
         );
         assert!(
@@ -1789,7 +1792,7 @@ mod tests {
         assert!(
             matches!(
                 links.write(id, FrameType::KeepAlive, &[]).await,
-                Err(Error::NoLink)
+                Err(Error::Core(CoreError::NoLink))
             ),
             "the key is gone, so a later send reports it as missing"
         );

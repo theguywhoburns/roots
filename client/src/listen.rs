@@ -11,7 +11,7 @@
 
 use ed25519_dalek::SigningKey;
 use roots::link::{accept as tcp_accept, listen as tcp_listen};
-use roots::{AnyConn, Error, LinkOptions, Scheme, parse_link_uri};
+use roots::{AnyConn, CoreError, Error, LinkOptions, Scheme, parse_link_uri};
 use tokio::sync::mpsc;
 
 use crate::node::Cmd;
@@ -117,7 +117,14 @@ pub async fn spawn_listeners(
                             // `quic_accept` puts a handshake timeout on the
                             // `accept()` await, so an idle QUIC listener times
                             // out regularly and says nothing when it does.
-                            Err(Error::Timeout) => {}
+                            //
+                            // `Error::Core(CoreError::Timeout)` rather than
+                            // `Error::Timeout`: the latter is an associated
+                            // *constant*, and a constant of a non-structural type
+                            // is not a valid pattern. That spelling is the
+                            // wrapper's intended form for matching, and it says
+                            // visibly that this is the protocol half.
+                            Err(Error::Core(CoreError::Timeout)) => {}
                             Err(e) => failed(name, &addr, &e),
                         }
                     }

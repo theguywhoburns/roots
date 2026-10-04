@@ -8,7 +8,7 @@ use blake2::{Blake2b512, Blake2bMac512, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 
 /// First 4 bytes of every handshake message.
 pub const PREAMBLE: &[u8; 4] = b"meta";
@@ -77,7 +77,7 @@ impl Meta {
 
     pub fn encode(&self, secret: &SigningKey, password: &[u8]) -> Result<Vec<u8>, Error> {
         if password.len() > MAX_PASSWORD_LEN {
-            return Err(Error::PasswordTooLong);
+            return Err(Error::Core(CoreError::PasswordTooLong));
         }
         let mut out = Vec::with_capacity(HEADER_LEN + 20 + KEY_LEN + SIG_LEN);
         out.extend_from_slice(PREAMBLE);
@@ -102,11 +102,11 @@ impl Meta {
     /// Decode a full message (header + body). Mirrors Go's streaming decode.
     pub fn decode(msg: &[u8], password: &[u8]) -> Result<Self, Error> {
         if msg.len() < HEADER_LEN || &msg[..4] != PREAMBLE {
-            return Err(Error::InvalidPreamble);
+            return Err(Error::Core(CoreError::InvalidPreamble));
         }
         let body_len = u16::from_be_bytes([msg[4], msg[5]]) as usize;
         if body_len < SIG_LEN || msg.len() != HEADER_LEN + body_len {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let body = &msg[HEADER_LEN..];
         let (fields, sig) = body.split_at(body.len() - SIG_LEN);
@@ -124,7 +124,7 @@ impl Meta {
             let len = u16::from_be_bytes([rest[2], rest[3]]) as usize;
             rest = &rest[FIELD_HEADER_LEN..];
             if rest.len() < len {
-                return Err(Error::InvalidLength);
+                return Err(Error::Core(CoreError::InvalidLength));
             }
             let (val, tail) = rest.split_at(len);
             match tag {
@@ -141,7 +141,7 @@ impl Meta {
                     meta.priority = val[0];
                 }
                 TAG_MAJOR | TAG_MINOR | TAG_PUBKEY | TAG_PRIORITY => {
-                    return Err(Error::InvalidLength);
+                    return Err(Error::Core(CoreError::InvalidLength));
                 }
                 TAG_VENDOR => {
                     // Cap length for hygiene; overlong vendor falls back to
@@ -154,14 +154,14 @@ impl Meta {
                     meta.features = Some(u32::from_be_bytes([val[0], val[1], val[2], val[3]]));
                 }
                 TAG_FEATURES => {
-                    return Err(Error::InvalidLength);
+                    return Err(Error::Core(CoreError::InvalidLength));
                 }
                 _ => {} // forward-compatible: ignore unknown tags
             }
             rest = tail;
         }
         if !rest.is_empty() {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let hash = keyed_hash(&meta.public_key, password)?;
         let sig = Signature::from_bytes(sig.try_into().map_err(|_| Error::InvalidLength)?);
@@ -174,7 +174,7 @@ impl Meta {
 
     pub fn check(&self) -> Result<(), Error> {
         if self.major != PROTOCOL_MAJOR || self.minor != PROTOCOL_MINOR {
-            return Err(Error::BadVersion(self.major, self.minor));
+            return Err(Error::bad_version(self.major, self.minor));
         }
         Ok(())
     }
@@ -195,7 +195,7 @@ fn push_field(out: &mut Vec<u8>, tag: u16, val: &[u8]) {
 /// so `nil` and `""` interoperate exactly like the Go side.
 fn keyed_hash(public_key: &[u8; KEY_LEN], password: &[u8]) -> Result<Vec<u8>, Error> {
     if password.len() > MAX_PASSWORD_LEN {
-        return Err(Error::PasswordTooLong);
+        return Err(Error::Core(CoreError::PasswordTooLong));
     }
     if password.is_empty() {
         let mut h = Blake2b512::new();
@@ -263,15 +263,18 @@ mod tests {
         let enc = Meta::local(&pk, 0).encode(&sk, b"").unwrap();
         assert!(matches!(
             Meta::decode(b"nope", b""),
-            Err(Error::InvalidPreamble)
+            Err(Error::Core(CoreError::InvalidPreamble))
         ));
         assert!(matches!(
             Meta::decode(&enc[..10], b""),
-            Err(Error::InvalidLength)
+            Err(Error::Core(CoreError::InvalidLength))
         ));
         let mut bad = enc.clone();
         bad[4..6].copy_from_slice(&99u16.to_be_bytes());
-        assert!(matches!(Meta::decode(&bad, b""), Err(Error::InvalidLength)));
+        assert!(matches!(
+            Meta::decode(&bad, b""),
+            Err(Error::Core(CoreError::InvalidLength))
+        ));
     }
 
     #[test]
@@ -284,7 +287,10 @@ mod tests {
             vendor: None,
             features: None,
         };
-        assert!(matches!(m.check(), Err(Error::BadVersion(9, 9))));
+        assert!(matches!(
+            m.check(),
+            Err(Error::Core(CoreError::BadVersion(9, 9)))
+        ));
         assert!(Meta::local(&[0; KEY_LEN], 0).check().is_ok());
     }
 

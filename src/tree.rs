@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::frame::{FrameType, append_uvarint, read_uvarint};
 use crate::link::LinkSet;
 use crate::router::UNKNOWN_LATENCY;
@@ -106,7 +106,7 @@ impl SigRes {
         let (port, m) = read_uvarint(rest).ok_or(Error::InvalidLength)?;
         let rest = &rest[m..];
         if rest.len() < 64 {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut psig = [0u8; 64];
         psig.copy_from_slice(&rest[..64]);
@@ -143,7 +143,7 @@ impl Announce {
 
     pub fn decode_exact(buf: &[u8]) -> Result<Self, Error> {
         if buf.len() < 2 * KEY_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut key = [0u8; KEY_LEN];
         let mut parent = [0u8; KEY_LEN];
@@ -152,7 +152,7 @@ impl Announce {
         let (res, n) = SigRes::decode(&buf[2 * KEY_LEN..])?;
         let rest = &buf[2 * KEY_LEN + n..];
         if rest.len() != 64 {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut sig = [0u8; 64];
         sig.copy_from_slice(rest);
@@ -866,7 +866,7 @@ mod tests {
             .send_req(&mut links, peer)
             .await
             .expect_err("a request for a peer with no link must report it");
-        assert!(matches!(e, Error::NoLink), "got {e:?}");
+        assert!(matches!(e, Error::Core(CoreError::NoLink)), "got {e:?}");
         assert!(
             router.tree.links[&id].sent_at.is_none(),
             "the failed send leaves the clock alone"

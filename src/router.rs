@@ -239,7 +239,7 @@ mod tests {
         assert!(
             matches!(
                 links.write(absent, FrameType::KeepAlive, &[]).await,
-                Err(crate::error::Error::NoLink)
+                Err(crate::error::Error::Core(crate::error::CoreError::NoLink))
             ),
             "hard send must not be swallowed by the counter"
         );

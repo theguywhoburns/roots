@@ -662,16 +662,32 @@ impl Session {
             NextRecv,
         }
         let case = if from_current && to_recv {
+            // The three nonce guards below are `!(a < b)` rather than `a >= b`
+            // **on purpose**, and clippy's `nonminimal_bool` is right that they
+            // are the same thing. They are written this way because Go writes
+            // them this way — `encrypted/session.go:368`, `:377` and `:403`, all
+            // three of them, in the same three-arm switch this mirrors.
+            //
+            // Rewriting them to `>=` would be a mechanical, behaviour-preserving
+            // cleanup that makes the port *less* checkable line by line, which is
+            // the opposite of what the rewrite is for. `AGENTS.md`'s rule is to
+            // mirror the Go function including its quirks and cite `file:line`;
+            // a diff against `session.go` is the review technique for this code,
+            // and three needless differences in three consecutive arms is three
+            // places for a reader to stop and ask.
+            #[allow(clippy::nonminimal_bool)]
             if !(self.recv_nonce < nonce) {
                 return None;
             }
             Case::Current
         } else if from_next && to_send {
+            #[allow(clippy::nonminimal_bool)]
             if !(self.next_send_nonce < nonce) {
                 return None;
             }
             Case::NextSend
         } else if from_next && to_recv {
+            #[allow(clippy::nonminimal_bool)]
             if !(self.next_recv_nonce < nonce) {
                 return None;
             }

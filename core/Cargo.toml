@@ -1,0 +1,62 @@
+# The `no_std` half: wire formats and state machines, with no `std` and no `alloc`.
+#
+# This crate is the *core* of `roots`, not a fork of it. The rule for what
+# belongs here is not "small" or "portable" — it is **does this need to own a
+# buffer, a socket or a clock**. Everything that answers yes stays in `roots`.
+#
+# Two properties are load-bearing here, and they are **not equally enforced** —
+# `lib.rs` has the measurements, so read that before trusting either:
+#
+# * `#![no_std]` (see `lib.rs`) removes `std` from the prelude on **every**
+#   target, so naming it is a compile error. Unconditional. CI builds this
+#   crate, which makes CI the no_std gate with no bare-metal toolchain.
+# * No `alloc` is declared, so `Vec`, `String` and `Box` are absent from the
+#   prelude. This holds until someone writes `extern crate alloc;`, which
+#   re-opens it silently — `unused_extern_crates = "deny"` plus a
+#   `cargo tree -p roots-core -e normal` line in CI are what cover that gap.
+#
+# What that costs, and why it is worth it, is in
+# `docs/plans/no-std-core/00-plan.md`. The short version: the whole
+# cryptographic stack is available here with `default-features = false`
+# (verified against Go's own vectors), so the constraint is entirely about
+# buffer ownership, and buffer ownership is something the caller can supply.
+#
+# The boundary in one line: **`roots-core` never allocates, so it cannot own
+# anything that outlives a call.** Where it needs state, the caller passes it in.
+
+[package]
+name = "roots-core"
+version = "0.1.0"
+edition = "2024"
+description = "no_std, no-alloc core of the roots Yggdrasil implementation: wire formats and state machines, buffer-external and streamed."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "roots_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Every one of these is `default-features = false` **on purpose**, and the
+# reason is specific rather than fashionable: several of them enable `alloc`
+# (or `std`) by default even though nothing in a `#![no_std]` crate can use it.
+#
+# `curve25519-dalek` is the one that matters. Its default feature set is
+# `["alloc", "precomputed-tables", "zeroize"]`, and `alloc` arrives *through*
+# `precomputed-tables`. We need exactly one operation from it —
+# `CompressedEdwardsY::decompress().to_montgomery()`, which is field
+# arithmetic and touches no table — so dropping the defaults costs nothing and
+# removes the `alloc` edge. Verified: `ed_to_curve_pub` in this crate still
+# reproduces the transcribed Go vector, in `src/session.rs`'s test module.
+curve25519-dalek = { version = "4", default-features = false }
+crypto_box = { version = "0.9", default-features = false }
+ed25519-dalek = { version = "2", default-features = false, features = ["rand_core"] }
+blake2 = { version = "0.10", default-features = false }
+sha2 = { version = "0.10", default-features = false }
+# `hex`'s `encode`/`decode` return `String`/`Vec` and are `alloc`-gated. The
+# `*_to_slice` forms used throughout are not, and they are the only ones this
+# crate may call. This is the shape every codec boundary takes.
+hex = { version = "0.4", default-features = false }

@@ -4,7 +4,7 @@
 use std::time::{Duration, Instant};
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::frame::{FrameType, KEEPALIVE_DELAY};
 use crate::link::{Link, LinkSet};
 use crate::peer::PeerState;
@@ -139,7 +139,7 @@ impl Router {
         // Checking it here turns a stale handle into a clear error instead of a
         // panic in the read below.
         if links.peer_of(conn).is_none() {
-            return Err(Error::NoLink);
+            return Err(Error::Core(CoreError::NoLink));
         }
         let partial = crate::address::lookup_key_for_addr(addr);
         let end = tokio::time::Instant::now() + timeout;
@@ -185,7 +185,7 @@ impl Router {
                 return Ok(k);
             }
         }
-        Err(Error::Timeout)
+        Err(Error::Core(CoreError::Timeout))
     }
 
     /// Send `payload` for `dest` now, or hold it until a DHT notify names the
@@ -253,7 +253,7 @@ impl Router {
         payload: Vec<u8>,
     ) -> Result<Route, Error> {
         if links.peer_of(via).is_none() {
-            return Err(Error::NoLink);
+            return Err(Error::Core(CoreError::NoLink));
         }
         // No type byte here. `session_send` is the thing that adds it
         // (`session_send_kind(..., PACKET_TYPE_TRAFFIC, ...)`, `session.rs:400`),
@@ -402,7 +402,13 @@ impl Router {
     /// rule: every peer owns a reader goroutine (`peers.go:228`), so a dead
     /// link cannot abort a live one.
     pub(crate) fn fatal_link_error(links: &LinkSet, e: &Error) -> bool {
-        !matches!(e, Error::Io(_) | Error::NoLink) || links.is_empty()
+        // `is_link` rather than an open-coded match, so that adding an error
+        // variant cannot leave this one behind. It is the whole of what the
+        // old `matches!(e, Error::Io(_) | Error::NoLink)` said, and the
+        // `BadUri`/`BadMaxBackoff` arms in `is_link` are the interesting part:
+        // a URI that will not parse is not a dead link, so a misconfigured peer
+        // must not be redialed forever.
+        !e.is_link() || links.is_empty()
     }
 
     /// Handle one inbound frame: router protocol plus a lazy keepalive

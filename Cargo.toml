@@ -1,6 +1,37 @@
 [workspace]
-members = ["client"]
+members = ["client", "core"]
 resolver = "3"
+
+# Workspace lint groups, so a rule is written once and every member opts in.
+#
+# `roots-core` is why this section exists at all: it carries rules the other two
+# members must not inherit, because they legitimately use `alloc`. Naming them
+# here is what stops the no-alloc promise from being a convention that decays.
+[workspace.lints.rust]
+# An allocation in `roots-core` is a bug, and the compiler does **not** catch it
+# on its own. `#![no_std]` removes `std` from the prelude, so naming `std::` is a
+# compile error on every target — but writing `extern crate alloc;` re-opens the
+# door and `alloc::vec::Vec` then compiles silently. Measured, in that order.
+#
+# `unused_extern_crates` is the enforcement rather than the allowance: it fires on
+# an `extern crate alloc;` that nothing uses, and once something *does* use it,
+# `cargo tree -p roots-core -e normal` is the second gate — the same check
+# AGENTS.md already prescribes to keep `smoltcp` and `tun` out of the library.
+# Denied in all three crates, because an unused extern crate is never intentional.
+unused_extern_crates = "deny"
+# Every public item documented. In a crate whose entire purpose is to be a
+# boundary, an undocumented item is an unexamined one, and the other two members
+# already document nearly everything, so this costs almost nothing.
+missing_docs = "warn"
+# `unsafe` in a crate that performs no I/O of its own would be a surprise in every
+# direction: a caller cannot audit a `no_std` core it does not compile.
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# The `Vec`-returning APIs this crate is being refactored away from. Catches the
+# case where a `Vec` was only ever built in order to be `.as_slice()`d, which is
+# the shape most of them have.
+useless_vec = "deny"
 
 [package]
 name = "roots"
@@ -14,6 +45,10 @@ path = "src/lib.rs"
 [dependencies]
 tokio = { version = "1", features = ["net", "time", "macros", "rt-multi-thread", "io-util"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+# The `no_std` half. No default-features here on purpose: `curve25519-dalek`'s
+# defaults pull `alloc` in through `precomputed-tables`, and nothing in this
+# workspace needs a table. See `docs/plans/no-std-core/00-plan.md`.
+roots-core = { path = "core" }
 blake2 = "0.10"
 thiserror = "2"
 hex = "0.4"

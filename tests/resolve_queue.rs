@@ -30,7 +30,7 @@ use ed25519_dalek::SigningKey;
 use roots::address::{KEY_LEN, addr_for_key, subnet_for_key};
 use roots::driver::Route;
 use roots::link::{AnyConn, LinkId, LinkOptions, LinkSet, PeerConn};
-use roots::{Address, Error, Router};
+use roots::{Address, CoreError, Error, Router};
 
 /// One serve slice per node, as in `tests/mesh3.rs`: the nodes take turns on
 /// the runtime, so every link is serviced well inside the ~4 s peer read
@@ -263,7 +263,7 @@ where
                     // follows the notify picks its own next hop, so the handle
                     // is a liveness check and nothing more.
                     let Some(id) = set.ids().first().copied() else {
-                        let _ = reply.send(Err(Error::NoLink));
+                        let _ = reply.send(Err(Error::Core(CoreError::NoLink)));
                         continue;
                     };
                     let _ = reply.send(router.send_or_resolve(&mut set, id, &dest, payload).await);
@@ -548,7 +548,7 @@ async fn send_or_resolve_refuses_a_link_the_set_does_not_hold() {
         )
         .await
         .expect_err("a link that is not in the set must be refused");
-    assert!(matches!(err, Error::NoLink), "got {err:?}");
+    assert!(matches!(err, Error::Core(CoreError::NoLink)), "got {err:?}");
     assert!(
         router.pending_routes().is_empty(),
         "a refused send must not queue anything"

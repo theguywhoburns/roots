@@ -13,7 +13,7 @@ yet.
 All three were answered by building probe crates, not by reading documentation.
 Each is reproducible with the commands shown.
 
-### 1. Can `#![no_std]` be enforced without a cross toolchain? Yes.
+### 1. Can `#![no_std]` be enforced without a cross toolchain? Yes — but only half of it is free.
 
 Only the host target is installed here (`rustc --print sysroot` lists
 `x86_64-unknown-linux-gnu` and nothing else), so the obvious worry is that a
@@ -32,19 +32,47 @@ pub fn bad() -> std::collections::HashMap<u8, u8> { std::collections::HashMap::n
 error[E0433]: cannot find module or crate `std` in this scope
 ```
 
-…on the **host** target, no cross toolchain. And `alloc` is not smuggled in by
-the prelude either — `Vec` and `String` are simply absent, so an unwanted
-allocation is a compile error rather than a review comment:
+…on the **host** target, no cross toolchain. `Vec` and `String` are likewise
+absent from the prelude, so an unwanted allocation is a compile error rather than
+a review comment.
 
-```rust
-#![no_std]
-pub fn sneaky() -> Vec<u8> { Vec::new() }
-// error[E0425]: cannot find type `Vec` in this scope
-```
+**But the no-*alloc* half is weaker than that, and the first version of this
+document overstated it.** Three probes, in order:
 
-**Consequence for CI:** add a `roots-core` build to the existing workflow and it
-*is* the no_std gate. No new toolchain, no new job, no network. The failure mode
-is a compile error on a line someone wrote, which is the cheapest possible gate.
+| what | result |
+|---|---|
+| `no_std`, bare `Vec` | 3 errors — `Vec` not in scope |
+| `no_std`, `std::` path | 3 errors — `std` not in scope |
+| `no_std` + `extern crate alloc;` + `alloc::vec::Vec` | **0 errors — compiles** |
+
+That third row is the hole. One line — `extern crate alloc;` — re-opens
+everything the first two rows closed, and it compiles silently. So:
+
+- **`no_std` is compiler-enforced**, unconditionally, forever.
+- **no-`alloc` is enforced only while nobody writes `extern crate alloc;`.**
+
+Two gates close the second one, and neither is a lint:
+
+1. `unused_extern_crates = "deny"` in `[workspace.lints.rust]`. An
+   `extern crate alloc;` that nothing uses is denied — which covers the realistic
+   case, someone importing it while building a codec. Once something *does* use
+   it the lint is silent, by design: it is an allowlist lint, not a policy.
+2. `cargo tree -p roots-core -e normal` in CI. `alloc` cannot appear in a
+   dependency edge without somebody having enabled it, so this catches the
+   deliberate case that the lint cannot. It is the same check `AGENTS.md`
+   already prescribes to keep `smoltcp` and `tun` out of the library, so it is
+   not a new habit.
+
+What would *not* work, and why it is worth saying: building for a bare-metal
+target does not help either. `alloc` exists as a crate on every target; a
+missing global allocator only fails at link time, and a library is an rlib, so
+nothing links. There is no rustc flag for "no allocator, please" — the property
+is a code-review property wearing a compile-error costume, and the costume only
+covers one of the two doors.
+
+**Consequence for CI:** add a `roots-core` build and it *is* the no_std gate —
+no new job, no toolchain, no network. Add the `cargo tree` line and the no-alloc
+gate is two commands rather than a review.
 
 ### 2. Do the crypto dependencies survive `default-features = false`? Yes.
 

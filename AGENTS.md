@@ -48,8 +48,11 @@ wire; there is no release process, and CI is three local commands.
 ## Commands
 
 - `cargo build --workspace`; run the node: `cargo run -q -p roots-client -- [peer-uri] [hold_secs] [resolve-ipv6]`
+- `cargo build -p roots-core` is the `no_std` gate (see Boundaries); the
+  workspace build already covers it, so this only matters when you want the
+  error on its own.
   (plain `cargo run` from the root **fails**: that package is lib-only).
-- `cargo test --workspace` — ~25 s, 181 tests, loopback only.
+- `cargo test --workspace` — ~25 s, 204 tests, loopback only.
   Narrow it: `cargo test -p roots --lib <filter>`, `cargo test -p roots --test mesh3`,
   `cargo test -p roots-client --test peer_rows -- --nocapture`.
 - `cargo test -p roots --test mesh_ping -- --ignored --nocapture` — live, needs
@@ -85,6 +88,15 @@ wire; there is no release process, and CI is three local commands.
 
 ## Boundaries
 
+- **`core/` is `roots-core`: `no_std`, no `alloc`.** It holds the wire formats
+  and the state machines that need no I/O. The rule is **does this need to own a
+  buffer, a socket or a clock** — not size, not elegance. Check it mechanically:
+  `cargo tree -p roots-core -e normal` must show no `alloc` edge, and `grep -rn
+  "extern crate alloc" core/src/` must be empty. `#![no_std]` makes `std::` a
+  compile error on the host target, so `cargo build -p roots-core` **is** the
+  no_std gate with no bare-metal toolchain. The no-alloc half is weaker and the
+  gap is documented in `core/src/lib.rs`; do not believe a comment about it,
+  believe the two commands. Plan: `docs/plans/no-std-core/00-plan.md`.
 - The **library** talks wire and owns state: crypto, `meta`, the five
   transports, framing, tree/DHT/bloom/session/proto, read-only snapshots. It
   never prints, never opens a TUN, never serves admin, and **never builds a
@@ -92,6 +104,18 @@ wire; there is no release process, and CI is three local commands.
   `grep -n "mod tests" src/*.rs` (every `Router::new` in `src/` must sit
   *below* its file's test module) and `cargo tree -p roots -e normal` (must
   list no `smoltcp`, `tun` or `serde_json`).
+- **`roots::Error` is a wrapper, `roots_core::Error` is not.** Core owns the
+  protocol refusals; the wrapper adds `Io`, `BadUri` and `BadMaxBackoff`, which
+  need a system to happen. The core's 16 variants are re-exposed on the wrapper
+  as **associated constants** so `Err(Error::InvalidLength)` still compiles at
+  ~120 sites — but a constant is not a pattern, so a `match` must write
+  `Error::Core(CoreError::InvalidLength)`. That asymmetry is deliberate; two
+  sites already use the long form.
+- A core error **cannot** be a `std::error::Error`: `core::error::Error` is
+  unstable, `std` is unreachable from `no_std`, and the orphan rule blocks the
+  wrapper from supplying it. So `roots::Error::Core(..)` is the way in, and its
+  `source()` stops there. Do not "fix" this by adding a `std` feature to
+  `roots-core`.
 - **`client/`** is the only package that drives a `Router`. `Node::run` in
   `client/src/node.rs` is the one production loop: it owns `Router` + `LinkSet` +
   the mailbox, so there are no locks — and therefore **nothing off-task may

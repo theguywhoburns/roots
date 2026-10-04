@@ -5,7 +5,7 @@
 //! terminated" comment is stale: `wireAppendPath` always appends the zero.)
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::frame::{append_path, append_uvarint, split_path};
 use crate::link::LinkSet;
 
@@ -36,7 +36,7 @@ impl Traffic {
         let (from, m) = split_path(&buf[n..]).ok_or(Error::InvalidLength)?;
         let rest = &buf[n + m..];
         if rest.len() < 2 * KEY_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut source = [0u8; KEY_LEN];
         let mut dest = [0u8; KEY_LEN];

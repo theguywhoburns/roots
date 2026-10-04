@@ -4,7 +4,7 @@
 //! Each frame: `uvarint(len(type + payload))` + `u8 type` + payload.
 //! A keepalive is just `[0x01, 0x01]`.
 
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 
 /// Max decoded frame body (type + payload). Matches yggdrasil-go's
 /// `WithPeerMaxMessageSize(65535 * 2)`.
@@ -61,7 +61,7 @@ impl FrameType {
             7 => Ok(Self::PathNotify),
             8 => Ok(Self::PathBroken),
             9 => Ok(Self::Traffic),
-            _ => Err(Error::InvalidLength),
+            _ => Err(Error::Core(CoreError::InvalidLength)),
         }
     }
 }
@@ -108,7 +108,7 @@ pub const fn wire_len(payload_len: usize) -> u64 {
 /// Split a full frame body (after the length prefix) into type + payload.
 pub fn decode_body(body: &[u8]) -> Result<(FrameType, &[u8]), Error> {
     if body.is_empty() || body.len() > MAX_MESSAGE_SIZE {
-        return Err(Error::InvalidLength);
+        return Err(Error::Core(CoreError::InvalidLength));
     }
     Ok((FrameType::from_byte(body[0])?, &body[1..]))
 }

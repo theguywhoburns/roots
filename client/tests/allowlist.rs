@@ -10,7 +10,7 @@
 
 use ed25519_dalek::SigningKey;
 use roots::link::{accept, listen};
-use roots::{Client, Error};
+use roots::{Client, CoreError, Error};
 use roots_client::config::Config;
 
 fn public_hex(key: &SigningKey) -> String {
@@ -51,7 +51,7 @@ async fn allowed_public_keys_gate_inbound_links_only() {
         )
     };
     assert!(
-        matches!(inbound, Err(Error::KeyNotAllowed)),
+        matches!(inbound, Err(Error::Core(CoreError::KeyNotAllowed))),
         "an unlisted peer must be refused with KeyNotAllowed"
     );
     assert!(

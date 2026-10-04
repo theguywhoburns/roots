@@ -1078,6 +1078,7 @@ dependencies = [
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "roots-core",
  "rustls",
  "sha2",
  "smoltcp",
@@ -1101,6 +1102,18 @@ dependencies = [
  "socket2",
  "tokio",
  "tun",
+]
+
+[[package]]
+name = "roots-core"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "crypto_box",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "sha2",
 ]
 
 [[package]]

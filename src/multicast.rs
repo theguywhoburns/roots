@@ -16,7 +16,7 @@ use blake2::digest::{KeyInit, Mac};
 use blake2::{Blake2b512, Blake2bMac512, Digest};
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 
 /// Group the beacons go to. Go hardcodes it in `New` and never reads it from
 /// config, so it is a constant here too (`multicast.go:71`).
@@ -79,13 +79,13 @@ impl Advertisement {
     ///   comparison in [`Multicast::receive`].
     pub fn decode(b: &[u8]) -> Result<Self, Error> {
         if b.len() < HEADER_LEN {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let mut pubkey = [0u8; KEY_LEN];
         pubkey.copy_from_slice(&b[4..4 + KEY_LEN]);
         let hash_len = u16::from_be_bytes([b[6 + KEY_LEN], b[7 + KEY_LEN]]) as usize;
         if b.len() < HEADER_LEN + hash_len {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         Ok(Self {
             major: u16::from_be_bytes([b[0], b[1]]),

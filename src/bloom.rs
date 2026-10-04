@@ -5,7 +5,7 @@
 //! Bit mapping matches `bitset`: location `L` → word `L >> 6`, bit `1 << (L & 63)`.
 
 use crate::address::KEY_LEN;
-use crate::error::Error;
+use crate::error::{CoreError, Error};
 use crate::link::LinkSet;
 
 /// Bits in the filter.
@@ -218,7 +218,7 @@ impl BloomFilter {
 
     pub fn decode_exact(buf: &[u8]) -> Result<Self, Error> {
         if buf.len() < 2 * BLOOM_FLAGS {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         let (flags0, rest) = buf.split_at(BLOOM_FLAGS);
         let (flags1, mut rest) = rest.split_at(BLOOM_FLAGS);
@@ -227,12 +227,12 @@ impl BloomFilter {
             let f0 = flags0[idx / 8] & (0x80 >> (idx % 8)) != 0;
             let f1 = flags1[idx / 8] & (0x80 >> (idx % 8)) != 0;
             match (f0, f1) {
-                (true, true) => return Err(Error::InvalidLength),
+                (true, true) => return Err(Error::Core(CoreError::InvalidLength)),
                 (true, false) => *w = 0,
                 (false, true) => *w = u64::MAX,
                 (false, false) => {
                     if rest.len() < 8 {
-                        return Err(Error::InvalidLength);
+                        return Err(Error::Core(CoreError::InvalidLength));
                     }
                     *w = u64::from_be_bytes(rest[..8].try_into().unwrap());
                     rest = &rest[8..];
@@ -240,7 +240,7 @@ impl BloomFilter {
             }
         }
         if !rest.is_empty() {
-            return Err(Error::InvalidLength);
+            return Err(Error::Core(CoreError::InvalidLength));
         }
         Ok(Self { words })
     }
