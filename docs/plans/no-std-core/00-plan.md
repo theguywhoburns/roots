@@ -260,15 +260,36 @@ compiler rather than by a test, and it de-risks the dependency question (Q2)
 before any state is touched.
 
 **Slice 2 — the buffer-external codec pass, still inside `roots`.**
-`Vec<u8> -> Vec<u8>` becomes `(&mut [u8]) -> usize` for every codec, with the
-wrapper owning the scratch buffer. Do this *before* the crate split so the diff
-is mechanical and every wire test can run against both shapes at once. Doing it
-across a crate boundary and a signature change simultaneously would make a
+`Vec<u8> -> Vec<u8>` becomes `(&mut [u8]) -> Result<usize>` for every codec, with
+the wrapper owning the scratch buffer. Do this *before* the crate split so the
+diff is mechanical and every wire test can run against both shapes at once. Doing
+it across a crate boundary and a signature change simultaneously would make a
 failure ambiguous between the two.
 
 *Why second:* this is the bulk of the mechanical work and it is where the wire
 vectors keep us honest. A codec regression here is caught by
 `tests/go_vectors.rs` — real Go bytes — which is the strongest oracle available.
+
+**Done so far (2026-10-05):** `frame::encode_frame_to`, `Traffic::encode_to`
+and `BloomFilter::encode_to`, each with the allocating form as a thin wrapper,
+plus `Traffic::encoded_len`. 9 of 9 mutants killed across the three.
+
+**Not done, and it is not the same job:** the `bytes_for_sig` family
+(`SigReq`, `SigRes`, `NotifyInfo`) and `Meta::encode`. These are *preimages*, not
+frames: their output goes straight into `ed25519_dalek::sign`, which wants a
+contiguous `&[u8]`. So making them buffer-external means a scratch buffer has to
+outlive the call into `seal`/`sign`, which changes **their** signatures rather
+than just adding an output parameter — and for `NotifyInfo` the preimage contains
+a path list, so the capacity question has to be answered before there is a bound
+to write into. That is the same question as the read-only tables, so it belongs
+with them rather than here.
+
+`Meta::encode` is genuinely deferred rather than deferred-by-accident: it seals
+with a keyed membership hash whose length depends on the password, so its output
+size is not a constant and a caller cannot size a buffer without either
+computing the hash first or accepting a documented maximum. The maximum is 64
+bytes of hash, so it is doable — but it belongs with the `GroupPassword` work in
+`TODO.md`, which changes the same function's inputs.
 
 **Slice 3 — `Clock`.**
 `Instant` becomes a core value type; `std::time::Instant` becomes the wrapper's

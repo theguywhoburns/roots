@@ -194,25 +194,71 @@ impl BloomFilter {
         }
     }
 
-    pub fn encode(&self) -> Vec<u8> {
+    /// Longest filter this module will ever encode: both flag blocks, plus one data
+    /// word per 64-bit word.
+    ///
+    /// An upper bound rather than a typical size — the wire format is
+    /// variable-length, and a filter over a real routing table is usually a few
+    /// dozen data words rather than 128. It is also what a `no_std` caller needs,
+    /// and it is exact: every word is either flagged all-zero, flagged all-ones,
+    /// or emitted as eight bytes, so nothing can exceed it.
+    pub const MAX_ENCODED_LEN: usize = 2 * BLOOM_FLAGS + 8 * BLOOM_WORDS;
+
+    /// Encode into `out`, returning the byte count.
+    ///
+    /// The layout is the format's own: 16 flag bytes for all-zero words, 16 for
+    /// all-ones words, then the remaining words as big-endian u64s in index
+    /// order. Flags-then-data is not a choice — `decode_exact` reads the two
+    /// blocks at fixed offsets, so a swap parses "successfully" and then puts
+    /// every data word in the wrong place. `the_flag_layout_is_flags_then_data`
+    /// is what holds that.
+    ///
+    /// `out` too small is an error rather than a truncation, and this is the frame
+    /// where that matters most. A short bloom filter is not a protocol error at
+    /// all: the truncated bytes still parse, still answer "no", and so **silently
+    /// drop every lookup that should have been forwarded**. Nothing on the wire
+    /// distinguishes it from a peer with nothing to say.
+    pub fn encode_to(&self, out: &mut [u8]) -> Result<usize, Error> {
+        // Count first, so `out` is checked once rather than incrementally. Two
+        // passes over 128 words is nothing next to the socket write this precedes.
+        let mut data_words = 0usize;
+        for w in self.words.iter() {
+            if *w != 0 && *w != u64::MAX {
+                data_words += 1;
+            }
+        }
+        let need = 2 * BLOOM_FLAGS + 8 * data_words;
+        if out.len() < need {
+            return Err(Error::Core(CoreError::InvalidLength));
+        }
         let mut flags0 = [0u8; BLOOM_FLAGS];
         let mut flags1 = [0u8; BLOOM_FLAGS];
-        let mut keep = Vec::new();
         for (idx, w) in self.words.iter().enumerate() {
             if *w == 0 {
                 flags0[idx / 8] |= 0x80 >> (idx % 8);
             } else if *w == u64::MAX {
                 flags1[idx / 8] |= 0x80 >> (idx % 8);
-            } else {
-                keep.push(*w);
             }
         }
-        let mut out = Vec::with_capacity(2 * BLOOM_FLAGS + 8 * keep.len());
-        out.extend_from_slice(&flags0);
-        out.extend_from_slice(&flags1);
-        for w in keep {
-            out.extend_from_slice(&w.to_be_bytes());
+        out[..BLOOM_FLAGS].copy_from_slice(&flags0);
+        out[BLOOM_FLAGS..2 * BLOOM_FLAGS].copy_from_slice(&flags1);
+        let mut at = 2 * BLOOM_FLAGS;
+        for w in self.words.iter() {
+            if *w != 0 && *w != u64::MAX {
+                out[at..at + 8].copy_from_slice(&w.to_be_bytes());
+                at += 8;
+            }
         }
+        debug_assert_eq!(at, need, "the two passes disagree on the length");
+        Ok(at)
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![0u8; Self::MAX_ENCODED_LEN];
+        let n = self
+            .encode_to(&mut out)
+            .expect("MAX_ENCODED_LEN is the upper bound");
+        out.truncate(n);
         out
     }
 
@@ -518,6 +564,74 @@ mod tests {
             b.words.iter().any(|w| *w != 0 && *w != u64::MAX),
             "Go's filter has data words, which is the whole reason for capturing it"
         );
+    }
+
+    /// The buffer form must reproduce the **captured Go filter**.
+    ///
+    /// `encode_to` is a second implementation of the layout, and the captured
+    /// `GO_BLOOM` is the only independent witness that it is the right one — a
+    /// round trip through our own decoder would agree with a wrong encoder
+    /// forever.
+    ///
+    /// The captured filter is 96 bytes with 8 data words, which is the interesting
+    /// case: not empty (so the flag positions are visible) and not full (so the
+    /// data section is present). An empty filter would pass even with the two
+    /// blocks swapped and the data section omitted entirely.
+    #[test]
+    fn the_buffer_form_reproduces_the_captured_go_filter() {
+        let raw = hexbytes(GO_BLOOM);
+        let b = BloomFilter::decode_exact(&raw).expect("decode Go's filter");
+        let mut buf = vec![0u8; BloomFilter::MAX_ENCODED_LEN];
+        let n = b
+            .encode_to(&mut buf)
+            .expect("MAX_ENCODED_LEN is the upper bound");
+        assert_eq!(
+            hex::encode(&buf[..n]),
+            GO_BLOOM,
+            "the buffer encoder must produce Go's bytes, not ours"
+        );
+        assert_eq!(n, raw.len(), "and the same length");
+
+        // The short-buffer refusal, which matters more here than on any other
+        // frame: a truncated filter still parses and still answers "no", so it
+        // drops every lookup it should have forwarded and nothing says so.
+        for short in 1..=n {
+            let mut small = vec![0u8; n - short];
+            assert!(
+                b.encode_to(&mut small).is_err(),
+                "a buffer {short} byte(s) short must be refused"
+            );
+        }
+    }
+
+    /// `MAX_ENCODED_LEN` must be big enough for the densest legal filter.
+    ///
+    /// The densest case for the bound is a filter where *no* word is all-zero or
+    /// all-ones, so every one of the 128 words is emitted as eight data bytes. A
+    /// real routing table never produces that, but an arbitrary caller can
+    /// construct it directly, and the bound is a promise to callers rather than a
+    /// statistic about ours.
+    ///
+    /// The round trip at the end is the half that matters: it shows the bound is
+    /// not merely large enough to *write* but large enough to be self-consistent,
+    /// which is what a stale constant would break.
+    #[test]
+    fn the_bloom_bound_covers_the_densest_filter() {
+        let mut b = BloomFilter::new();
+        for w in b.words.iter_mut() {
+            *w = 1; // neither 0 nor u64::MAX, so every word becomes a data word
+        }
+        let mut buf = vec![0u8; BloomFilter::MAX_ENCODED_LEN];
+        let n = b
+            .encode_to(&mut buf)
+            .expect("the bound is exact, not merely generous");
+        assert_eq!(
+            n,
+            2 * BLOOM_FLAGS + 8 * BLOOM_WORDS,
+            "every word emitted as data, which is the bound"
+        );
+        let back = BloomFilter::decode_exact(&buf[..n]).expect("round trip");
+        assert_eq!(back.words, b.words);
     }
 
     /// The bit order *within* a flag byte, against the installed binary.
