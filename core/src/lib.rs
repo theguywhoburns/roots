@@ -92,10 +92,12 @@
 pub mod address;
 pub mod clock;
 pub mod error;
+pub mod table;
 
 pub use address::{Address, Subnet, addr_for_key, subnet_for_key};
 pub use clock::{Clock, FnClock, Instant};
 pub use error::Error;
+pub use table::{Fnv, Table, TableFull};
 
 /// The crate version, for `getSelf`-style reporting.
 ///

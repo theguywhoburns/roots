@@ -52,7 +52,7 @@ wire; there is no release process, and CI is three local commands.
   workspace build already covers it, so this only matters when you want the
   error on its own.
   (plain `cargo run` from the root **fails**: that package is lib-only).
-- `cargo test --workspace` — ~25 s, 225 tests, loopback only.
+- `cargo test --workspace` — ~25 s, 236 tests, loopback only.
   Narrow it: `cargo test -p roots --lib <filter>`, `cargo test -p roots --test mesh3`,
   `cargo test -p roots-client --test peer_rows -- --nocapture`.
 - `cargo test -p roots --test mesh_ping -- --ignored --nocapture` — live, needs
@@ -116,6 +116,16 @@ wire; there is no release process, and CI is three local commands.
   wrapper from supplying it. So `roots::Error::Core(..)` is the way in, and its
   `source()` stops there. Do not "fix" this by adding a `std` feature to
   `roots-core`.
+- **`roots_core::table` is a fixed-capacity map with three slot states, and the
+  third one is not optional.** A tombstone must be distinguishable from a
+  never-used slot: an empty slot terminates a probe chain, so conflating them
+  means a `remove` silently loses every key that hashed past it — a key nobody
+  removed, just unfindable. `insert` returns `Result<_, TableFull>` and refuses
+  **without writing**; `remove` of an absent key leaves nothing behind. It is
+  `Copy`-constrained because `[None; N]` needs `Copy` and `[Option<T>; N]: Default`
+  does not exist, so it can hold `bool` and `Instant` but **not** a value with a
+  `Vec` in it — which is why `tree.infos` and `pathfind.rumors` need the
+  caller-owned design instead.
 - **Time is a stored value, not a callback.** `roots_core::clock::Instant` is a
   `u64` of **nanoseconds** from an arbitrary process-local epoch, because
   `PathEntry::deadline`, `LinkState::srrt` and `Session::rotated_at` are all

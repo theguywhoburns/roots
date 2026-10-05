@@ -344,7 +344,7 @@ One design constraint surfaced and is worth keeping: `FnClock` takes an `Fn`, no
 `&self` while consulting time. A fake clock that advanced only by handing back
 `&mut` would be unusable in exactly the places it is needed.
 
-**Slice 4 — the read-mostly tables.**
+**Slice 4 — the read-only tables.**
 `tree.infos`, `tree.deadlines`, `pathfind.rumors`, `bloom.on_tree`. Fixed
 capacity, documented overflow, Go-cited. `tests/mesh3.rs` is the safety net here
 — it is the only test that exercises convergence, and AGENTS.md already warns it
@@ -352,6 +352,38 @@ is timing-sensitive, so **one suite at a time**.
 
 *Why fourth:* these have benign overflow, so they are the right place to learn
 the table API before the dangerous ones.
+
+**Done (2026-10-05):** `roots_core::table` — a fixed-capacity open-addressed map,
+no allocation and no `unsafe`, with `insert` returning `Result<_, TableFull>`
+because the correct response to overflow differs per table. 4 of 4 mutants
+killed. **No caller migrated yet**; `bloom.on_tree` is the proving instance and is
+slice 6 work, for the same reason `Clock` was.
+
+**Two bugs the tests caught, both in the deletion path, and both silent:**
+
+- **A tombstone and an empty slot cannot be the same value.** My first version
+  stored `Option<(K, V)>` and set it to `None` on delete, so a probe could not tell
+  "this slot is free" from "this slot held something that is gone" — and an empty
+  slot terminates a probe chain, so deleting a key silently lost every key hashed
+  past it. That is the classic open-addressing deletion bug, arrived at by writing
+  the natural thing. It now has three explicit states.
+- **A completely full table must still use a tombstone.** With no never-used slot,
+  the probe loop never reached the arm that reuses one, so `insert` returned
+  `TableFull` while a free slot sat in the table. A churn-heavy caller — a peer
+  flapping on and off the tree — would have filled the table with tombstones and
+  then been refused forever.
+
+**`insert` must refuse *without writing*, and `remove` of an absent key must not
+leave a tombstone.** Both are "no-op" properties that a caller retrying on
+`TableFull` depends on, and neither is the default behaviour.
+
+**The `Copy` bound is measured, not chosen, and it decides slice 5.** An inline
+table must initialise every slot, and there is no `no_std` way to do that without
+`Copy`: `[None; N]` requires it and `[Option<T>; N]: Default` does not exist.
+So this table can hold `on_tree` (`bool`) and `deadlines` (`Instant`), and
+**cannot** hold `tree.infos` or `pathfind.rumors`, whose values contain a `Vec`.
+Those need the caller-owned design — and the reason is a trait bound, not an
+overflow policy, which is a sharper reason than the one this plan originally gave.
 
 **Slice 5 — the caller-owned tables.**
 `tree.peers`, `session.sessions`, `pathfind.entries`. Wrapper keeps `HashMap`,
