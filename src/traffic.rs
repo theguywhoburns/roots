@@ -6,8 +6,58 @@
 
 use crate::address::KEY_LEN;
 use crate::error::{CoreError, Error};
-use crate::frame::{append_path, append_uvarint, split_path};
+use crate::frame::{split_path, write_uvarint};
 use crate::link::LinkSet;
+
+/// The parts of a traffic frame with no length variation: the two 32-byte keys.
+///
+/// The paths contribute a terminator each *on top of* their ports, the watermark
+/// is a uvarint of any width, and the payload is whatever the session put in the
+/// frame — so all three are counted in [`Traffic::encoded_len`] rather than
+/// folded into a constant.
+const _: () = {
+    // A path is at minimum its terminator, so the smallest legal frame is two
+    // terminators, two keys and a one-byte watermark. If this constant ever
+    // exceeds that, `encoded_len` is wrong in the direction that over-allocates,
+    // which is safe; if it is *below* `2 * KEY_LEN` the frame cannot hold its
+    // own keys. Assert the floor rather than the ceiling.
+    assert!(Traffic::FIXED_LEN >= 2 * KEY_LEN);
+};
+
+/// Bytes a zero-terminated port list occupies: each port as a uvarint, plus the
+/// terminator.
+///
+/// The layout is Go's `wireAppendPath` (`network/wire.go:80-86`): ports as
+/// uvarints, then a **zero terminator**, unconditionally. Go's own comment in
+/// `traffic.go` says "not zero terminated" and is stale — the code has always
+/// appended the zero, and a decoder that skipped it would desynchronise on the
+/// second path.
+fn path_len(path: &[u64]) -> usize {
+    path.iter().map(|p| uvarint_len(*p)).sum::<usize>() + 1
+}
+
+/// uvarint length of one value.
+fn uvarint_len(v: u64) -> usize {
+    let mut n = 1;
+    let mut rest = v >> 7;
+    while rest != 0 {
+        n += 1;
+        rest >>= 7;
+    }
+    n
+}
+
+/// Write a zero-terminated port list into `out`.
+///
+/// `out` is assumed large enough; [`Traffic::encode_to`] sizes it with
+/// [`path_len`].
+fn write_path(out: &mut [u8], path: &[u64]) {
+    let mut at = 0;
+    for p in path {
+        at += write_uvarint(&mut out[at..], *p);
+    }
+    out[at] = 0;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Traffic {
@@ -20,14 +70,65 @@ pub struct Traffic {
 }
 
 impl Traffic {
+    /// The fixed part of an encoded traffic frame: two path terminators, the two
+    /// keys, and the watermark's uvarint.
+    ///
+    /// Exists so a caller can size one buffer for `encode_to` without doing
+    /// arithmetic that has to be kept in step with the layout. The paths and
+    /// payload are variable, so this is a *lower* bound and the caller adds them.
+    pub const FIXED_LEN: usize = 2 * KEY_LEN;
+
+    /// Bytes `encode_to` will write, exactly.
+    ///
+    /// Computed rather than a constant because the two paths, the watermark and
+    /// the payload are all variable-length. A caller that sizes a buffer with a
+    /// stale constant gets a silent truncation, and a `debug_assert` inside
+    /// `encode_to` is not a check a `no_std` caller gets to keep.
+    pub fn encoded_len(&self) -> usize {
+        path_len(&self.path)
+            + path_len(&self.from)
+            + Self::FIXED_LEN
+            + uvarint_len(self.watermark)
+            + self.payload.len()
+    }
+
+    /// Encode into `out`, returning the byte count.
+    ///
+    /// The allocating [`encode`](Self::encode) is a wrapper around this, and this
+    /// is what a `no_std` caller uses. `out` too small is an error rather than a
+    /// truncation, for the reason given on [`frame::encode_frame_to`]: a
+    /// truncated traffic frame leaves the far end waiting for bytes that never
+    /// come, and the link times out with nothing in the log.
+    pub fn encode_to(&self, out: &mut [u8]) -> Result<usize, Error> {
+        let need = self.encoded_len();
+        if out.len() < need {
+            return Err(Error::Core(CoreError::InvalidLength));
+        }
+        let mut at = 0usize;
+        // Written out rather than looped, because the two paths must land in
+        // order and threading `&mut &mut [u8]` through a helper would be harder
+        // to read than the six lines it saves.
+        write_path(&mut out[at..], &self.path);
+        at += path_len(&self.path);
+        write_path(&mut out[at..], &self.from);
+        at += path_len(&self.from);
+        out[at..at + KEY_LEN].copy_from_slice(&self.source);
+        at += KEY_LEN;
+        out[at..at + KEY_LEN].copy_from_slice(&self.dest);
+        at += KEY_LEN;
+        at += write_uvarint(&mut out[at..], self.watermark);
+        out[at..at + self.payload.len()].copy_from_slice(&self.payload);
+        at += self.payload.len();
+        debug_assert_eq!(at, need, "encoded_len and encode_to disagree");
+        Ok(at)
+    }
+
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        append_path(&mut out, &self.path);
-        append_path(&mut out, &self.from);
-        out.extend_from_slice(&self.source);
-        out.extend_from_slice(&self.dest);
-        append_uvarint(&mut out, self.watermark);
-        out.extend_from_slice(&self.payload);
+        let mut out = vec![0u8; self.encoded_len()];
+        let n = self
+            .encode_to(&mut out)
+            .expect("encoded_len sizes the buffer");
+        debug_assert_eq!(n, out.len());
         out
     }
 
@@ -121,6 +222,93 @@ mod tests {
         assert_eq!(dec.watermark, 77);
         assert_eq!(dec.payload, vec![9, 8, 7]);
         assert_eq!(hex::encode(dec.encode()), TRAFFIC);
+    }
+
+    /// The buffer form must reproduce the **captured Go vector**, not merely
+    /// round-trip through our own decoder.
+    ///
+    /// This is the assertion that matters for the no_std work: `encode_to` is a
+    /// second implementation of the layout, and a second implementation that
+    /// agrees with the first tells you nothing about whether the first is right.
+    /// The Go bytes are the only independent witness available.
+    ///
+    /// It is also how `encoded_len` is validated. My first version folded the
+    /// fixed part into `2 * (1 + 2 * KEY_LEN)`, which double-counted the
+    /// terminators and over-ran by 65 bytes — and the `debug_assert_eq!` inside
+    /// `encode_to` caught it, which is exactly the assertion's job.
+    #[test]
+    fn the_buffer_form_reproduces_the_captured_go_vector() {
+        let raw = hex::decode(TRAFFIC).unwrap();
+        let dec = Traffic::decode(&raw).unwrap();
+        let mut buf = vec![0u8; dec.encoded_len()];
+        let n = dec.encode_to(&mut buf).expect("encoded_len sizes it");
+        assert_eq!(n, raw.len(), "encoded_len is exact");
+        assert_eq!(
+            hex::encode(&buf[..n]),
+            TRAFFIC,
+            "the buffer encoder must produce Go's bytes, not ours"
+        );
+    }
+
+    /// `encoded_len` stays exact as the variable parts vary.
+    ///
+    /// The three parts that change length — the two paths, the watermark's uvarint
+    /// width, and the payload — are each varied across a boundary here. A
+    /// `watermark` of 0 versus 127 versus 128 is the interesting one, because a
+    /// one-byte-off length function is invisible for small values and truncates
+    /// silently for large ones.
+    #[test]
+    fn encoded_len_is_exact_across_every_variable_part() {
+        for path in [vec![], vec![1], vec![1, 2, 3], vec![127], vec![128, 16_384]] {
+            for watermark in [0u64, 1, 127, 128, 16_383, 16_384, u64::MAX] {
+                for payload_len in [0usize, 1, 127, 128, 1000] {
+                    let t = Traffic {
+                        path: path.clone(),
+                        from: path.clone(),
+                        source: [0xABu8; KEY_LEN],
+                        dest: [0xCDu8; KEY_LEN],
+                        watermark,
+                        payload: vec![0x5Au8; payload_len],
+                    };
+                    let mut buf = vec![0u8; t.encoded_len()];
+                    let n = t.encode_to(&mut buf).expect("exact");
+                    assert_eq!(n, t.encoded_len(), "len is exact and stable");
+                    // And it decodes back to the same thing, which is the only
+                    // check that `encoded_len` and `encode_to` agree on *where*
+                    // the fields are, not just how many bytes there are.
+                    let back = Traffic::decode(&buf[..n]).expect("our own output decodes");
+                    assert_eq!(back.path, t.path);
+                    assert_eq!(back.from, t.from);
+                    assert_eq!(back.watermark, t.watermark);
+                    assert_eq!(back.payload, t.payload);
+                }
+            }
+        }
+    }
+
+    /// A short buffer is refused, never truncated — for the same reason as
+    /// `frame::a_short_buffer_is_refused_rather_than_truncated`, and with the
+    /// same stakes: a traffic frame truncated mid-payload is handed to the
+    /// session layer, which fails to decrypt it, and the link ages out with
+    /// nothing in the log saying why.
+    #[test]
+    fn a_traffic_frame_is_not_truncated_into_a_short_buffer() {
+        let t = Traffic {
+            path: vec![1, 2],
+            from: vec![3],
+            source: [1u8; KEY_LEN],
+            dest: [2u8; KEY_LEN],
+            watermark: 300,
+            payload: vec![7u8; 40],
+        };
+        let need = t.encoded_len();
+        for short in 1..=need {
+            let mut buf = vec![0u8; need - short];
+            assert!(
+                t.encode_to(&mut buf).is_err(),
+                "a buffer {short} byte(s) short must be refused"
+            );
+        }
     }
 
     /// A learned path is refreshed by **any** frame addressed to us, before the

@@ -189,9 +189,30 @@ intrusion:
 | fixed-capacity array | `path: [u64; MAX_PATH]` | removes all alloc; needs a documented bound |
 
 `Traffic` is the interesting one: it has `path: Vec<u64>`, `from: Vec<u64>` and
-`payload: Vec<u8>`, and `payload` is by far the largest. In practice the path is
-0–2 hops (`_getRootAndPath` walks ancestors), so a fixed-capacity array is the
-honest encoding — and Go's own `MAX_PATH_SIZE` is the precedent to cite.
+`payload: Vec<u8>`, and `payload` is by far the largest. Two things about it are
+now measured rather than assumed:
+
+- **There is no `MAX_PATH_SIZE` in Go.** The plan used to cite one. There is
+  not: `wireAppendPath` (`network/wire.go:80-86`) has no bound at all, and a
+  search of both reference submodules for `MAX_PATH_SIZE` / `maxPath` /
+  `MaxDepth` returns nothing. So a fixed-capacity path array in the core has **no
+  Go precedent to cite**, and its bound has to be ours, justified rather than
+  borrowed. The honest justification is that `_getRootAndPath` walks ancestors,
+  so a path is as long as the tree is deep, and an overflow must be a **loud
+  refusal** rather than a truncation — a truncated path list would send a frame
+  to the wrong next hop.
+- **The paths cannot borrow.** A uvarint is not fixed-width, so `split_path` has
+  to materialise a `Vec<u64>` and a `&[u64]` view into the input is impossible
+  without changing the wire format. Caller-provided `&mut [u64]` with a documented
+  capacity is the only shape that works, and it is slice 4's problem rather than
+  slice 2's.
+
+What slice 2 *did* settle is the write side, which is the side `no_std` needs
+first: `frame::encode_frame_to` and `Traffic::encode_to` now write into a caller
+buffer, with the allocating forms as thin wrappers over them. Two implementations
+of one layout is a drift risk, so the tests assert they are byte-identical *and*
+that the buffer form reproduces the captured Go bytes — a round trip through our
+own decoder would agree with a wrong implementation forever.
 
 **3. Five `HashMap`s of state → caller-provided tables.**
 

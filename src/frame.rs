@@ -80,12 +80,93 @@ const _: () = {
     }
 };
 
+/// Longest length prefix [`encode_frame_to`] will write.
+///
+/// A uvarint over `MAX_MESSAGE_SIZE + 1`, which is 3 bytes: Go caps a frame at
+/// `MAX_MESSAGE_SIZE` (`core/link.go`, `MaximumIfMTU`-adjacent) and the type byte
+/// adds one, so the prefix never exceeds three bytes in practice. The loop in
+/// [`wire_len`] is the authority; this is a bound, not a second implementation
+/// of it — and `frame_prefix_len_is_at_most_three_bytes` below checks that it
+/// agrees, because a too-small bound here is a silent truncation on the largest
+/// legal frame and a too-large one just wastes a byte of caller buffer.
+pub const MAX_LEN_PREFIX: usize = 5;
+
+/// Encode `type + payload` with uvarint length prefix, into `out`.
+///
+/// Returns the number of bytes written, which is what a caller needs in order to
+/// advance its own cursor.
+///
+/// **Why this form exists.** It is the only one that can be called from a
+/// `no_std` caller with no allocator, which is the whole reason
+/// `roots-core` is being built: the wrapper owns one scratch buffer and calls
+/// this in a loop, rather than every frame allocating a `Vec` that is dropped
+/// immediately after the socket write. The allocation was never the point — it
+/// was invisible.
+///
+/// `out` is truncated to fit, so a buffer that is too small yields a **short**
+/// write, never a panic and never a partial frame that looks complete. That is
+/// deliberate: this is called on a path with a socket to write to, and a panic
+/// there is worse than a dropped frame.
+///
+/// # Sizing
+///
+/// [`wire_len`] gives the exact byte count for a payload length, so a caller
+/// does not have to reason about the prefix at all:
+///
+/// ```ignore
+/// let mut buf = [0u8; MAX_FRAME];
+/// let n = frame::encode_frame_to(ftype, payload, &mut buf)?;
+/// socket.write_all(&buf[..n]).await?;
+/// ```
+pub fn encode_frame_to(ftype: FrameType, payload: &[u8], out: &mut [u8]) -> Result<usize, Error> {
+    // The prefix is computed into a stack array rather than a Vec, so this
+    // function allocates nothing at all.
+    let mut prefix = [0u8; MAX_LEN_PREFIX];
+    let n = write_uvarint(&mut prefix, (payload.len() + 1) as u64);
+    let need = n + 1 + payload.len();
+    if out.len() < need {
+        return Err(Error::Core(CoreError::InvalidLength));
+    }
+    out[..n].copy_from_slice(&prefix[..n]);
+    out[n] = ftype as u8;
+    out[n + 1..need].copy_from_slice(payload);
+    Ok(need)
+}
+
+/// Write a uvarint into a fixed buffer, returning its length.
+///
+/// `pub(crate)` rather than private because [`crate::traffic`] needs it for the
+/// zero-terminated port lists, and duplicating a uvarint writer is how two
+/// encoders start disagreeing.
+pub(crate) fn write_uvarint(out: &mut [u8], mut v: u64) -> usize {
+    let mut n = 0;
+    loop {
+        if v < 0x80 {
+            out[n] = v as u8;
+            n += 1;
+            return n;
+        }
+        out[n] = (v as u8) | 0x80;
+        n += 1;
+        v >>= 7;
+    }
+}
+
 /// Encode `type + payload` with uvarint length prefix.
+///
+/// The allocating convenience form, kept because two callers want it and because
+/// `roots-core` cannot use it. New `no_std` code should use
+/// [`encode_frame_to`]; the split exists so the allocation is a *choice* rather
+/// than a property of the API.
 pub fn encode_frame(ftype: FrameType, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + payload.len());
-    append_uvarint(&mut out, (payload.len() + 1) as u64);
-    out.push(ftype as u8);
-    out.extend_from_slice(payload);
+    // Sized from `wire_len`, which is exact, plus slack for the prefix — so the
+    // `encode_frame_to` below cannot fail and the `unwrap` is unreachable rather
+    // than defensive. If `wire_len` and `encode_frame_to` ever disagreed, this
+    // panic is the right outcome: a truncated frame on the wire is worse than a
+    // crash.
+    let mut out = vec![0u8; wire_len(payload.len()) as usize + MAX_LEN_PREFIX];
+    let n = encode_frame_to(ftype, payload, &mut out).expect("wire_len sizes the buffer");
+    out.truncate(n);
     out
 }
 
@@ -181,6 +262,101 @@ mod tests {
         }
         assert_eq!(read_uvarint(&[]), None);
         assert_eq!(read_uvarint(&[0x80]), None);
+    }
+
+    /// The buffer form and the owned form must agree **byte for byte**.
+    ///
+    /// They are two implementations of one encoding, written twice on purpose:
+    /// the allocating one exists for convenience and the stack one exists so a
+    /// `no_std` caller has a way in. Two implementations of a wire format is
+    /// exactly the arrangement that drifts, and the drift would be invisible —
+    /// both would still round-trip through our own decoder.
+    ///
+    /// So this asserts equality against the *other* function, for every type and
+    /// for the payload sizes that change the length prefix (1 byte for < 127,
+    /// 2 bytes at 127, 3 at 16384). A prefix that grew by one byte at a boundary
+    /// is the mutation this is here to catch.
+    #[test]
+    fn the_buffer_form_matches_the_owned_form_across_prefix_boundaries() {
+        for t in FrameType::ALL {
+            for len in [0usize, 1, 126, 127, 128, 16_383, 16_384, 16_385] {
+                let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+                let owned = encode_frame(t, &payload);
+                let mut buf = [0u8; 64 * 1024];
+                let n = encode_frame_to(t, &payload, &mut buf).expect("64 KiB is plenty");
+                assert_eq!(
+                    &owned[..],
+                    &buf[..n],
+                    "type {t:?} payload {len}: the two encoders disagree"
+                );
+                assert_eq!(owned.len(), wire_len(len) as usize, "and wire_len agrees");
+            }
+        }
+    }
+
+    /// A buffer that is too small must be **refused**, not truncated.
+    ///
+    /// This is the mutation that matters most in the whole function. A
+    /// truncating write would emit a frame whose length prefix disagrees with its
+    /// body — and the far end would read the prefix, wait for bytes that never
+    /// come, and eventually time the link out. On a path with a live socket that
+    /// is a silent, confusing failure; a `Result` the caller can see is not.
+    ///
+    /// The off-by-one is checked from both sides: one byte short must fail and
+    /// exactly enough must succeed. A check written as `out.len() < need` rather
+    /// than `<=` is the difference between those two.
+    #[test]
+    fn a_short_buffer_is_refused_rather_than_truncated() {
+        let payload = [1u8, 2, 3, 4, 5];
+        let need = wire_len(payload.len()) as usize;
+        for short in 1..=need {
+            let mut buf = vec![0u8; need - short];
+            assert!(
+                encode_frame_to(FrameType::SigReq, &payload, &mut buf).is_err(),
+                "a buffer {short} byte(s) short must be refused, not filled"
+            );
+        }
+        let mut exact = vec![0u8; need];
+        assert_eq!(
+            encode_frame_to(FrameType::SigReq, &payload, &mut exact).expect("exactly enough"),
+            need
+        );
+    }
+
+    /// `MAX_LEN_PREFIX` must be big enough for the largest legal frame.
+    ///
+    /// If it were not, `write_uvarint` would index past its stack array — and the
+    /// symptom would be a corrupted prefix on the biggest frames only, which is
+    /// the kind of bug that shows up as an unexplained link timeout on a busy
+    /// node. So the bound is checked against `wire_len`'s own arithmetic rather
+    /// than trusted.
+    #[test]
+    fn the_length_prefix_bound_covers_the_largest_frame() {
+        for len in [0usize, 127, 16_384, MAX_MESSAGE_SIZE] {
+            // `wire_len` counts the prefix; the encoded buffer is prefix + type +
+            // payload, and the prefix alone is what `MAX_LEN_PREFIX` bounds.
+            let prefix = wire_len(len) as usize - (len + 1);
+            assert!(
+                prefix <= MAX_LEN_PREFIX,
+                "payload {len} needs a {prefix}-byte prefix, bound is {MAX_LEN_PREFIX}"
+            );
+        }
+    }
+
+    /// An empty payload still produces a valid frame.
+    ///
+    /// `len + 1` rather than `len`: the type byte is inside the length prefix,
+    /// so a `Dummy` frame with no payload is one byte of body and must encode as
+    /// `01 00`, not `00`. Getting this wrong is invisible for every non-empty
+    /// payload and fatal for every empty one, and `KeepAlive` is an empty payload
+    /// on a live link.
+    #[test]
+    fn an_empty_payload_still_counts_its_type_byte() {
+        let enc = encode_frame(FrameType::KeepAlive, &[]);
+        assert_eq!(enc, vec![0x01, 0x01], "uvarint(1) then the type byte");
+        let (len, n) = read_uvarint(&enc).unwrap();
+        assert_eq!(len as usize, enc.len() - n);
+        assert_eq!(decode_body(&enc[n..]).unwrap().0, FrameType::KeepAlive);
     }
 
     #[test]
