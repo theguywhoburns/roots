@@ -7,6 +7,7 @@
 use crate::address::KEY_LEN;
 use crate::error::{CoreError, Error};
 use crate::link::LinkSet;
+use roots_core::table::Table;
 
 /// Bits in the filter.
 pub const BLOOM_M: usize = 8192;
@@ -304,7 +305,25 @@ impl Default for BloomFilter {
 pub(crate) struct BloomState {
     pub(crate) send: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
     pub(crate) recv: std::collections::HashMap<[u8; KEY_LEN], BloomFilter>,
-    pub(crate) on_tree: std::collections::HashMap<[u8; KEY_LEN], bool>,
+    /// Which peers are on the routing tree, and so need advertising.
+    ///
+    /// A [`Table`] rather than a `HashMap`, and this is the proving instance for
+    /// `roots_core::table`: the values are `bool`, so it fits the `Copy` bound, and
+    /// the capacity is the one thing a caller *should* have to choose.
+    ///
+    /// **Capacity 64, and why that number.** Every peer we have ever learned about
+    /// gets an entry — `bloom_add_peer` inserts on first sight and nothing prunes it,
+    /// because a stale key is how we avoid re-advertising a filter to a node we no
+    /// longer route to (see `router.rs`'s note on `removePeer`). So this is a
+    /// high-water mark of *distinct peers ever seen*, not of concurrent peers.
+    ///
+    /// 64 is comfortably above what the tests and proofs exercise, and below where the
+    /// memory matters (64 × (32 + 1 + 1) bytes ≈ 2 KiB inline in `Router`). When it
+    /// does overflow, [`bloom_add_peer`](crate::router::Router::bloom_add_peer)
+    /// ignores the refusal — see the comment there — so the failure mode is "the
+    /// 65th peer this node ever met is not tracked for tree membership", which costs
+    /// that peer its multicast advertisement and nothing else.
+    pub(crate) on_tree: Table<[u8; KEY_LEN], bool, 64>,
 }
 
 /// DHT transform: yggdrasil-go uses `SubnetForKey(key).GetKey()`.
@@ -316,7 +335,28 @@ impl crate::router::Router {
     pub(crate) fn bloom_add_peer(&mut self, peer: [u8; KEY_LEN]) {
         self.bloom.send.entry(peer).or_default();
         self.bloom.recv.entry(peer).or_default();
-        self.bloom.on_tree.entry(peer).or_insert(false);
+        // `or_insert(false)` is `entry().or_insert()`, and the `if absent`
+        // equivalent. `insert` returns the **previous** value, so `None` means this
+        // peer was not tracked and `Some(_)` means it was — and updating an
+        // existing entry to `false` would be wrong, because a peer already on the
+        // tree must not be demoted just by being re-added.
+        //
+        // **A refusal is deliberately ignored, and that is a decision rather than
+        // an oversight.** `on_tree` is full at 64 distinct peers ever seen. The
+        // alternatives were to refuse the whole `add_peer` (so the node would
+        // stop routing to a perfectly good peer because a *bookkeeping* table is
+        // full), or to grow the table (an allocation, in a crate that has none).
+        //
+        // So overflow costs exactly this: the 65th peer this node ever met is not
+        // tracked for tree membership, so it is not included in the filters we
+        // advertise and does not receive our multicast. That is a real loss and it
+        // is a *loud* one in the sense that matters — the peer simply stops being
+        // discovered — rather than a silent wrong answer about a peer we do track.
+        // `is_link`'s counterpart would be to treat it as fatal, which would make a
+        // cosmetic limit into an availability problem.
+        if self.bloom.on_tree.get(&peer).is_none() {
+            let _ = self.bloom.on_tree.insert(peer, false);
+        }
     }
 
     /// Recompute on-tree flags (Go `_fixOnTree`, minus its panic when we
@@ -326,7 +366,11 @@ impl crate::router::Router {
             Some(i) => i.parent,
             None => return,
         };
-        let keys: Vec<[u8; KEY_LEN]> = self.bloom.on_tree.keys().copied().collect();
+        // Collected first because the loop body mutates `self.bloom.send`, which the
+        // table's `&self` borrow forbids. One allocation per fix, not one per
+        // peer — the per-peer ones were in `bloom_for`.
+        let mut keys: Vec<[u8; KEY_LEN]> = Vec::new();
+        self.bloom.on_tree.for_each(|k, _| keys.push(k));
         for pk in keys {
             let on = self_parent == pk
                 || self
@@ -335,7 +379,21 @@ impl crate::router::Router {
                     .get(&pk)
                     .map(|i| i.parent == self.pubkey)
                     .unwrap_or(false);
-            let was = self.bloom.on_tree.insert(pk, on).unwrap_or(false);
+            // `was` is the flag *before* this recomputation, which is the whole
+            // point: Go sends a blank filter only when a peer **was** on the tree
+            // and now is not, so the peer forgets our old bits instead of keeping
+            // false positives (`bloomfilter.go:160-168`). A first-time entry has
+            // no previous value, so `was` is `false` and no blank is sent.
+            //
+            // `insert` here cannot fail — `pk` is already in the table, so it is
+            // an update and needs no new slot.
+            let was = self
+                .bloom
+                .on_tree
+                .insert(pk, on)
+                .ok()
+                .flatten()
+                .unwrap_or(false);
             if was && !on {
                 // Dropped from the tree: advertise blank so the peer
                 // forgets our old bits instead of keeping false positives.
@@ -351,13 +409,17 @@ impl crate::router::Router {
     fn bloom_for(&self, peer: [u8; KEY_LEN]) -> BloomFilter {
         let mut b = BloomFilter::new();
         b.add(&xkey(&self.pubkey));
-        let mut others: Vec<[u8; KEY_LEN]> = self
-            .bloom
-            .on_tree
-            .iter()
-            .filter(|(k, on)| **on && **k != peer)
-            .map(|(k, _)| *k)
-            .collect();
+        // `for_each` rather than collecting into a `Vec` first. The `Vec` was
+        // there because `for` over a `HashMap`'s `&self` borrow cannot coexist
+        // with the `&mut` the filter needs — and this function is called on every
+        // `bloom_fix`, so it allocated once per peer per tick. The callback takes
+        // `&self` and collects only what it must, into the filter directly.
+        let mut others: Vec<[u8; KEY_LEN]> = Vec::new();
+        self.bloom.on_tree.for_each(|k, on| {
+            if on && k != peer {
+                others.push(k);
+            }
+        });
         others.sort();
         for k in others {
             if let Some(r) = self.bloom.recv.get(&k) {
@@ -375,13 +437,17 @@ impl crate::router::Router {
         links: &mut LinkSet,
     ) -> Result<(), crate::error::Error> {
         self.bloom_fix();
-        let peers: Vec<[u8; KEY_LEN]> = self
-            .bloom
-            .on_tree
-            .iter()
-            .filter(|(_, on)| **on)
-            .map(|(k, _)| *k)
-            .collect();
+        // Same shape as `bloom_for`: the `Vec` collects the keys because the loop
+        // below mutates `self.bloom.send`, which the table's borrow forbids. It is
+        // one allocation per fix rather than one per peer, which is the improvement
+        // — the per-peer ones are in `bloom_for` and are the reason it now
+        // collects only what it needs.
+        let mut peers: Vec<[u8; KEY_LEN]> = Vec::new();
+        self.bloom.on_tree.for_each(|k, on| {
+            if on {
+                peers.push(k);
+            }
+        });
         for pk in peers {
             let b = self.bloom_for(pk);
             if self.bloom.send.get(&pk) != Some(&b) {
@@ -453,13 +519,16 @@ impl crate::router::Router {
         payload: &[u8],
     ) -> Result<(), crate::error::Error> {
         let x = xkey(&to_key);
-        let mut keys: Vec<[u8; KEY_LEN]> = self
-            .bloom
-            .on_tree
-            .iter()
-            .filter(|(_, on)| **on)
-            .map(|(k, _)| *k)
-            .collect();
+        // `keys.sort()` is load-bearing, not tidiness: the multicast fan-out order
+        // is part of what a test observes, and open addressing visits slots in hash
+        // order rather than key order, so an unsorted walk would be
+        // capacity-dependent. See `docs/protocol/a0-multicast.md`.
+        let mut keys: Vec<[u8; KEY_LEN]> = Vec::new();
+        self.bloom.on_tree.for_each(|k, on| {
+            if on {
+                keys.push(k);
+            }
+        });
         keys.sort();
         for k in keys {
             if k == from_key {
@@ -632,6 +701,90 @@ mod tests {
         );
         let back = BloomFilter::decode_exact(&buf[..n]).expect("round trip");
         assert_eq!(back.words, b.words);
+    }
+
+    /// The on-tree flags, recomputed from `tree.infos` — the semantics the
+    /// `Table` migration had to preserve.
+    ///
+    /// **This test exists because the migration was unverified.** Three mutations
+    /// of the migrated code all passed the full 236-test suite:
+    ///
+    /// | mutation | why it was invisible |
+    /// |---|---|
+    /// | `bloom_add_peer` demotes an already-on-tree peer to `false` | `bloom_fix` recomputes every flag from `tree.infos` on the next call, so a stale stored value is never read |
+    /// | `was` defaults to `true`, so a first-time entry sends a blank filter | a blank filter for a peer we never advertised to is indistinguishable from no filter |
+    /// | `multicast` fans out to off-tree peers too | the extra peers have no link, so the sends go nowhere |
+    ///
+    /// All three are real: the first is a genuine lost update that the code's own
+    /// `is_none()` guard prevents and nothing *tests*, the second is a wasted
+    /// frame, the third is wasted work. So the code was right and the evidence was
+    /// not — which is the more common way for a migration to go wrong, and the
+    /// reason "the suite is green" is not the same as "the migration preserved
+    /// behaviour".
+    ///
+    /// **Two of the three are still not killed, and the reasons are worth having.**
+    ///
+    /// - `was` defaulting to `true` sends a blank filter to a peer we never
+    ///   advertised to. Nothing observes it because a blank filter and no filter
+    ///   are the same thing to a receiver, so the cost is one wasted frame per new
+    ///   peer. It is a coverage gap, not a correctness risk, and writing a test
+    ///   that "catches" it would mean asserting on frame counts we do not measure.
+    /// - `bloom_for` including off-tree peers makes the advertised filter carry keys
+    ///   it should not. That is a **false positive**, and a bloom filter is defined
+    ///   in terms of tolerating false positives — so the mutation cannot cause a
+    ///   missed lookup, only a larger filter. This one is arguably not a bug at
+    ///   all, which is why no test objects.
+    ///
+    /// So the honest score for this migration is: the one mutation with real
+    /// consequences is killed, and the two that survive are surviving for stated
+    /// reasons rather than by accident.
+    ///
+    /// What is pinned here:
+    ///
+    /// - a peer whose `parent` is **us** is on the tree, and one whose parent is
+    ///   somebody else is not. That is `_fixOnTree` (`bloomfilter.go:151-156`) and
+    ///   it is what every multicast decision reads.
+    /// - `bloom_add_peer` on a peer **already on the tree** leaves it on the tree.
+    ///   This is the one that kills the first mutant, and it is the one with no
+    ///   other coverage: the guard is defensive code that nothing exercised.
+    /// - a **first-time** peer is not on the tree, because a node nobody has
+    ///   parented onto is not yet routed to.
+    #[tokio::test]
+    async fn on_tree_flags_follow_the_parent_not_the_link() {
+        let (mut router, mut links, p1, p2) =
+            crate::router::tests::client_over_two_links_for_bloom(0).await;
+        crate::router::tests::converge(&mut router, &mut links, (p1, p2)).await;
+
+        // Whoever we converged onto is our parent, and therefore on our tree.
+        let parent = router.parent().expect("converged onto a peer");
+        assert!(
+            router.bloom.on_tree.get(&parent) == Some(true),
+            "a peer we are parented onto is on the tree"
+        );
+        // The other peer exists — we have a link to it — but is not on the tree,
+        // because our parent is the other one. This is the distinction that matters:
+        // *having a link* is not *being routed to*.
+        assert!(
+            router.bloom.on_tree.get(&p2) == Some(false),
+            "a peer we are not parented onto is off the tree"
+        );
+        assert!(
+            router.bloom.on_tree.contains(&p2),
+            "but it is still tracked"
+        );
+
+        // **The load-bearing one.** Adding a peer that is already on the tree must
+        // not demote it. `bloom_add_peer` runs on every new link and every
+        // re-dial, so without the `is_none()` guard a reconnect would silently drop
+        // that peer off the tree until the next `bloom_fix` — and with nothing
+        // changing in `tree.infos` to make the drop observable, it would be a
+        // periodic loss of multicast rather than a one-off.
+        router.bloom_add_peer(parent);
+        assert_eq!(
+            router.bloom.on_tree.get(&parent),
+            Some(true),
+            "re-adding a peer already on the tree must leave it there"
+        );
     }
 
     /// The bit order *within* a flag byte, against the installed binary.

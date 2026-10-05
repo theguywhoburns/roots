@@ -279,6 +279,21 @@ EOF
 grep -q '"Listen": \[\]' "$WORK/gob.conf" || { echo "FAIL: the Go node has no configured peer" >&2; exit 1; }
 grep -q '"Listen": \[\]' "$WORK/oursb.conf" || { echo "FAIL: our node has no configured peer" >&2; exit 1; }
 
+# **Stop A and B before starting the beacon pair.** They are still running —
+# `cleanup` is only an EXIT trap — and they beacon on the *same* group
+# `[ff02::114]:9001`. So the listener below was catching whichever beacon arrived
+# first, and comparing it against `gob`'s own key: "the beacon advertises
+# 718129… but the node is 214a2b…". Not a codec bug and not flaky in the usual
+# sense; it is three nodes on one multicast group and a phase that assumed it had
+# one.
+#
+# The veths stay up: `cleanup` deletes them and this phase needs `$WORK`.
+kill "$A_PID" "$B_PID" 2>/dev/null || true
+wait "$A_PID" 2>/dev/null || true
+wait "$B_PID" 2>/dev/null || true
+A_PID=
+B_PID=
+
 ROOTS_DBG_MULTICAST=1 "$BIN" -useconffile "$WORK/oursb.conf" >"$WORK/oursb.log" 2>&1 &
 B_PID=$!
 yggdrasil -useconffile "$WORK/gob.conf" >"$WORK/gob.log" 2>&1 &

@@ -117,7 +117,7 @@ impl Router {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
@@ -456,6 +456,16 @@ mod tests {
     /// A client `Router` holding two loopback links, both registered and in
     /// one owned set. `dying` names the peer whose server task drops its
     /// socket 2s in (`0` keeps both alive).
+    /// Re-exported for `bloom.rs`'s on-tree test, which needs the same fixture and
+    /// the same convergence. `pub(crate)` rather than duplicated: two copies of
+    /// a three-node fixture drift, and a fixture that drifted would make the bloom
+    /// assertions pass or fail for reasons unrelated to bloom.
+    pub(crate) async fn client_over_two_links_for_bloom(
+        dying: u8,
+    ) -> (Router, LinkSet, [u8; 32], [u8; 32]) {
+        client_over_two_links(dying).await
+    }
+
     async fn client_over_two_links(dying: u8) -> (Router, LinkSet, [u8; 32], [u8; 32]) {
         let (c_sk, s1_sk, s2_sk) = client_and_peers();
         let l1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -493,7 +503,11 @@ mod tests {
     /// Pump short slices until the client has a parent that is one of its two
     /// links — being its own root counts as a parent, so `parent().is_some()`
     /// alone would return before the tree formed.
-    async fn converge(router: &mut Router, links: &mut LinkSet, peers: ([u8; 32], [u8; 32])) {
+    pub(crate) async fn converge(
+        router: &mut Router,
+        links: &mut LinkSet,
+        peers: ([u8; 32], [u8; 32]),
+    ) {
         for _ in 0..6 {
             router
                 .serve_links(links, Some(Duration::from_millis(250)), &mut Vec::new())
@@ -597,7 +611,7 @@ mod tests {
             "the per-link book does NOT outlive the link: `fix` asks it"
         );
         assert!(
-            router.bloom.on_tree.contains_key(&dead),
+            router.bloom.on_tree.contains(&dead),
             "the bloom book outlives the link too"
         );
         router
