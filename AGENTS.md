@@ -52,7 +52,7 @@ wire; there is no release process, and CI is three local commands.
   workspace build already covers it, so this only matters when you want the
   error on its own.
   (plain `cargo run` from the root **fails**: that package is lib-only).
-- `cargo test --workspace` — ~25 s, 204 tests, loopback only.
+- `cargo test --workspace` — ~25 s, 225 tests, loopback only.
   Narrow it: `cargo test -p roots --lib <filter>`, `cargo test -p roots --test mesh3`,
   `cargo test -p roots-client --test peer_rows -- --nocapture`.
 - `cargo test -p roots --test mesh_ping -- --ignored --nocapture` — live, needs
@@ -116,6 +116,16 @@ wire; there is no release process, and CI is three local commands.
   wrapper from supplying it. So `roots::Error::Core(..)` is the way in, and its
   `source()` stops there. Do not "fix" this by adding a `std` feature to
   `roots-core`.
+- **Time is a stored value, not a callback.** `roots_core::clock::Instant` is a
+  `u64` of **nanoseconds** from an arbitrary process-local epoch, because
+  `PathEntry::deadline`, `LinkState::srrt` and `Session::rotated_at` are all
+  stored and compared, and `latency` is `srrt - srst`. **Do not change the unit to
+  milliseconds**: Go reports latency in nanoseconds, its observed value on one
+  loopback link is 450 µs, and the unexplained gap in `TODO.md` is ~50 ms — a
+  representation that cannot express 0.45 ms cannot be used to investigate it.
+  `sub_millisecond_durations_survive_the_conversion_exactly` holds that, and both
+  lossy conversions are mutation-killed. Arithmetic **saturates**, because a
+  wrapped deadline lands in the past and reads as expired.
 - **`client/`** is the only package that drives a `Router`. `Node::run` in
   `client/src/node.rs` is the one production loop: it owns `Router` + `LinkSet` +
   the mailbox, so there are no locks — and therefore **nothing off-task may

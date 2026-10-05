@@ -293,11 +293,56 @@ bytes of hash, so it is doable — but it belongs with the `GroupPassword` work 
 
 **Slice 3 — `Clock`.**
 `Instant` becomes a core value type; `std::time::Instant` becomes the wrapper's
-impl. Unlocks `peer`, `traffic`, `proto`, `views`, and the read-mostly tables.
+impl. Unlocks `peer`, `traffic`, `proto`, `views`, and the read-only tables.
 Then the first expiry tests can move across.
 
 *Why third:* it is a prerequisite for every remaining stateful module and it is
 independent of the table work, so it parallelises cleanly.
+
+**Done (2026-10-05):** `roots_core::clock` — `Instant` (a `u64` of nanoseconds
+from an arbitrary, process-local epoch), the one-method `Clock` trait, and
+`FnClock` so a deterministic test needs no trait impl of its own. `roots::clock`
+adds `StdClock`, which fixes its origin at construction because
+`std::time::Instant` has no convertible origin of its own. 4 of 4 mutants killed.
+
+**The unit is nanoseconds and that was the decision worth arguing about.**
+Milliseconds would be tidier and 1000× cheaper, and the argument against is
+entirely about evidence:
+
+* Go reports `latency` in nanoseconds (`core/debug.go:85`) and `21-admin.md`
+  compares our printed number against `yggdrasilctl`'s. A millisecond
+  representation would round Go's observed **450 µs** to zero and make that
+  comparison meaningless.
+* The quantities are sub-millisecond: a loopback RTT is tens of microseconds.
+  Milliseconds would quantise every latency report to a rounding artefact.
+* The **unexplained** disagreement in `TODO.md` is of that order — ours ~50 ms
+  against Go's ~0.45 ms on the same link. A representation that cannot express
+  0.45 ms cannot be used to investigate a 50 ms gap.
+
+So the precision is not a nicety; it is the instrument the open question needs.
+`sub_millisecond_durations_survive_the_conversion_exactly` asserts it on the
+conversion itself rather than on a stopwatch, and both lossy-conversion mutants
+(a microsecond core, a millisecond adapter) die against it.
+
+**Saturating, not wrapping, and the reason is directional.** A deadline that
+wrapped would land in the *past* and read as expired — so a path entry or a
+session buffer would be evicted immediately instead of living. `duration_since`
+clamps at zero because its one protocol caller is `latency = srrt - srst`, and a
+negative interval has no meaning on the wire; clamping in one place is how two
+clamps end up disagreeing.
+
+**Not done, and it is the migration, not the abstraction:** all 100 `Instant`
+uses still read `std::time::Instant`. `Clock` exists and is proven, but nothing
+calls it yet. Migrating a module means threading `&dyn Clock` (or a stored
+reference) into the state machine that consults time, and `Router` does not hold
+one yet — that is a constructor change and belongs with slice 6. Migrating a
+module *without* it would mean passing a clock to functions that are already
+taking `&mut Router`, which is the same plumbing by another name.
+
+One design constraint surfaced and is worth keeping: `FnClock` takes an `Fn`, not
+`FnMut`, because a `Clock` is read through `&self` and the state machines hold
+`&self` while consulting time. A fake clock that advanced only by handing back
+`&mut` would be unusable in exactly the places it is needed.
 
 **Slice 4 — the read-mostly tables.**
 `tree.infos`, `tree.deadlines`, `pathfind.rumors`, `bloom.on_tree`. Fixed

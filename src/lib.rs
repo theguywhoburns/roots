@@ -8,6 +8,7 @@
 //! lives in the `roots-client` package (`client/`).
 
 pub mod bloom;
+pub mod clock;
 pub mod error;
 
 /// The address module, now living in `roots-core`.
