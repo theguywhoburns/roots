@@ -248,6 +248,42 @@ Each slice is independently revertible and leaves the suite green, which is the
 repo's standing rule ("a proof that encodes the current behaviour stops telling
 you when the behaviour is wrong").
 
+### Status
+
+| slice | what | commit | state |
+|---|---|---|---|
+| 1 | `roots-core` crate + `address`, `error` | `88e554c` | done |
+| 2 | buffer-external encoders | `748890d`, `063d2a7` | done |
+| 3 | `Clock` — `Instant` as a stored value | `7b9027d` | done |
+| 4 | fixed-capacity `Table` | `680cd65` | done |
+| 4b | `bloom.on_tree` onto it (the proving instance) | `6829db2` | done |
+| 5 | caller-owned tables for non-`Copy` values | — | **not attempted, see below** |
+| 6 | split `router` / `driver` | `0e53f7e` | clock half only |
+| 7 | stream-shaped `dispatch_frame` | — | not started |
+
+**Slice 5 was scoped out, deliberately.** It needs `Info` and `RumorEntry`
+redefined with *borrowed* payloads so the core can name them at all (`Info`
+contains a `Vec<u64>`, and `no_std` + no-alloc cannot), and that cascades through
+`tree`, `pathfind`, `router` and `driver`. Doing it properly is a much larger
+change than doing it quickly, and a half-migrated book that loses live sessions is
+worse than an unmigrated one. The constraint that forces it — `Table` is
+`Copy`-bounded because `[None; N]` needs `Copy` and `[Option<T>; N]: Default` does
+not exist — is now measured rather than argued, and it is the thing slice 5 has to
+solve.
+
+**Two migration findings that apply to every remaining slice.** Both from slice 6
+and 4b:
+
+1. *"The suite is green" is not "the migration preserved behaviour."* Slice 4b's
+   `bloom.on_tree` migration passed all 236 tests with three semantic mutations
+   live in it. Slice 6's `go_latency` had **no test at all**, so deleting a whole
+   branch passed everything. Migrating a module says nothing about whether
+   anything observes it — mutation-test the migrated module, or admit the change
+   is unverified.
+2. *Migrating onto a primitive finds bugs in the primitive.* Slice 6 turned a
+   `Clock` bug into a green-looking tree by writing tests that inherited it. The
+   failing assertion was about a `saturating_sub`, not about the `Router`.
+
 **Slice 1 — `roots-core` crate skeleton + the pure modules.**
 `address`, `handshake`, `frame`, `error` (core part). These four have 841 lines,
 almost no state, and the only obstacles are `std::net::Ipv6Addr` in `address` and
@@ -393,11 +429,43 @@ vocabulary and becomes the actual mechanism.
 *Why last of the state work:* it is the only one where a mistake loses live
 sessions, so it should be written once the vocabulary is proven.
 
-**Slice 6 — split `router` and `driver`.**
+**Slice 6 — split `router` and `driver`.** — *partly done, `0e53f7e`*
 `Router` becomes a thin aggregate over core state; `driver` keeps its name in the
 wrapper because `serve_links` is inherently I/O-shaped (it awaits reads and
 writes). The interesting cut is `dispatch_frame`, which today takes `&mut LinkSet`
 purely so its handlers can write replies — see slice 7.
+
+**What landed.** Only the clock half. `Router` now holds a `StdClock` and the two
+sites that stamp `LinkState.srrt`/`sent_at` read `self.clock.now()`, so
+`latency = srrt - srst` is a subtraction of two `roots_core::clock::Instant`s
+rather than two `std::time::Instant`s. `Router::with_clock` is the seam for a
+caller-supplied clock; nothing uses it yet, because a `dyn Clock` would cost a
+vtable and `Router` must stay `Send`.
+
+**How much is left, measured.** `grep -c "Instant::now()"` across `src/` is
+**77** in 11 files (`router.rs` 21, `driver.rs` 9, `multicast.rs` 7, `clock.rs` 6,
+`proto.rs` 6, `session.rs` 6, `supervisor.rs` 6, `pathfind.rs` 4, `link.rs` 3,
+`traffic.rs` 3, `tree.rs` 3) against **8** adopted core-instant sites. So one
+module's worth, not the job — slice 6 as written is ~11 migrations and the rest
+should be treated as mechanical repetition of this one, with the caveat below.
+
+**The caveat, and it is the real finding of this slice.** "Mechanical" is wrong.
+Migrating the clock surfaced **a latent bug in the clock itself**:
+
+> `Instant::saturating_sub` clamps at the epoch, and a `StdClock`'s readings
+> started at zero — so on a freshly-constructed `Router`, "20 ms ago" clamped to
+> 8 ms ago and the caller could not tell. Two round-trip tests failed reporting
+> latencies of 8.35 ms and 26.9 ms, which look like valid loopback measurements.
+
+Saturation is the right default for `saturating_add` and the wrong one here: a
+deadline clamped forward is conservative, a round trip clamped backward is
+*optimistic*. Fixed by starting readings an hour above the epoch, and hardened with
+`Instant::ago_exact` for callers where the interval is the assertion.
+
+So each remaining migration should expect to find something in the primitive it is
+being migrated *onto*, not just type errors. That is the argument for doing these
+one at a time with mutation tests rather than in a single sweep — a sweep would
+have produced 11 green modules and one undetected clock bug.
 
 **Slice 7 — `dispatch_frame` becomes stream-shaped.**
 Today every handler that provokes a reply awaits `links.write(...)` directly, so
