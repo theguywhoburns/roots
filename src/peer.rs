@@ -10,6 +10,7 @@
 //! gated on `PeerKind::supports(_)`, defaulting to Go-exact wire behavior.
 
 use crate::tree::SigReq;
+use roots_core::clock::Instant;
 
 /// TLV tag: implementation name, UTF-8 (e.g. `roots`). Unknown to Go.
 pub const TAG_VENDOR: u16 = 4;
@@ -97,7 +98,7 @@ pub(crate) struct LinkState {
     pub(crate) lag: std::time::Duration,
     /// When we sent the request we are waiting on, in Go's `srst`
     /// (`peers.go:112-113`).
-    pub(crate) sent_at: Option<std::time::Instant>,
+    pub(crate) sent_at: Option<Instant>,
     /// Link priority from the handshake (lowest wins among candidates).
     pub(crate) prio: u8,
     /// Connection order (oldest wins final tiebreaks).
@@ -108,7 +109,7 @@ pub(crate) struct LinkState {
     /// `srrt`. `getPeers`' `latency` is `srrt - srst` **re-read at query time**
     /// (`debug.go:85`), so it is the last round trip as of now, not as of the
     /// reply — and grows until the next `SigReq` resets the pair.
-    pub(crate) srrt: Option<std::time::Instant>,
+    pub(crate) srrt: Option<Instant>,
 }
 
 #[cfg(test)]

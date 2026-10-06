@@ -69,7 +69,7 @@ impl Router {
             peer: peer_key,
             responded: false,
             lag: UNKNOWN_LATENCY,
-            sent_at: Some(Instant::now()),
+            sent_at: Some(roots_core::Instant::EPOCH),
             srrt: None,
             prio: conn.priority(),
             order,

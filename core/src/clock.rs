@@ -101,6 +101,64 @@ impl Instant {
         }
     }
 
+    /// An earlier instant, saturating at the epoch rather than wrapping.
+    ///
+    /// The mirror of [`saturating_add`](Self::saturating_add), and needed by every
+    /// caller that reasons *backwards* from now — a test saying "twenty
+    /// milliseconds ago" is the obvious one.
+    ///
+    /// # Saturation here is a lie the caller cannot see
+    ///
+    /// `saturating_add` saturating is safe: a deadline clamped to `u64::MAX` is
+    /// 584 years out, which no caller acts on, and wrapping would have moved it to
+    /// the past. The *direction* of the failure is conservative.
+    ///
+    /// This is not. A **fresh** clock starts near zero, so `saturating_sub(20ms)`
+    /// on one returns `EPOCH` — an instant 8 ms back, not 20 ms — and the caller
+    /// cannot tell, because `EPOCH` is a perfectly valid instant. Measured: two
+    /// round-trip tests asked for 20 ms and 30 ms, got 8.35 ms and a smaller
+    /// number, and reported intervals that look like plausible loopback round
+    /// trips rather than like clamps.
+    ///
+    /// So two things make it safe rather than merely defined. The reading floor —
+    /// [`StdClock`](https://docs.rs/roots/latest/roots/clock/struct.StdClock.html)
+    /// starts its readings at an hour, so any test-sized step is representable
+    /// before it can saturate — and, for a caller that cares,
+    /// [`ago_exact`](Self::ago_exact), which refuses rather than returns a
+    /// shortened interval.
+    ///
+    /// There is deliberately **no `Sub`**. "Now minus twenty milliseconds" is
+    /// `saturating_sub(Duration)`, not `now - twenty_milliseconds_as_Instant`,
+    /// and an infix `-` on a timestamp type would also permit `a - b` for two
+    /// arbitrary timestamps — where the operand order carries all the meaning and
+    /// the mistake produces a plausible number rather than a compile error. The
+    /// protocol has one such subtraction, `latency = srrt - srst`, and its
+    /// inverted-pair case is a real thing that has to be *detected* rather than
+    /// clamped away. A type that made the mistake easy to write would work against
+    /// both.
+    pub fn saturating_sub(&self, d: Duration) -> Self {
+        Instant {
+            nanos: self
+                .nanos
+                .saturating_sub(d.as_nanos().min(u64::MAX as u128) as u64),
+        }
+    }
+
+    /// Exactly `d` before `self`, or `None` if that would run past the epoch.
+    ///
+    /// The same value as [`saturating_sub`](Self::saturating_sub), but it **refuses**
+    /// instead of shortening. This is the form a caller should reach for when the
+    /// interval is the thing being asserted — a round trip asked to be 20 ms must
+    /// come back as 20 ms or not at all, and a clamp that quietly returns 8 ms is
+    /// the failure mode [`saturating_sub`]'s docs describe.
+    ///
+    /// Returns `None` rather than `Instant::EPOCH` because `EPOCH` is
+    /// indistinguishable from a legitimate answer, which is the whole problem.
+    pub fn ago_exact(&self, d: Duration) -> Option<Instant> {
+        let nanos = d.as_nanos().min(u64::MAX as u128) as u64;
+        self.nanos.checked_sub(nanos).map(|n| Instant { nanos: n })
+    }
+
     /// Time from `earlier` to `self`, or zero if `earlier` is later.
     ///
     /// Saturating at zero rather than panicking or wrapping, because the one
@@ -108,6 +166,12 @@ impl Instant {
     /// that returned a reply out of order would otherwise produce a negative
     /// number that has to be clamped somewhere anyway. Clamping here means the
     /// clamp happens in exactly one place.
+    ///
+    /// **Which is why `views.rs` does not use it for the inversion case.** A clamp
+    /// to zero is indistinguishable from a genuinely instantaneous round trip, so
+    /// `go_latency` detects `srrt < srst` first and reports no latency at all —
+    /// which is what Go's `checked_duration_since` does and what `omitempty` then
+    /// makes observable as an absent field rather than a present zero.
     pub fn duration_since(&self, earlier: Instant) -> Duration {
         Duration::from_nanos(self.nanos.saturating_sub(earlier.nanos))
     }

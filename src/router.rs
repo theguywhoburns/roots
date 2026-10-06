@@ -31,6 +31,19 @@ pub const UNKNOWN_LATENCY: Duration = Duration::from_nanos(u32::MAX as u64);
 /// owns its own state; cross-table algorithms take explicit refs instead of
 /// poking a shared god-object.
 pub struct Router {
+    /// Where every stored timestamp comes from.
+    ///
+    /// A field rather than a `std::time::Instant::now()` at each site, because the
+    /// whole point of `roots_core::clock` is that the core *stores* time rather
+    /// than asking a global clock for it — and `LinkState.sent_at`/`srrt` are
+    /// exactly that. The alternative, calling `Instant::now()` inline, would be
+    /// untestable: every expiry and every latency would need a real sleep, which
+    /// is why those paths have no unit tests today.
+    ///
+    /// `StdClock` by default and swappable, so a caller can drive the state machine
+    /// from a fixed clock. Nothing does yet — `Router::with_clock` exists for that
+    /// and is the seam slice 7 uses.
+    pub(crate) clock: crate::clock::StdClock,
     pub(crate) key: SigningKey,
     pub(crate) pubkey: [u8; KEY_LEN],
     pub(crate) tree: TreeState,
@@ -52,8 +65,21 @@ pub struct Router {
 
 impl Router {
     pub fn new(key: SigningKey) -> Self {
+        Self::with_clock(key, crate::clock::StdClock::default())
+    }
+
+    /// A router whose stored timestamps come from `clock`.
+    ///
+    /// The seam that makes expiry and rotation testable without a `sleep`. Nothing
+    /// calls this yet — the state machines still take their timestamps from the
+    /// injected `StdClock` above rather than from a caller-supplied `dyn Clock`,
+    /// because `Router` is `Send` and a trait object would need `+ Sync` to stay
+    /// so. A `StdClock` is two `u64`s and copies; a `dyn Clock` is a pointer and a
+    /// vtable. When a test genuinely needs to *drive* time, this is where it goes.
+    pub fn with_clock(key: SigningKey, clock: crate::clock::StdClock) -> Self {
         let pubkey = key.verifying_key().to_bytes();
         Self {
+            clock,
             key,
             pubkey,
             tree: TreeState::default(),

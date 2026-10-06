@@ -39,6 +39,28 @@ impl Default for StdClock {
     }
 }
 
+/// One hour, in nanoseconds: how far below the epoch a [`StdClock`]'s *readings*
+/// start, so that `now()` starts at 3.6 × 10¹² rather than at 0.
+///
+/// # Why the floor exists
+///
+/// `Instant::saturating_sub` clamps at the epoch, and a clock whose readings start
+/// at zero has **no past at all**. So on a freshly-constructed clock,
+/// `saturating_sub(20 ms)` returns `EPOCH` — an instant 0 ms back, not 20 ms — and
+/// the caller cannot tell, because `EPOCH` is a perfectly valid instant.
+///
+/// This was not hypothetical. Two round-trip tests asked for 20 ms and 30 ms,
+/// clamped, and produced latencies of 8.35 ms and 26.9 ms. Both *look* like
+/// plausible loopback round trips, so the assertion failed with a number that gave
+/// no hint at the cause, and the first diagnosis — that `ago` had built its own
+/// clock with an independent origin — was wrong, because `ago` took the router's
+/// clock and the real fault was one level down.
+///
+/// An hour is comfortably more than anything here expresses (the longest interval
+/// in the protocol is `PATH_TIMEOUT` at 60 s) and leaves ~584 years of headroom in
+/// a `u64` of nanoseconds, so `saturating_add` cannot reach it.
+const FLOOR_NANOS: u64 = 3_600_000_000_000;
+
 impl StdClock {
     /// A clock whose origin is now.
     pub fn from_now() -> Self {
@@ -67,12 +89,18 @@ impl Clock for StdClock {
         // `duration_since` on `Instant` saturates at zero in the *other*
         // direction, so this cannot panic and cannot go negative: `origin` was
         // taken at or before any reading, because it was taken first.
-        Instant::from_nanos(
-            StdInstant::now()
-                .duration_since(self.origin)
-                .as_nanos()
-                .min(u64::MAX as u128) as u64,
-        )
+        let elapsed = StdInstant::now()
+            .duration_since(self.origin)
+            .as_nanos()
+            .min(u64::MAX as u128) as u64;
+        // The floor is **added to the reading**, not subtracted from the origin.
+        // Subtracting from the origin would have been simpler to write and would
+        // have had two problems: [`StdInstant`] counts from *boot*, so a machine
+        // up for less than an hour cannot be backed off by an hour and the
+        // subtraction would panic on exactly the machines least likely to be
+        // running the tests; and `origin()` would stop returning what the caller
+        // passed, breaking the [`since`](Self::since) contract for no gain.
+        Instant::from_nanos(FLOOR_NANOS.saturating_add(elapsed))
     }
 }
 
@@ -207,8 +235,54 @@ mod tests {
         );
     }
 
-    /// `origin()` returns what `since` was given, so a caller can reason about
-    /// the epoch it chose.
+    /// A clock's readings start an hour above the epoch, so a test can ask for a
+    /// past instant at all.
+    ///
+    /// Without this, `Instant::saturating_sub` on a freshly-constructed clock
+    /// clamps at zero and returns a *shorter* interval than asked for — silently,
+    /// because `EPOCH` is a valid instant. Measured: a round-trip test asked for
+    /// 20 ms and measured 8.35 ms, which is indistinguishable from a real loopback
+    /// round trip.
+    ///
+    /// So the property is asserted on the clock, not left to whatever test happens
+    /// to be the first to step backwards.
+    #[test]
+    fn a_clock_can_be_stepped_backwards_without_clamping() {
+        let c = StdClock::default();
+        let now = c.now();
+        assert!(
+            now.as_nanos() >= 3_600_000_000_000,
+            "readings must start an hour above the epoch, got {} ns",
+            now.as_nanos()
+        );
+        // The whole point: a test-sized step backwards is *exact*, not clamped.
+        for ms in [1, 20, 30, 1_000, 60_000] {
+            let earlier = now
+                .ago_exact(Duration::from_millis(ms))
+                .unwrap_or_else(|| panic!("{ms}ms backwards must be representable"));
+            assert_eq!(
+                now.duration_since(earlier),
+                Duration::from_millis(ms),
+                "{ms}ms must survive the step exactly"
+            );
+        }
+        // And the clamp still exists for the case that genuinely has no past,
+        // where a `None` is the honest answer.
+        assert!(
+            Instant::EPOCH.ago_exact(Duration::from_millis(1)).is_none(),
+            "the epoch has no past, and must say so rather than clamp"
+        );
+    }
+
+    /// The floor is an **offset**, not a shifted origin, so `origin()` still
+    /// returns what the caller passed.
+    ///
+    /// The alternative — subtracting the floor from the `StdInstant` — is shorter to
+    /// write and wrong twice over: [`StdInstant`] counts from *boot*, so a machine up
+    /// for under an hour cannot be backed off by an hour and would panic on exactly
+    /// the machines least likely to be running the suite; and `origin()` would stop
+    /// being the caller's value, breaking the [`StdClock::since`] contract for no
+    /// gain.
     #[test]
     fn the_origin_is_what_the_caller_passed() {
         let origin = StdInstant::now();

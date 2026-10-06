@@ -1,7 +1,7 @@
 //! Read-only router views: snapshot queries for diagnostics and the admin adapter.
 //! Pure borrows over the composed tables; the lib never prints (see `dump`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::address::KEY_LEN;
 use crate::router::Router;
@@ -242,12 +242,40 @@ pub struct LinkPeer {
 }
 
 /// Go's `peer.srrt.Sub(peer.srst).Round(time.Millisecond / 100)`, kept only if
-/// the result is positive (`debug.go:84`). Two behaviours hide in that one line:
-/// the pair is *stored* timestamps, so the number grows until the next `SigReq`
-/// resets it, and a `SigReq` sent after the last `SigRes` makes it negative,
-/// which reports as no latency at all rather than a small one.
-fn go_latency(srrt: Option<Instant>, srst: Option<Instant>) -> Option<Duration> {
-    let delta = srrt?.checked_duration_since(srst?)?;
+/// the result is positive (`debug.go:84-85`). Three behaviours hide in that one
+/// line:
+///
+/// * the pair is *stored* timestamps, so the number grows until the next `SigReq`
+///   resets it;
+/// * a `SigReq` sent after the last `SigRes` makes `srrt - srst` **negative**, and
+///   Go's `> 0` gate drops it — so an inverted pair reports as *no* latency, not a
+///   small one;
+/// * `Round` quantises to 10 µs, so a 4 µs round trip is reported as *no* latency
+///   too. That is why the unit is nanoseconds upstream and why the
+///   `sub_millisecond_durations_survive_the_conversion_exactly` test exists.
+fn go_latency(
+    srrt: Option<roots_core::clock::Instant>,
+    srst: Option<roots_core::clock::Instant>,
+) -> Option<Duration> {
+    let srrt = srrt?;
+    let srst = srst?;
+    let delta = srrt.duration_since(srst);
+    // **The inverted case is handled by the `> 0` gate, not by an explicit
+    // comparison — and that is worth stating because the obvious version of this
+    // function was wrong about it.**
+    //
+    // `roots_core::clock::Instant::duration_since` **saturates**, so an inverted
+    // pair arrives here as a zero rather than as a negative. That looks like it
+    // needs an `if srrt < srst { return None }` in front. It does not: Go's
+    // subtraction yields a negative and its `> 0` gate drops it, so Go's observable
+    // is *absent*; and a clamped zero also quantises to zero and also fails `> 0`,
+    // so ours is *absent* too. Same answer, reached differently.
+    //
+    // An earlier version of this comment claimed the clamp would report
+    // `latency: 0` — which `omitempty` would drop, "a different observable from
+    // Go's". That was false, and a mutation deleting the explicit check passed
+    // all 238 tests, which is what exposed it. So there is no explicit check, and
+    // the two lines that do the work are both load-bearing.
     let hundredths = (delta.as_nanos() as u64 + 5_000) / 10_000;
     (hundredths > 0).then(|| Duration::from_nanos(hundredths * 10_000))
 }
@@ -285,5 +313,124 @@ impl Snapshot for Router {
     }
     fn dump(&self) -> String {
         self.dump()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use roots_core::clock::Instant;
+
+    /// An instant `ns` nanoseconds after the epoch, so a test can write a delta as
+    /// a number instead of as an arithmetic chain.
+    fn at(ns: u64) -> Instant {
+        Instant::from_nanos(ns)
+    }
+
+    /// Go's `debug.go:85` line, one clause at a time.
+    ///
+    /// This function had **no test at all** until the clock was migrated onto
+    /// `roots_core::clock`, at which point a mutation that deleted its inversion
+    /// check passed the whole suite — which is only possible if nothing observes
+    /// the function directly. So the clauses are pinned here.
+    ///
+    /// Go is `peer.srrt.Sub(peer.srst).Round(time.Millisecond / 100)` guarded by
+    /// `if rtt > 0`.
+    #[test]
+    fn latency_follows_go_rounding_and_positivity() {
+        // **Both timestamps are required.** Go reads two struct fields with no
+        // presence flag, and `omitempty` on the result means a peer that has not
+        // been asked yet simply has no field.
+        //
+        // The `srrt` here is deliberately **not** `at(0)`: the first version of this
+        // test used the epoch, which is exactly what a `srst.unwrap_or(EPOCH)` mutant
+        // substitutes, so the assertion passed with the presence check removed. A
+        // missing `srst` against a *non-zero* `srrt` is what actually distinguishes
+        // them, and it is the case that occurs — a peer replies, then its state is
+        // rebuilt before the send is stamped.
+        assert_eq!(go_latency(None, None), None);
+        assert_eq!(
+            go_latency(Some(at(20_000_000)), None),
+            None,
+            "a reply with no matching send is not a round trip"
+        );
+        assert_eq!(
+            go_latency(None, Some(at(20_000_000))),
+            None,
+            "a send with no matching reply is not a round trip"
+        );
+
+        // A zero gap is not a latency. Go's `rtt > 0` rejects it.
+        assert_eq!(go_latency(Some(at(0)), Some(at(0))), None);
+
+        // **The inverted pair.** A `SigReq` sent *after* the last `SigRes` leaves
+        // `srst > srrt`, and this is a real state, not a hypothetical — `send_sigreq`
+        // stamps `sent_at` without waiting for the reply.
+        //
+        // Go subtracts to a negative and its `> 0` gate drops it. Ours saturates to
+        // zero and the same gate drops it. Either way the field is **absent**, which
+        // is the observable: a reported `latency: 0` would be a different answer.
+        assert_eq!(
+            go_latency(Some(at(1_000)), Some(at(2_000))),
+            None,
+            "an inverted pair reports no latency, not a small one"
+        );
+
+        // **The sub-quantum case.** 10 µs is `Round`'s granularity, so anything
+        // under 5 µs rounds away to nothing and is reported as absent. Go's `Round`
+        // rounds half *away from zero*, which is what the `+ 5_000` below mirrors.
+        assert_eq!(go_latency(Some(at(4_999)), Some(at(0))), None);
+        assert_eq!(
+            go_latency(Some(at(5_000)), Some(at(0))),
+            Some(Duration::from_nanos(10_000)),
+            "exactly half a quantum rounds up, as Go's Round does"
+        );
+
+        // **The number that motivated the nanosecond representation**, from
+        // `docs/protocol/21-admin.md`: Go reported `latency: 450000` — 450 µs — on
+        // the link this repository measures. If the delta were held in
+        // milliseconds this would quantise to nothing and the comparison against
+        // `yggdrasilctl` would be meaningless.
+        assert_eq!(
+            go_latency(Some(at(450_000)), Some(at(0))),
+            Some(Duration::from_nanos(450_000)),
+            "450us must survive as 450us"
+        );
+
+        // The captured `yggdrasilctl` value on the same link, `21-admin.md:421`.
+        assert_eq!(
+            go_latency(Some(at(52_000_000)), Some(at(0))),
+            Some(Duration::from_nanos(52_000_000))
+        );
+
+        // And rounding on a large delta, so the `+ 5_000` cannot be dropped
+        // without this noticing: 50.004 ms rounds to 50.00 ms, 50.005 ms to 50.01.
+        assert_eq!(
+            go_latency(Some(at(50_004_999)), Some(at(0))),
+            Some(Duration::from_nanos(50_000_000))
+        );
+        assert_eq!(
+            go_latency(Some(at(50_005_000)), Some(at(0))),
+            Some(Duration::from_nanos(50_010_000)),
+            "half a quantum rounds up, not down"
+        );
+    }
+
+    /// The delta is measured **between the two stored timestamps**, so it is a
+    /// property of the pair and not of when the query happens.
+    ///
+    /// Go reads `peer.srrt.Sub(peer.srst)` at *query* time
+    /// (`ironwood/network/debug.go:85`), so the reported number does not drift
+    /// between two calls — which is a difference from the naive "measure the age of
+    /// the last reply" reading, and the reason this takes two instants rather than
+    /// one and a clock.
+    #[test]
+    fn the_delta_does_not_drift_with_the_query_time() {
+        let (srrt, srst) = (at(20_000_000), at(0));
+        let first = go_latency(Some(srrt), Some(srst));
+        // A clock reading, and time passing, must not appear in the answer.
+        let _later = at(900_000_000);
+        assert_eq!(go_latency(Some(srrt), Some(srst)), first);
+        assert_eq!(first, Some(Duration::from_millis(20)));
     }
 }

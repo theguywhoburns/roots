@@ -21,6 +21,7 @@ use crate::error::{CoreError, Error};
 use crate::frame::{FrameType, append_uvarint, read_uvarint};
 use crate::link::LinkSet;
 use crate::router::UNKNOWN_LATENCY;
+use roots_core::clock::Clock;
 
 /// Self-announce refresh (Go: `routerRefresh` 4min).
 pub const TREE_REFRESH: Duration = Duration::from_secs(4 * 60);
@@ -266,7 +267,7 @@ impl crate::router::Router {
         // trip it later measures excludes our own queueing (`peers.go:318-321`).
         // It is per link, so each link's own clock is what moves.
         if sent.is_ok() {
-            let now = Instant::now();
+            let now = self.clock.now();
             for id in &targets {
                 if let Some(l) = self.tree.links.get_mut(id) {
                     l.sent_at = Some(now);
@@ -318,9 +319,9 @@ impl crate::router::Router {
             .links
             .get(&conn)
             .and_then(|l| l.sent_at)
-            .map(|t| t.elapsed());
+            .map(|t| self.clock.now().duration_since(t));
         if let Some(l) = self.tree.links.get_mut(&conn) {
-            l.srrt = Some(Instant::now());
+            l.srrt = Some(self.clock.now());
         }
         let matches = self
             .tree
@@ -704,12 +705,46 @@ mod tests {
         assert_eq!(n2, buf.len() - 1);
     }
 
+    /// A core `Instant` `ms` before the **router's** clock, for the round-trip tests.
+    ///
+    /// Two things this gets right that its first two versions did not, and both were
+    /// found by the tests it feeds rather than by review.
+    ///
+    /// **The clock is a parameter, not created here.** Version one built its own
+    /// `StdClock::default()`, so its instants had a *different origin* from the
+    /// router's and the subtraction became a difference between two unrelated
+    /// epochs - precisely the hazard `roots_core::clock`'s module docs name.
+    ///
+    /// **`ago_exact`, not `saturating_sub`.** Version two used the router's clock
+    /// and was still wrong: the clock was ~8 ms old, so subtracting 20 ms clamped at
+    /// the epoch and the round trip came back as 8.35 ms - a number that looks like a
+    /// perfectly good loopback measurement, which is why the assertion failed without
+    /// pointing at the cause. `ago_exact` returns an `Option`, so a clamp is a loud
+    /// failure naming the interval rather than a plausible value. The clock now starts
+    /// an hour of nanoseconds above the epoch so the clamp cannot happen; the
+    /// `expect` says so if it ever does.
+    ///
+    /// `Instant` also deliberately has no `Sub`: an infix `-` on a timestamp type
+    /// would allow `a - b` for two arbitrary instants, where the operand order carries
+    /// all the meaning and a mistake yields a plausible number, not a compile error.
+    fn ago(clock: &crate::clock::StdClock, ms: u64) -> roots_core::clock::Instant {
+        clock
+            .now()
+            .ago_exact(core::time::Duration::from_millis(ms))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a {ms}ms-old instant is not representable on this clock, so the \
+                 round trip would be measured short"
+                )
+            })
+    }
+
     /// Build the two books `handle_response` reads: a per-key [`PeerState`] and
     /// the per-link [`LinkState`] the round trip lives on.
     fn peer_with_link(
         router: &mut Router,
         key: [u8; KEY_LEN],
-        sent_at: Option<Instant>,
+        sent_at: Option<roots_core::clock::Instant>,
     ) -> crate::link::LinkId {
         let id = crate::link::LinkId::absent();
         router.tree.peers.insert(
@@ -749,11 +784,8 @@ mod tests {
         let peer = keys(0x22);
         let peer_pub = peer.verifying_key().to_bytes();
         let mut router = Router::new(me);
-        let id = peer_with_link(
-            &mut router,
-            peer_pub,
-            Some(Instant::now() - Duration::from_millis(20)),
-        );
+        let sent_at = ago(&router.clock, 20);
+        let id = peer_with_link(&mut router, peer_pub, Some(sent_at));
         assert!(
             router.link_peers()[0].latency.is_none(),
             "no reply has arrived yet"
@@ -793,7 +825,7 @@ mod tests {
         assert!(!p.responded, "the EWMA still requires a matching request");
         assert_eq!(p.lag_ms, 4294, "so the lag stays at Go's sentinel");
 
-        router.tree.links.get_mut(&id).unwrap().sent_at = Some(Instant::now());
+        router.tree.links.get_mut(&id).unwrap().sent_at = Some(router.clock.now());
         assert!(
             router.link_peers()[0].latency.is_none(),
             "a send after the last reply reads as no latency, not a negative one"
@@ -812,16 +844,10 @@ mod tests {
         let peer = keys(0x42);
         let peer_pub = peer.verifying_key().to_bytes();
         let mut router = Router::new(me);
-        let slow = peer_with_link(
-            &mut router,
-            peer_pub,
-            Some(Instant::now() - Duration::from_millis(30)),
-        );
-        let fast = peer_with_link(
-            &mut router,
-            peer_pub,
-            Some(Instant::now() - Duration::from_millis(1)),
-        );
+        let slow_at = ago(&router.clock, 30);
+        let fast_at = ago(&router.clock, 1);
+        let slow = peer_with_link(&mut router, peer_pub, Some(slow_at));
+        let fast = peer_with_link(&mut router, peer_pub, Some(fast_at));
         assert_ne!(slow, fast, "two connections, two ids");
         assert_eq!(
             router.link_peers().len(),
@@ -883,7 +909,8 @@ mod tests {
     async fn a_key_with_no_live_link_costs_the_maximum() {
         let mut router = Router::new(keys(0x51));
         let peer = keys(0x52).verifying_key().to_bytes();
-        let id = peer_with_link(&mut router, peer, Some(Instant::now()));
+        let now = router.clock.now();
+        let id = peer_with_link(&mut router, peer, Some(now));
         // Make the link measurably expensive, so a floor at 1 would show.
         router.tree.links.get_mut(&id).unwrap().lag = Duration::from_millis(10);
         let links = LinkSet::new();
